@@ -1,0 +1,27 @@
+# Environment
+backend/.env
+
+# VS Code
+.vscode/
+
+# Logs
+*.log
+
+# Windows
+Thumbs.db
+
+# macOS
+.DS_Store
+
+# Build artifacts
+backend/bin/
+backend/dist/
+
+# Coverage
+*.out
+coverage.*
+
+# Docker volumes
+postgres_data/
+
+.claude/
