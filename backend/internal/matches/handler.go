@@ -178,6 +178,36 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 	response.Write(w, http.StatusOK, m)
 }
 
+// GetScore handles GET /api/v1/organizations/{slug}/matches/{id}/score.
+// Derives the current score from the effective event log.  No permission beyond
+// RequireAuth is required — scores are publicly readable by any authenticated
+// user within the organization.  No data is written or cached.
+func (h *Handler) GetScore(w http.ResponseWriter, r *http.Request) {
+	slug := chi.URLParam(r, "slug")
+	id := chi.URLParam(r, "id")
+
+	result, err := h.svc.GetScore(r.Context(), slug, id)
+	if err != nil {
+		if errors.Is(err, ErrOrganizationNotFound) {
+			response.Error(w, http.StatusNotFound, "organization not found")
+			return
+		}
+		if errors.Is(err, ErrMatchNotFound) {
+			response.Error(w, http.StatusNotFound, "match not found")
+			return
+		}
+		h.log.ErrorContext(r.Context(), "matches.score.failed",
+			slog.String("org_slug", slug),
+			slog.String("match_id", id),
+			slog.Any("error", err),
+			slog.String("request_id", chimw.GetReqID(r.Context())),
+		)
+		response.Error(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+	response.Write(w, http.StatusOK, result)
+}
+
 // Delete handles DELETE /api/v1/organizations/{slug}/matches/{id}.
 // Soft-cancels the match (status → cancelled). No hard deletes.
 func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {

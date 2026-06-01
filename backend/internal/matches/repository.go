@@ -147,6 +147,16 @@ func (r *Repository) List(ctx context.Context, orgID pgtype.UUID, params ListPar
 	})
 }
 
+// GetEffectiveEventsForScore returns all effective (non-cancelled) match events
+// in sequence order for the scoring engine.  No pagination is applied: the
+// engine requires the complete effective timeline to produce a correct score.
+func (r *Repository) GetEffectiveEventsForScore(ctx context.Context, matchID, orgID pgtype.UUID) ([]db.MatchEvent, error) {
+	return r.queries.GetEffectiveMatchEventsForScore(ctx, db.GetEffectiveMatchEventsForScoreParams{
+		MatchID:        matchID,
+		OrganizationID: orgID,
+	})
+}
+
 // Count returns the total count matching the same filters as List.
 func (r *Repository) Count(ctx context.Context, orgID pgtype.UUID, params ListParams) (int64, error) {
 	tidFilter := pgutil.ParseOptionalUUID(derefStr(params.TournamentFilter))

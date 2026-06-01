@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"time"
@@ -12,6 +13,7 @@ import (
 
 	db "github.com/4yushraman-jpg/playarena/db/sqlc"
 	"github.com/4yushraman-jpg/playarena/internal/platform/pgutil"
+	"github.com/4yushraman-jpg/playarena/internal/scoring"
 )
 
 // Service implements match event use-cases.
@@ -77,6 +79,12 @@ func (s *Service) Create(
 	payload, err := parsePayload(req.Payload)
 	if err != nil {
 		return nil, err
+	}
+
+	// Validate that scoring event payloads carry the required fields.
+	// This runs at write time so malformed events never enter the immutable log.
+	if err := scoring.ValidateScoreEventPayload(eventType, payload); err != nil {
+		return nil, fmt.Errorf("%w: %s", ErrInvalidScorePayload, err.Error())
 	}
 
 	teamUID := pgutil.ParseOptionalUUID(derefStr(req.TeamID))

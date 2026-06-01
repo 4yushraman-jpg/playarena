@@ -33,4 +33,9 @@ var (
 	ErrCancelsEventCrossMatch = errors.New("cancels_event_id must reference an event in the same match")
 	ErrEventAlreadyCancelled  = errors.New("the target event has already been cancelled by a score_correction")
 	ErrCannotCancelCorrection = errors.New("a score_correction event cannot cancel another score_correction")
+
+	// ErrInvalidScorePayload is returned when a scoring event is submitted with
+	// a payload that is missing required fields or contains invalid values.
+	// Wraps the specific scoring.Err* sentinel for diagnostic detail.
+	ErrInvalidScorePayload = errors.New("invalid scoring event payload")
 )

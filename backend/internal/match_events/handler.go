@@ -159,7 +159,7 @@ func (h *Handler) writeEventError(w http.ResponseWriter, r *http.Request, err er
 	case errors.Is(err, ErrForbidden):
 		response.Error(w, http.StatusForbidden, err.Error())
 	case errors.Is(err, ErrInvalidEventType), errors.Is(err, ErrInvalidTimestamp),
-		errors.Is(err, ErrInvalidPayload):
+		errors.Is(err, ErrInvalidPayload), errors.Is(err, ErrInvalidScorePayload):
 		response.Error(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, ErrDuplicateLifecycleEvent):
 		response.Error(w, http.StatusConflict, err.Error())
@@ -214,6 +214,8 @@ func errKind(err error) string {
 		return "invalid_event_type"
 	case errors.Is(err, ErrInvalidPayload):
 		return "invalid_payload"
+	case errors.Is(err, ErrInvalidScorePayload):
+		return "invalid_score_payload"
 	case errors.Is(err, ErrInvalidTimestamp):
 		return "invalid_timestamp"
 	case errors.Is(err, ErrTeamNotParticipant):

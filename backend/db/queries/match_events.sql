@@ -174,3 +174,21 @@ SELECT EXISTS(
       AND  team_id   = sqlc.arg(team_id)
       AND  status    = 'active'
 ) AS on_team;
+
+-- name: GetEffectiveMatchEventsForScore :many
+-- Returns the complete effective event timeline for a match in sequence order.
+-- No pagination: the scoring engine requires the full timeline to compute scores.
+-- An event is excluded (cancelled) when its id appears in any cancels_event_id
+-- within the same match.  score_correction events themselves remain in the
+-- result — they contribute zero points and carry the cancels_event_id reference.
+SELECT me.*
+FROM   match_events me
+WHERE  me.match_id        = sqlc.arg(match_id)
+  AND  me.organization_id = sqlc.arg(organization_id)
+  AND  me.id NOT IN (
+           SELECT c.cancels_event_id
+           FROM   match_events c
+           WHERE  c.match_id         = sqlc.arg(match_id)
+             AND  c.cancels_event_id IS NOT NULL
+       )
+ORDER  BY me.sequence_number ASC;

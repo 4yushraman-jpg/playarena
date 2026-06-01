@@ -13,6 +13,7 @@ import (
 
 	db "github.com/4yushraman-jpg/playarena/db/sqlc"
 	"github.com/4yushraman-jpg/playarena/internal/platform/pgutil"
+	"github.com/4yushraman-jpg/playarena/internal/scoring"
 )
 
 // allowedTransitions defines the permitted match status moves for Phase 8A.
@@ -471,6 +472,36 @@ func (s *Service) Delete(
 		actorID: actorUID,
 		oldData: oldData,
 	})
+}
+
+// GetScore derives the current score for a match from the effective event log.
+// No permission beyond RequireAuth is required — scores are publicly readable
+// by any authenticated user in the organization.
+// No data is persisted; the result is always recomputable from the event log.
+func (s *Service) GetScore(ctx context.Context, orgSlug, matchID string) (*scoring.ScoreResult, error) {
+	org, err := s.repo.GetOrgBySlug(ctx, orgSlug)
+	if err != nil {
+		return nil, err
+	}
+
+	mid, err := pgutil.ParseUUID(matchID)
+	if err != nil {
+		return nil, ErrMatchNotFound
+	}
+
+	match, err := s.repo.GetByID(ctx, mid, org.ID)
+	if err != nil {
+		return nil, err
+	}
+
+	events, err := s.repo.GetEffectiveEventsForScore(ctx, mid, org.ID)
+	if err != nil {
+		return nil, err
+	}
+
+	engine := scoring.NewScoreEngine()
+	result := engine.Compute(match, events)
+	return &result, nil
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────

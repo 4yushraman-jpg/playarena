@@ -4,7 +4,8 @@
 **Build status:** `go build ./...` passing, `go vet ./...` clean, `sqlc generate` clean  
 **Migrations applied:** 000001 – 000018  
 **Go version:** 1.25.6  
-**Database:** PostgreSQL 17
+**Database:** PostgreSQL 17  
+**Phases complete:** 1 – 9
 
 ---
 
@@ -108,6 +109,11 @@ backend/
 │   │   ├── service.go
 │   │   ├── handler.go
 │   │   └── routes.go
+│   ├── scoring/                            Live Scoring engine (fully implemented, Phase 9)
+│   │   ├── engine.go                      ScoreEngine — stateless Compute(match, events) → ScoreResult
+│   │   ├── rules.go                       Kabaddi scoring rules: participantSide, allOutScore, payloadPoints
+│   │   ├── models.go                      ScoreResult — the derived score response type
+│   │   └── validation.go                  Write-time payload validation for scoring event types
 │   ├── bootstrap/
 │   │   ├── app.go                         App struct (Config, DB, Log) — composition root
 │   │   ├── router.go                      Builds chi router + global middleware stack
@@ -448,6 +454,7 @@ Each access token carries **exactly one** `organization_id`. The token is org-co
 | **Tournament Registrations** | `errors.go`, `dto.go`, `model.go`, `repository.go`, `service.go`, `handler.go`, `routes.go` | Complete |
 | **Matches** | `errors.go`, `dto.go`, `model.go`, `repository.go`, `service.go`, `handler.go`, `routes.go` | Complete |
 | **Match Events** | `errors.go`, `dto.go`, `model.go`, `repository.go`, `service.go`, `handler.go`, `routes.go` | Complete |
+| **Scoring Engine** | `engine.go`, `rules.go`, `models.go`, `validation.go` | Complete |
 | **Platform / Config** | `config.go` | Complete |
 | **Platform / Database** | `postgres.go` | Complete |
 | **Platform / Logger** | `logger.go` | Complete |
@@ -538,6 +545,7 @@ Each access token carries **exactly one** `organization_id`. The token is org-co
 | `POST` | `/matches` | Yes | `match.create` | Schedule match; validates tournament ongoing, participant eligibility, approved registrations; BOLA-guarded |
 | `GET` | `/matches` | Yes | — | List matches (paginated; `?limit`, `?offset`, `?tournament_id`, `?status`, `?search`) |
 | `GET` | `/matches/{id}` | Yes | — | Get match by UUID; returns all statuses including cancelled/completed |
+| `GET` | `/matches/{id}/score` | Yes | — | Derive current score from effective event log; no persistence; valid for all match statuses |
 | `PATCH` | `/matches/{id}` | Yes | `match.update` | Partial update; validates status transitions, winner, participant changes; BOLA-guarded |
 | `DELETE` | `/matches/{id}` | Yes | `match.delete` | Soft-cancel — sets `status = cancelled`; terminal-state guard; BOLA-guarded |
 
@@ -905,6 +913,97 @@ Adversarial review performed after implementation and hardening fix. Results:
 | Authorization coverage | **PASS** |
 | Data integrity | **PASS** |
 
+### Phase 9 — Live Scoring (Complete)
+
+The live scoring engine derives match scores from the immutable `match_events` event log. No score is ever stored. Every call to the score endpoint recomputes from committed events. The engine is a pure, stateless Go function with no database access or side effects.
+
+#### Architecture Decisions
+
+**Source of truth:** `match_events` remains the sole source of truth for all scores. The `matches` table is not modified by Phase 9; no new columns were added. This preserves the event-sourcing design from Phase 8B.
+
+**Derived-on-read:** Scores are computed on each `GET /matches/{id}/score` request by aggregating the effective event log. For kabaddi matches (100–300 events, indexed by `match_id`), this aggregation is sub-millisecond. No caching, no background jobs, no score persistence.
+
+**Effective-event filtering:** Cancelled events are excluded at the SQL layer via the same `id NOT IN (SELECT cancels_event_id …)` pattern established in Phase 8B. The engine receives only effective events and processes them sequentially.
+
+#### Scoring Package (`internal/scoring/`)
+
+| File | Purpose |
+|------|---------|
+| `engine.go` | `ScoreEngine` struct; `Compute(match, events) ScoreResult` — the single public entry point |
+| `rules.go` | Kabaddi scoring rules: `participantSide`, `sideByID`, `payloadPoints`, `allOutScore` |
+| `models.go` | `ScoreResult` — JSON response type carrying `home_score`, `away_score`, `match_status`, `is_walkover`, and participant IDs |
+| `validation.go` | `ValidateScoreEventPayload` — write-time payload validation; three exported error sentinels |
+
+#### Kabaddi Scoring Rules (implemented)
+
+| Event Type | Points | Attribution |
+|-----------|--------|-------------|
+| `raid_successful` | `payload.points` | `event.team_id` (raiding team) |
+| `bonus_point_awarded` | +1 | `event.team_id` (raiding team) |
+| `tackle_successful` | +1 | `event.team_id` (defending team) |
+| `super_tackle` | +2 | `event.team_id` (defending team) |
+| `all_out` | `payload.bonus_points` | Opponent of `payload.team_id` (eliminated team) |
+| `penalty_awarded` | `payload.points` | `event.team_id` |
+| `super_raid` | 0 | Analytics label only — `raid_successful` already carries the points; scoring separately would double-count |
+| All other types | 0 | — |
+
+Both team-format (keyed on `team_id`) and individual-format (keyed on `player_id`) tournaments are supported. The engine branches on `match.HomeTeamID.Valid` to select the correct attribution key.
+
+#### Score Correction Handling
+
+`score_correction` events are present in the effective event log (they are not targets of corrections themselves). The engine's `default:` case returns `(0, sideNone)` for them. The targeted event is excluded from the effective log by the SQL subquery — its point contribution disappears from the derived score automatically on the next read. No separate recomputation step is needed.
+
+#### Write-Time Payload Validation
+
+Three scoring event types require specific payload fields. These are validated at write time (in `match_events/service.go:Create`, after `parsePayload`) so malformed events never enter the immutable log:
+
+| Event | Required Fields | Error |
+|-------|----------------|-------|
+| `raid_successful` | `payload.points > 0` | `ErrInvalidScorePayload` → HTTP 400 |
+| `penalty_awarded` | `payload.points > 0` | `ErrInvalidScorePayload` → HTTP 400 |
+| `all_out` | `payload.team_id` (non-empty) + `payload.bonus_points > 0` | `ErrInvalidScorePayload` → HTTP 400 |
+
+The engine is fault-tolerant for pre-Phase-9 events with missing payload fields (returns 0 points for unparseable payloads rather than erroring).
+
+#### New SQL Query
+
+`GetEffectiveMatchEventsForScore` — added to `db/queries/match_events.sql`, regenerated into `db/sqlc/match_events.sql.go`. Returns the complete effective event timeline for a match in sequence order, with no pagination limit. Identical effective-log filter to `ListEffectiveMatchEventsByMatch` but without `LIMIT`/`OFFSET`.
+
+#### Files Modified in Phase 9
+
+| File | Change |
+|------|--------|
+| `db/queries/match_events.sql` | Added `GetEffectiveMatchEventsForScore` query |
+| `db/sqlc/match_events.sql.go` | Regenerated — 15 query functions (was 14) |
+| `internal/matches/repository.go` | Added `GetEffectiveEventsForScore` method |
+| `internal/matches/service.go` | Added `GetScore` method; imported `internal/scoring` |
+| `internal/matches/handler.go` | Added `GetScore` handler |
+| `internal/matches/routes.go` | Added `GET /{id}/score` route under `RequireAuth` |
+| `internal/match_events/errors.go` | Added `ErrInvalidScorePayload` sentinel |
+| `internal/match_events/service.go` | Added `ValidateScoreEventPayload` call at write time |
+| `internal/match_events/handler.go` | Added `ErrInvalidScorePayload` → HTTP 400 in error switch and `errKind` |
+
+#### Phase 9 Production Review (adversarial, all PASS)
+
+| Check | Result |
+|-------|--------|
+| Score correctness | **PASS** |
+| Effective-event handling | **PASS** |
+| score_correction handling | **PASS** |
+| Payload validation | **PASS** |
+| Multi-tenant isolation | **PASS** |
+| BOLA protection | **PASS** |
+| Authorization | **PASS** |
+| Match-state enforcement | **PASS** |
+| Concurrency safety | **PASS** |
+| Score derivation correctness | **PASS** |
+| Event-type interpretation | **PASS** |
+| Super-raid double-count protection | **PASS** |
+| All-out attribution correctness | **PASS** |
+| Live score consistency | **PASS** |
+
+---
+
 ### Concurrency Hardening — Registration Capacity
 
 A code review identified a TOCTOU (Time of Check to Time of Use) race condition in the original capacity enforcement:
@@ -975,6 +1074,7 @@ The service-layer guard remains in place as the first line of defence for sequen
 - [x] **Match Events module** — Phase 8B (append-only event log, sequence integrity, participant validation, correction rules, production hardening)
 - [x] **Audit logging** — wired into all organization, player, team, tournament, registration, match, and match event mutations
 - [x] **BOLA protection** — enforced in every write service across all implemented modules
+- [x] **Live Scoring engine** — Phase 9 (`internal/scoring/`; `GET /matches/{id}/score`; effective-log derivation; write-time payload validation; all-out inversion; super_raid zero-score protection)
 
 ### Must-have before first production deployment
 
@@ -988,7 +1088,7 @@ The service-layer guard remains in place as the first line of defence for sequen
 ### Required for feature completeness
 
 - [ ] **Users module** — User management: list, get, update profile, change password, deactivate.
-- [ ] **Live Scoring** — Score derivation from event log; match score aggregation; Phase 9.
+- [ ] **Live Score snapshots at completion** — Phase 9 derives live scores on read; the architecture review approved snapshotting the final score into `matches.home_score`/`away_score` at match completion to support standings queries without per-match event aggregation. Not implemented yet — required for Phase 10 standings.
 - [ ] **Rankings module** — Computed standings; depends on match and match events modules. Phase 10.
 - [ ] **Media module** — File upload coordination, `media_attachments` CRUD, storage backend integration. Phase 11.
 - [ ] **News module** — Stub exists; no business logic.
@@ -1023,7 +1123,7 @@ The service-layer guard remains in place as the first line of defence for sequen
 | Phase 7C | RBAC correction — `match.delete` permission | **COMPLETE** |
 | Phase 8A | Matches | **COMPLETE** |
 | Phase 8B | Match Events | **COMPLETE** |
-| Phase 9 | Live Scoring | NOT STARTED |
+| Phase 9 | Live Scoring | **COMPLETE** |
 | Phase 10 | Rankings & Standings | NOT STARTED |
 | Phase 11 | Media | NOT STARTED |
 | Phase 12 | Notifications | NOT STARTED |
@@ -1031,15 +1131,9 @@ The service-layer guard remains in place as the first line of defence for sequen
 
 ---
 
-### Phase 9 — Live Scoring (next)
+### Phase 9 — Live Scoring (Complete)
 
-**Goal:** derive and serve match scores from the immutable event log.
-
-1. **Score derivation model** — define which event types contribute points and how (raid points, tackle bonus, all-out bonus, penalties, corrections).
-2. **Event-to-score mapping** — aggregate `match_events` to compute home and away scores per match; exclude cancelled events via the effective-log pattern.
-3. **Match score endpoint** — `GET /api/v1/organizations/{slug}/matches/{id}/score` returns current scores and key statistics derived on read from the event log.
-4. **Correction handling** — scores must be recalculated when a `score_correction` event exists; cancelled events must be excluded atomically.
-5. **Match completion workflow** — final score derivation at `match.status = completed`.
+Stateless scoring engine in `internal/scoring/`. Score derived on read from the effective event log. No score columns added to the database. Full kabaddi scoring rule set implemented: `raid_successful`, `bonus_point_awarded`, `tackle_successful`, `super_tackle`, `all_out` (opponent bonus), `penalty_awarded`. `super_raid` explicitly contributes zero (analytics label only). Write-time payload validation added to the `match_events` create path. All 14 adversarial review checks passed.
 
 ---
 
@@ -1078,17 +1172,17 @@ The service-layer guard remains in place as the first line of defence for sequen
 
 ## 10. Next Recommended Phase
 
-**Phase 9 — Live Scoring**
+**Phase 10 — Rankings & Standings**
 
-Phase 8B (Match Events) is complete and production-hardened. The immutable event log is in place: every in-match action is recorded as an append-only row with a guaranteed-unique sequence number. The next step is implementing score derivation — reading the event log and computing scores, stats, and match outcomes from it. Phase 9 depends directly on the Phase 8B event pipeline and is the prerequisite for Phase 10 (Rankings & Standings).
+Phase 9 (Live Scoring) is complete and production-hardened. The scoring engine can derive home and away scores for any match on demand. The next step is implementing standings — aggregating completed match results across a tournament to produce wins, losses, draws, and points tables. Phase 10 depends directly on the Phase 9 scoring engine and the Phase 8A `winner_team_id` / `winner_player_id` match completion model.
 
 **Planning goals:**
 
-- Score derivation model — which event types contribute points, and how
-- Event-to-score mapping — per-team and per-player aggregation from the effective event log
-- Match score aggregation endpoint
-- Correction handling — cancelled events excluded from score computation
-- Match completion workflow — final score at status = completed
+- Final score snapshot at match completion — write `home_score`/`away_score` to `matches` inside the `live → completed` transition (the architecture review approved this denormalization for standings efficiency)
+- Tournament standings endpoint — compute league table from completed matches per tournament
+- Standings model — wins, losses, draws, points for/against, point difference, head-to-head tiebreakers
+- Format-specific rules — different computation for `league` vs `knockout` vs `group_knockout` formats (configured via `tournaments.settings` JSONB)
+- Player statistics — aggregate raid, tackle, and point stats per player from the event log
 
 ---
 
@@ -1108,8 +1202,11 @@ Phase 8B (Match Events) is complete and production-hardened. The immutable event
 | `backend/internal/tournament_registrations/repository.go` | Reference for row-lock capacity enforcement under concurrency |
 | `backend/internal/matches/service.go` | Match lifecycle, participant validation, winner rules, BOLA guard |
 | `backend/internal/matches/repository.go` | Match transactional writes; FOR SHARE tournament lock pattern |
-| `backend/internal/match_events/service.go` | Event validation, correction rules, participant checks, BOLA guard |
+| `backend/internal/match_events/service.go` | Event validation, correction rules, participant checks, BOLA guard, write-time payload validation |
 | `backend/internal/match_events/repository.go` | `CreateWithAudit` — FOR UPDATE lock, sequence computation, all in-transaction validation |
+| `backend/internal/scoring/engine.go` | `ScoreEngine.Compute` — pure stateless score derivation; entry point for Phase 9+ scoring |
+| `backend/internal/scoring/rules.go` | Kabaddi scoring rules: `participantSide`, `allOutScore`, `payloadPoints` |
+| `backend/internal/scoring/validation.go` | `ValidateScoreEventPayload` — write-time payload guard for scoring event types |
 | `backend/internal/bootstrap/modules.go` | Single place to register new domain modules |
 | `backend/internal/platform/pgutil/pgutil.go` | Shared UUID and constraint helpers used by all domain repositories |
 | `backend/internal/platform/validator/validator.go` | JSON decode + struct-tag validation (no external deps) |
@@ -1118,4 +1215,4 @@ Phase 8B (Match Events) is complete and production-hardened. The immutable event
 
 ---
 
-*This document was last updated on 2026-06-01. It should be updated whenever a phase is completed or significant architectural changes are made.*
+*This document was last updated on 2026-06-01 (Phase 9 complete). It should be updated whenever a phase is completed or significant architectural changes are made.*

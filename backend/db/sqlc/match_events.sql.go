@@ -148,6 +148,65 @@ func (q *Queries) CreateMatchEvent(ctx context.Context, arg CreateMatchEventPara
 	return i, err
 }
 
+const getEffectiveMatchEventsForScore = `-- name: GetEffectiveMatchEventsForScore :many
+SELECT me.id, me.match_id, me.organization_id, me.sequence_number, me.event_type, me.team_id, me.player_id, me.period, me.clock_seconds, me.payload, me.recorded_by, me.recorded_at, me.cancels_event_id, me.created_at
+FROM   match_events me
+WHERE  me.match_id        = $1
+  AND  me.organization_id = $2
+  AND  me.id NOT IN (
+           SELECT c.cancels_event_id
+           FROM   match_events c
+           WHERE  c.match_id         = $1
+             AND  c.cancels_event_id IS NOT NULL
+       )
+ORDER  BY me.sequence_number ASC
+`
+
+type GetEffectiveMatchEventsForScoreParams struct {
+	MatchID        pgtype.UUID `json:"match_id"`
+	OrganizationID pgtype.UUID `json:"organization_id"`
+}
+
+// Returns the complete effective event timeline for a match in sequence order.
+// No pagination: the scoring engine requires the full timeline to compute scores.
+// An event is excluded (cancelled) when its id appears in any cancels_event_id
+// within the same match.  score_correction events themselves remain in the
+// result — they contribute zero points and carry the cancels_event_id reference.
+func (q *Queries) GetEffectiveMatchEventsForScore(ctx context.Context, arg GetEffectiveMatchEventsForScoreParams) ([]MatchEvent, error) {
+	rows, err := q.db.Query(ctx, getEffectiveMatchEventsForScore, arg.MatchID, arg.OrganizationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []MatchEvent{}
+	for rows.Next() {
+		var i MatchEvent
+		if err := rows.Scan(
+			&i.ID,
+			&i.MatchID,
+			&i.OrganizationID,
+			&i.SequenceNumber,
+			&i.EventType,
+			&i.TeamID,
+			&i.PlayerID,
+			&i.Period,
+			&i.ClockSeconds,
+			&i.Payload,
+			&i.RecordedBy,
+			&i.RecordedAt,
+			&i.CancelsEventID,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const getEventCancellation = `-- name: GetEventCancellation :one
 SELECT id
 FROM   match_events
