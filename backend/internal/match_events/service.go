@@ -67,7 +67,8 @@ func (s *Service) Create(
 	}
 
 	// Confirm match exists and belongs to this org before opening the transaction.
-	if _, err := s.repo.GetMatchByID(ctx, mid, org.ID); err != nil {
+	match, err := s.repo.GetMatchByID(ctx, mid, org.ID)
+	if err != nil {
 		return nil, err
 	}
 
@@ -85,6 +86,17 @@ func (s *Service) Create(
 	// This runs at write time so malformed events never enter the immutable log.
 	if err := scoring.ValidateScoreEventPayload(eventType, payload); err != nil {
 		return nil, fmt.Errorf("%w: %s", ErrInvalidScorePayload, err.Error())
+	}
+
+	// For all_out, additionally verify that payload.team_id is one of the match
+	// participants.  ValidateScoreEventPayload confirmed team_id is non-empty;
+	// this guard rejects any value that does not belong to this specific match.
+	if eventType == db.MatchEventTypeAllOut {
+		homeID := pgutil.UUIDToString(match.HomeTeamID)
+		awayID := pgutil.UUIDToString(match.AwayTeamID)
+		if err := scoring.ValidateAllOutParticipant(payload, homeID, awayID); err != nil {
+			return nil, fmt.Errorf("%w: %s", ErrInvalidScorePayload, err.Error())
+		}
 	}
 
 	teamUID := pgutil.ParseOptionalUUID(derefStr(req.TeamID))

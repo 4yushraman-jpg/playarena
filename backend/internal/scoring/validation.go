@@ -19,6 +19,10 @@ var (
 	// ErrPayloadMissingBonusPoints is returned when an all_out event is submitted
 	// without a positive payload.bonus_points field.
 	ErrPayloadMissingBonusPoints = errors.New("all_out payload must include \"bonus_points\" > 0")
+
+	// ErrPayloadTeamIDNotParticipant is returned when an all_out event is submitted
+	// with a team_id that does not match either match participant.
+	ErrPayloadTeamIDNotParticipant = errors.New("all_out payload team_id must be the UUID of a match participant (home or away team)")
 )
 
 // ValidateScoreEventPayload validates that scoring event payloads contain the
@@ -75,4 +79,30 @@ func normalizePayload(p []byte) []byte {
 		return []byte("{}")
 	}
 	return p
+}
+
+// ValidateAllOutParticipant validates that the all_out payload's team_id matches
+// one of the match participants.  homeTeamID and awayTeamID are the UUID strings
+// returned by pgutil.UUIDToString for the match's HomeTeamID and AwayTeamID
+// columns; an empty string means the slot is unset (individual-format match).
+//
+// This is called after ValidateScoreEventPayload has confirmed team_id is
+// non-empty and bonus_points > 0.  A garbage string, a UUID from another match,
+// or an absent team slot all return ErrPayloadTeamIDNotParticipant.
+func ValidateAllOutParticipant(payload []byte, homeTeamID, awayTeamID string) error {
+	var obj struct {
+		TeamID *string `json:"team_id"`
+	}
+	if err := json.Unmarshal(normalizePayload(payload), &obj); err != nil || obj.TeamID == nil || *obj.TeamID == "" {
+		return ErrPayloadMissingTeamID
+	}
+	id := *obj.TeamID
+	// Both empty means individual-format match — no teams exist to eliminate.
+	if homeTeamID == "" && awayTeamID == "" {
+		return ErrPayloadTeamIDNotParticipant
+	}
+	if id != homeTeamID && id != awayTeamID {
+		return ErrPayloadTeamIDNotParticipant
+	}
+	return nil
 }
