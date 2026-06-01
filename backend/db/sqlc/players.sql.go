@@ -11,6 +11,100 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const countPlayersByOrganization = `-- name: CountPlayersByOrganization :one
+SELECT COUNT(*)
+FROM   players
+WHERE  organization_id = $1
+  AND  status            != 'inactive'
+  AND  ($2::text IS NULL OR status::text = $2)
+  AND  ($3::text  IS NULL OR display_name ILIKE '%' || $3 || '%')
+`
+
+type CountPlayersByOrganizationParams struct {
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	StatusFilter   *string     `json:"status_filter"`
+	SearchQuery    *string     `json:"search_query"`
+}
+
+// Returns the total row count matching the same filters as ListPlayersPaginated.
+// Used to build pagination metadata without fetching rows.
+func (q *Queries) CountPlayersByOrganization(ctx context.Context, arg CountPlayersByOrganizationParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countPlayersByOrganization, arg.OrganizationID, arg.StatusFilter, arg.SearchQuery)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const createPlayer = `-- name: CreatePlayer :one
+INSERT INTO players (
+    organization_id,
+    user_id,
+    display_name,
+    jersey_number,
+    position,
+    height_cm,
+    weight_kg,
+    dominant_hand,
+    nationality,
+    date_of_birth,
+    bio
+)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+RETURNING id, organization_id, user_id, display_name, jersey_number, position, height_cm, weight_kg, dominant_hand, nationality, date_of_birth, status, bio, metadata, created_at, updated_at
+`
+
+type CreatePlayerParams struct {
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	UserID         pgtype.UUID `json:"user_id"`
+	DisplayName    string      `json:"display_name"`
+	JerseyNumber   *string     `json:"jersey_number"`
+	Position       *string     `json:"position"`
+	HeightCm       *int16      `json:"height_cm"`
+	WeightKg       *int16      `json:"weight_kg"`
+	DominantHand   *string     `json:"dominant_hand"`
+	Nationality    *string     `json:"nationality"`
+	DateOfBirth    pgtype.Date `json:"date_of_birth"`
+	Bio            *string     `json:"bio"`
+}
+
+// Inserts a new active player profile for the given organization.
+// status defaults to 'active', metadata to '{}' per table defaults.
+func (q *Queries) CreatePlayer(ctx context.Context, arg CreatePlayerParams) (Player, error) {
+	row := q.db.QueryRow(ctx, createPlayer,
+		arg.OrganizationID,
+		arg.UserID,
+		arg.DisplayName,
+		arg.JerseyNumber,
+		arg.Position,
+		arg.HeightCm,
+		arg.WeightKg,
+		arg.DominantHand,
+		arg.Nationality,
+		arg.DateOfBirth,
+		arg.Bio,
+	)
+	var i Player
+	err := row.Scan(
+		&i.ID,
+		&i.OrganizationID,
+		&i.UserID,
+		&i.DisplayName,
+		&i.JerseyNumber,
+		&i.Position,
+		&i.HeightCm,
+		&i.WeightKg,
+		&i.DominantHand,
+		&i.Nationality,
+		&i.DateOfBirth,
+		&i.Status,
+		&i.Bio,
+		&i.Metadata,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const getPlayerByID = `-- name: GetPlayerByID :one
 
 SELECT id, organization_id, user_id, display_name, jersey_number, position, height_cm, weight_kg, dominant_hand, nationality, date_of_birth, status, bio, metadata, created_at, updated_at
@@ -93,4 +187,182 @@ func (q *Queries) ListPlayersByOrganization(ctx context.Context, organizationID 
 		return nil, err
 	}
 	return items, nil
+}
+
+const listPlayersPaginated = `-- name: ListPlayersPaginated :many
+SELECT id, organization_id, user_id, display_name, jersey_number, position, height_cm, weight_kg, dominant_hand, nationality, date_of_birth, status, bio, metadata, created_at, updated_at
+FROM   players
+WHERE  organization_id = $1
+  AND  status            != 'inactive'
+  AND  ($2::text IS NULL OR status::text = $2)
+  AND  ($3::text  IS NULL OR display_name ILIKE '%' || $3 || '%')
+ORDER  BY display_name ASC
+LIMIT  $5
+OFFSET $4
+`
+
+type ListPlayersPaginatedParams struct {
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	StatusFilter   *string     `json:"status_filter"`
+	SearchQuery    *string     `json:"search_query"`
+	PageOffset     int32       `json:"page_offset"`
+	PageLimit      int32       `json:"page_limit"`
+}
+
+// Returns non-inactive players for an org with optional status and name
+// search filters. Soft-deleted (inactive) players are excluded by default.
+func (q *Queries) ListPlayersPaginated(ctx context.Context, arg ListPlayersPaginatedParams) ([]Player, error) {
+	rows, err := q.db.Query(ctx, listPlayersPaginated,
+		arg.OrganizationID,
+		arg.StatusFilter,
+		arg.SearchQuery,
+		arg.PageOffset,
+		arg.PageLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Player{}
+	for rows.Next() {
+		var i Player
+		if err := rows.Scan(
+			&i.ID,
+			&i.OrganizationID,
+			&i.UserID,
+			&i.DisplayName,
+			&i.JerseyNumber,
+			&i.Position,
+			&i.HeightCm,
+			&i.WeightKg,
+			&i.DominantHand,
+			&i.Nationality,
+			&i.DateOfBirth,
+			&i.Status,
+			&i.Bio,
+			&i.Metadata,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const softDeletePlayer = `-- name: SoftDeletePlayer :one
+UPDATE players
+SET    status     = 'inactive',
+       updated_at = NOW()
+WHERE  id              = $1
+  AND  organization_id = $2
+RETURNING id, organization_id, user_id, display_name, jersey_number, position, height_cm, weight_kg, dominant_hand, nationality, date_of_birth, status, bio, metadata, created_at, updated_at
+`
+
+type SoftDeletePlayerParams struct {
+	ID             pgtype.UUID `json:"id"`
+	OrganizationID pgtype.UUID `json:"organization_id"`
+}
+
+// Marks a player as inactive (soft delete). Records are never hard-deleted
+// so that historical team membership and match event data remains intact.
+func (q *Queries) SoftDeletePlayer(ctx context.Context, arg SoftDeletePlayerParams) (Player, error) {
+	row := q.db.QueryRow(ctx, softDeletePlayer, arg.ID, arg.OrganizationID)
+	var i Player
+	err := row.Scan(
+		&i.ID,
+		&i.OrganizationID,
+		&i.UserID,
+		&i.DisplayName,
+		&i.JerseyNumber,
+		&i.Position,
+		&i.HeightCm,
+		&i.WeightKg,
+		&i.DominantHand,
+		&i.Nationality,
+		&i.DateOfBirth,
+		&i.Status,
+		&i.Bio,
+		&i.Metadata,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const updatePlayer = `-- name: UpdatePlayer :one
+UPDATE players
+SET    display_name  = $3,
+       jersey_number = $4,
+       position      = $5,
+       height_cm     = $6,
+       weight_kg     = $7,
+       dominant_hand = $8,
+       nationality   = $9,
+       date_of_birth = $10,
+       bio           = $11,
+       status        = $12,
+       updated_at    = NOW()
+WHERE  id              = $1
+  AND  organization_id = $2
+RETURNING id, organization_id, user_id, display_name, jersey_number, position, height_cm, weight_kg, dominant_hand, nationality, date_of_birth, status, bio, metadata, created_at, updated_at
+`
+
+type UpdatePlayerParams struct {
+	ID             pgtype.UUID  `json:"id"`
+	OrganizationID pgtype.UUID  `json:"organization_id"`
+	DisplayName    string       `json:"display_name"`
+	JerseyNumber   *string      `json:"jersey_number"`
+	Position       *string      `json:"position"`
+	HeightCm       *int16       `json:"height_cm"`
+	WeightKg       *int16       `json:"weight_kg"`
+	DominantHand   *string      `json:"dominant_hand"`
+	Nationality    *string      `json:"nationality"`
+	DateOfBirth    pgtype.Date  `json:"date_of_birth"`
+	Bio            *string      `json:"bio"`
+	Status         PlayerStatus `json:"status"`
+}
+
+// Full field update for an existing player. Service layer applies partial
+// request fields over current state before calling this query.
+// id and organization_id are immutable and used only in the WHERE clause.
+func (q *Queries) UpdatePlayer(ctx context.Context, arg UpdatePlayerParams) (Player, error) {
+	row := q.db.QueryRow(ctx, updatePlayer,
+		arg.ID,
+		arg.OrganizationID,
+		arg.DisplayName,
+		arg.JerseyNumber,
+		arg.Position,
+		arg.HeightCm,
+		arg.WeightKg,
+		arg.DominantHand,
+		arg.Nationality,
+		arg.DateOfBirth,
+		arg.Bio,
+		arg.Status,
+	)
+	var i Player
+	err := row.Scan(
+		&i.ID,
+		&i.OrganizationID,
+		&i.UserID,
+		&i.DisplayName,
+		&i.JerseyNumber,
+		&i.Position,
+		&i.HeightCm,
+		&i.WeightKg,
+		&i.DominantHand,
+		&i.Nationality,
+		&i.DateOfBirth,
+		&i.Status,
+		&i.Bio,
+		&i.Metadata,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
 }
