@@ -1,7 +1,7 @@
 # PlayArena — Project State & Handoff Document
 
 **Last Updated:** 2026-06-01  
-**Build status:** `go build ./...` passing, `go vet ./...` clean  
+**Build status:** `go build ./...` passing, `go vet ./...` clean, `sqlc generate` clean  
 **Migrations applied:** 000001 – 000018  
 **Go version:** 1.25.6  
 **Database:** PostgreSQL 17
@@ -93,6 +93,14 @@ backend/
 │   │   ├── handler.go
 │   │   └── routes.go
 │   ├── matches/                            Matches domain (fully implemented)
+│   │   ├── errors.go
+│   │   ├── dto.go
+│   │   ├── model.go
+│   │   ├── repository.go
+│   │   ├── service.go
+│   │   ├── handler.go
+│   │   └── routes.go
+│   ├── match_events/                       Match Events domain (fully implemented)
 │   │   ├── errors.go
 │   │   ├── dto.go
 │   │   ├── model.go
@@ -439,6 +447,7 @@ Each access token carries **exactly one** `organization_id`. The token is org-co
 | **Tournaments** | `errors.go`, `dto.go`, `model.go`, `repository.go`, `service.go`, `handler.go`, `routes.go` | Complete |
 | **Tournament Registrations** | `errors.go`, `dto.go`, `model.go`, `repository.go`, `service.go`, `handler.go`, `routes.go` | Complete |
 | **Matches** | `errors.go`, `dto.go`, `model.go`, `repository.go`, `service.go`, `handler.go`, `routes.go` | Complete |
+| **Match Events** | `errors.go`, `dto.go`, `model.go`, `repository.go`, `service.go`, `handler.go`, `routes.go` | Complete |
 | **Platform / Config** | `config.go` | Complete |
 | **Platform / Database** | `postgres.go` | Complete |
 | **Platform / Logger** | `logger.go` | Complete |
@@ -467,6 +476,7 @@ Each access token carries **exactly one** `organization_id`. The token is org-co
 | `POST` | `/api/v1/auth/refresh` | No | Rotate refresh token; issue new access + refresh tokens |
 | `POST` | `/api/v1/auth/logout` | No | Revoke refresh token by value |
 | `GET` | `/api/v1/auth/me` | Yes | Return profile + role + org context for authenticated user |
+| `GET` | `/api/v1/auth/admin-only` | Yes | RBAC demonstration endpoint; requires `role.assign` permission; returns caller's principal (user_id, email, role, org_id) |
 
 ### Organizations (`/api/v1/organizations`)
 
@@ -530,6 +540,16 @@ Each access token carries **exactly one** `organization_id`. The token is org-co
 | `GET` | `/matches/{id}` | Yes | — | Get match by UUID; returns all statuses including cancelled/completed |
 | `PATCH` | `/matches/{id}` | Yes | `match.update` | Partial update; validates status transitions, winner, participant changes; BOLA-guarded |
 | `DELETE` | `/matches/{id}` | Yes | `match.delete` | Soft-cancel — sets `status = cancelled`; terminal-state guard; BOLA-guarded |
+
+### Match Events (`/api/v1/organizations/{slug}/matches/{matchId}/events`)
+
+| Method | Path | Auth | Permission | Description |
+|--------|------|:----:|-----------|-------------|
+| `POST` | `/events` | Yes | `match.score` | Record event; validates match live, event type, participants, corrections; acquires `FOR UPDATE` lock |
+| `GET` | `/events` | Yes | — | List events in sequence order (paginated; `?limit`, `?offset`, `?effective_only`) |
+| `GET` | `/events/{eventId}` | Yes | — | Get event by UUID; scoped to match and org |
+
+No PATCH or DELETE endpoints exist. Match Events are append-only by design. Corrections are represented by inserting a `score_correction` event.
 
 ### Health
 
@@ -718,6 +738,173 @@ Attempting to update or cancel a match in a terminal status returns `ErrMatchNot
 
 All writes are transactional. `EntityType = "matches"`. `new_data` is always derived from the actual DB-returned row, never from request input.
 
+### Phase 8B — Match Events (Complete)
+
+Match Events are the canonical competition activity log and the foundation for Phase 9 Live Scoring and Phase 10 Rankings & Standings. The table is append-only and immutable: no UPDATE or DELETE is ever performed. Corrections are expressed by inserting a `score_correction` event that references the target via `cancels_event_id`.
+
+#### Files Added
+
+| File | Purpose |
+|------|---------|
+| `db/queries/match_events.sql` | 14 SQL queries for the match_events domain |
+| `internal/match_events/errors.go` | 14 typed domain error sentinels |
+| `internal/match_events/model.go` | `ListParams`, pagination constants |
+| `internal/match_events/dto.go` | `CreateRequest`, `Response`, `ListResponse` |
+| `internal/match_events/repository.go` | DB access: reads, `CreateWithAudit` transaction |
+| `internal/match_events/service.go` | Business logic, validation, BOLA guard, response mapping |
+| `internal/match_events/handler.go` | HTTP handlers + error mapping + structured logging |
+| `internal/match_events/routes.go` | `RegisterRoutes()` — mounts `/{slug}/matches/{matchId}/events` |
+
+#### Files Modified
+
+| File | Change |
+|------|--------|
+| `db/sqlc/match_events.sql.go` | Regenerated — 14 query functions |
+| `internal/bootstrap/modules.go` | Added `match_events.RegisterRoutes(...)` |
+
+#### SQL Queries Added (`db/queries/match_events.sql`)
+
+| Query | Purpose |
+|-------|---------|
+| `LockMatchForUpdate` | `SELECT … FOR UPDATE` — serialises concurrent inserts; returns status + participant fields for validation |
+| `GetMaxSequenceNumber` | `COALESCE(MAX(sequence_number), 0)::bigint` — run inside lock to compute next sequence |
+| `CreateMatchEvent` | INSERT RETURNING * |
+| `GetMatchEventByMatchAndID` | `WHERE id = $1 AND match_id = $2 AND organization_id = $3` — enforces resource hierarchy |
+| `GetMatchEventByID` | `WHERE id = $1 AND organization_id = $2` — org-scoped single event read |
+| `ListMatchEventsByMatch` | Raw timeline `ORDER BY sequence_number ASC` with pagination |
+| `ListEffectiveMatchEventsByMatch` | Raw timeline minus cancelled events (for score display) |
+| `CountMatchEventsByMatch` | Raw count for pagination |
+| `CountEffectiveMatchEventsByMatch` | Effective count for pagination |
+| `CountMatchEventsByType` | Lifecycle uniqueness check inside the lock |
+| `GetMatchEventForCorrection` | Fetch target event fields for correction validation |
+| `GetEventCancellation` | Check whether target event is already cancelled |
+| `IsPlayerOnParticipatingTeam` | `EXISTS` on `team_memberships` — team-format player validation |
+| `IsPlayerOnTeam` | `EXISTS` on `team_memberships` — cross-team attribution check |
+
+#### Event Model
+
+The `match_event_type` ENUM defines exactly 21 recordable event types. No new types may be invented at the application layer.
+
+| Category | Event Types |
+|----------|-------------|
+| Lifecycle | `match_started`, `match_ended`, `half_started`, `half_ended`, `timeout_called`, `timeout_ended` |
+| Raid | `raid_attempt`, `raid_successful`, `raid_empty`, `bonus_point_awarded` |
+| Tackle | `tackle_successful`, `super_tackle` |
+| Compound | `super_raid`, `do_or_die_raid`, `all_out` |
+| Player state | `player_out`, `player_revived`, `player_substituted`, `player_injured` |
+| Administrative | `penalty_awarded`, `score_correction` |
+
+#### Sequence Number Guarantee
+
+`sequence_number` is never accepted from the client. It is always computed server-side inside the `FOR UPDATE` transaction using the following sequence:
+
+```
+LockMatchForUpdate(matchID, organizationID)   ← acquires row lock
+  → GetMaxSequenceNumber(matchID)              ← safe under lock
+  → nextSeq = max + 1
+  → CreateMatchEvent(... sequence_number = nextSeq ...)
+  → CreateAuditLog(...)
+  → COMMIT
+```
+
+The `FOR UPDATE` lock on the match row blocks all concurrent event inserts for the same match until the current transaction commits. Two concurrent inserts for the same match cannot receive the same `sequence_number`. The `uq_match_events_sequence` UNIQUE constraint on `(match_id, sequence_number)` provides an independent DB-level backstop.
+
+**Review status: PASS** — Verified: concurrent inserts for the same match cannot receive the same sequence_number.
+
+#### Match State Enforcement
+
+Events may only be recorded when `match.status = live`. All other statuses (`scheduled`, `completed`, `cancelled`, `abandoned`) return `ErrMatchNotLive` (HTTP 422). This check is performed **inside the transaction** after the `FOR UPDATE` lock is acquired — a concurrent match status transition cannot bypass it.
+
+#### Participant Validation
+
+| Scenario | Rule |
+|----------|------|
+| `team_id` provided | Must equal `home_team_id` or `away_team_id` of the match |
+| `player_id` provided — individual tournament | Must equal `home_player_id` or `away_player_id` of the match |
+| `player_id` provided — team tournament | Must have an active `team_memberships` row on either participating team |
+| Both `team_id` and `player_id` provided | Player must have an active membership on the stated team specifically |
+
+Cross-team player attribution is rejected (`ErrPlayerNotOnTeam`, HTTP 422).
+
+#### Score Correction Rules
+
+A `score_correction` event must set `cancels_event_id`. The following are validated inside the `FOR UPDATE` transaction:
+
+1. Target event must exist (`ErrCancelsEventNotFound`)
+2. Target event must belong to the same match (`ErrCancelsEventCrossMatch`)
+3. Target event must not itself be a `score_correction` (`ErrCannotCancelCorrection`)
+4. Target event must not already be cancelled (`ErrEventAlreadyCancelled`)
+
+Correction chains are impossible because rule 3 prevents correcting another correction. Double cancellation is impossible because rule 4 runs under the match lock.
+
+#### Effective Timeline
+
+`?effective_only=true` on the List endpoint excludes events whose `id` appears in any `cancels_event_id` within the same match. The raw timeline (including cancelled events) is always available as the default view for audit and replay.
+
+#### Match Events Authorization
+
+| Method | Permission | Notes |
+|--------|-----------|-------|
+| `POST` | `match.score` | Granted to: `platform_admin`, `org_owner`, `org_admin`, `scorer` |
+| `GET /events` | RequireAuth | Any authenticated user |
+| `GET /events/{id}` | RequireAuth | Any authenticated user |
+
+Coaches (`match.update`) cannot record events. Scorers (`match.score`) can record events but cannot create or cancel matches.
+
+#### Match Events Audit Logging
+
+Every event INSERT generates one `AuditActionCreate` record with `entity_type = "match_events"`. The audit INSERT is inside the same transaction as the event INSERT — both commit or both roll back. Score corrections generate their own `create` audit records. There are no update or delete audit records for this table.
+
+#### Match Events Multi-Tenant Security
+
+- All event queries scope by `organization_id`.
+- `organization_id` on the event row is derived server-side from the locked match row — never from request input.
+- `trg_match_events_org_consistency` trigger validates `organization_id == match.organization_id` on every INSERT.
+- Cross-org event creation, reads, and corrections are all prevented by overlapping application and DB-level controls.
+
+#### Match Events BOLA Protection
+
+- **Write operations:** `assertOrgOwnership(actorOrgID, orgID)` called in `service.go:Create`.
+- **Match validation:** `GetMatchByID(matchID, organizationID)` confirms match belongs to the URL org before opening the transaction.
+- **Transaction validation:** `LockMatchForUpdate(matchID, organizationID)` re-confirms inside the transaction.
+- **Platform admins** remain exempt via `assertOrgOwnership("", targetID) → nil`.
+
+### Phase 8B Hardening — Resource Hierarchy Fix
+
+**Problem identified during production review:** The original `GetByID` implementation fetched an event by `(event_id, organization_id)` only. A user could retrieve an event from match M_B by specifying any valid match M_A in their org in the URL — the URL's `{matchId}` was validated to exist but was never used to scope the event lookup.
+
+**Fix applied:** A new query `GetMatchEventByMatchAndID` was added to `db/queries/match_events.sql`:
+
+```sql
+SELECT * FROM match_events
+WHERE  id              = $1
+  AND  match_id        = $2
+  AND  organization_id = $3
+LIMIT  1;
+```
+
+`repository.go:GetByID` was updated to accept a `matchID` parameter and call `GetMatchEventByMatchAndID`. `service.go:GetByID` was updated to pass `mid` to the repository. The event must now belong to the match specified in the URL, not just to the organization.
+
+**Review status: PASS** — An event from Match B cannot be retrieved through a Match A URL.
+
+### Phase 8B — Production Hardening Review
+
+Adversarial review performed after implementation and hardening fix. Results:
+
+| Check | Result |
+|-------|--------|
+| Multi-tenant isolation | **PASS** |
+| BOLA protection | **PASS** |
+| Match-state enforcement | **PASS** |
+| Event-type validation | **PASS** |
+| Participant validation | **PASS** |
+| Correction integrity | **PASS** |
+| Timeline ordering integrity | **PASS** |
+| Concurrency safety | **PASS** |
+| Audit logging correctness | **PASS** |
+| Authorization coverage | **PASS** |
+| Data integrity | **PASS** |
+
 ### Concurrency Hardening — Registration Capacity
 
 A code review identified a TOCTOU (Time of Check to Time of Use) race condition in the original capacity enforcement:
@@ -785,7 +972,8 @@ The service-layer guard remains in place as the first line of defence for sequen
 - [x] **Tournament registrations module** — Phase 7B
 - [x] **match.delete permission** — migration 000018 (Phase 7C)
 - [x] **Matches module** — Phase 8A (CRUD, lifecycle, participant/registration validation, concurrency hardening)
-- [x] **Audit logging** — wired into all organization, player, team, tournament, registration, and match mutations
+- [x] **Match Events module** — Phase 8B (append-only event log, sequence integrity, participant validation, correction rules, production hardening)
+- [x] **Audit logging** — wired into all organization, player, team, tournament, registration, match, and match event mutations
 - [x] **BOLA protection** — enforced in every write service across all implemented modules
 
 ### Must-have before first production deployment
@@ -793,16 +981,16 @@ The service-layer guard remains in place as the first line of defence for sequen
 - [ ] **Password reset flow** — `POST /api/v1/auth/forgot-password` / `POST /api/v1/auth/reset-password`
 - [ ] **Refresh token cleanup job** — `DeleteExpiredRefreshTokens` is generated and correct but never called. Without it the `refresh_tokens` table grows unboundedly.
 - [ ] **Email verification token cleanup job** — `DeleteExpiredVerificationTokens` is implemented on the service but never called on a schedule.
-- [ ] **CORS configuration** — `internal/platform/middleware/cors.go` is a stub. Browsers will block cross-origin requests.
+- [ ] **CORS configuration** — `internal/platform/middleware/cors.go` is fully implemented (`CORS(allowedOrigins)` + origin matching + OPTIONS preflight handling) but is not wired into the router. `bootstrap/router.go` does not call `r.Use(middleware.CORS(...))`. Browsers will block cross-origin requests until it is added to the middleware stack.
 - [ ] **Rate limiting** — `internal/platform/middleware/ratelimit.go` is a stub. Auth endpoints are unprotected against brute-force attacks.
 - [ ] **Remove `verification_token` from register response in production** — currently returned for development convenience; must be gated behind `IsDevelopment()` before deployment.
 
 ### Required for feature completeness
 
 - [ ] **Users module** — User management: list, get, update profile, change password, deactivate.
-- [ ] **Match events module** — `match_events` INSERT pipeline; sequence-number generation with row-level locking; event validation and audit logging. (Phase 8B)
-- [ ] **Rankings module** — Computed standings; depends on match and tournament modules. (Phase 10)
-- [ ] **Media module** — File upload coordination, `media_attachments` CRUD, storage backend integration. (Phase 11)
+- [ ] **Live Scoring** — Score derivation from event log; match score aggregation; Phase 9.
+- [ ] **Rankings module** — Computed standings; depends on match and match events modules. Phase 10.
+- [ ] **Media module** — File upload coordination, `media_attachments` CRUD, storage backend integration. Phase 11.
 - [ ] **News module** — Stub exists; no business logic.
 
 ### Technical debt
@@ -834,7 +1022,7 @@ The service-layer guard remains in place as the first line of defence for sequen
 | Phase 7B | Tournament registrations | **COMPLETE** |
 | Phase 7C | RBAC correction — `match.delete` permission | **COMPLETE** |
 | Phase 8A | Matches | **COMPLETE** |
-| Phase 8B | Match Events | NOT STARTED |
+| Phase 8B | Match Events | **COMPLETE** |
 | Phase 9 | Live Scoring | NOT STARTED |
 | Phase 10 | Rankings & Standings | NOT STARTED |
 | Phase 11 | Media | NOT STARTED |
@@ -843,26 +1031,15 @@ The service-layer guard remains in place as the first line of defence for sequen
 
 ---
 
-### Phase 8B — Match Events (next)
+### Phase 9 — Live Scoring (next)
 
-**Goal:** scorers can record the match event timeline; match statistics are derivable from the immutable event log.
+**Goal:** derive and serve match scores from the immutable event log.
 
-1. **`match_events` INSERT pipeline** — `POST /api/v1/organizations/{slug}/matches/{id}/events`. Requires a row-level lock (`SELECT … FOR UPDATE`) on the parent `matches` row to safely compute `MAX(sequence_number) + 1` under concurrent scorers — same pattern as the registration capacity fix.
-2. **Scoring events** — raid outcomes, tackle results, bonus points, penalties; payload stored in JSONB.
-3. **Match statistics** — aggregate `match_events` to derive per-team and per-player stats on read. No denormalized score columns exist; all derived.
-4. **Score corrections** — `score_correction` event with `cancels_event_id`. Effective event log excludes events whose `id` appears as any `cancels_event_id` within the same match.
-5. **Event validation** — match must be `live` to accept events; event type must be valid for the sport; sequence number must be monotonically increasing.
-6. **Audit logging** — append-only; no UPDATE or DELETE ever on `match_events`.
-
----
-
-### Phase 9 — Live Scoring
-
-**Goal:** real-time score delivery to spectators.
-
-1. **WebSocket / SSE push** — push live score updates as match events are recorded.
-2. **Score computation endpoint** — `GET /api/v1/organizations/{slug}/matches/{id}/score` aggregates the event log to return current scores and team stats.
-3. **Cache strategy** — derived scores are expensive; cache on read and invalidate on new event.
+1. **Score derivation model** — define which event types contribute points and how (raid points, tackle bonus, all-out bonus, penalties, corrections).
+2. **Event-to-score mapping** — aggregate `match_events` to compute home and away scores per match; exclude cancelled events via the effective-log pattern.
+3. **Match score endpoint** — `GET /api/v1/organizations/{slug}/matches/{id}/score` returns current scores and key statistics derived on read from the event log.
+4. **Correction handling** — scores must be recalculated when a `score_correction` event exists; cancelled events must be excluded atomically.
+5. **Match completion workflow** — final score derivation at `match.status = completed`.
 
 ---
 
@@ -890,7 +1067,7 @@ The service-layer guard remains in place as the first line of defence for sequen
 
 ### Phase 13 — Hardening, Observability & Tests
 
-1. **Test suite** — integration tests using `testcontainers-go` against a real PostgreSQL 17 instance. Priority: auth service, multi-tenant isolation, tournament registration rules, match lifecycle and concurrency invariants.
+1. **Test suite** — integration tests using `testcontainers-go` against a real PostgreSQL 17 instance. Priority: auth service, multi-tenant isolation, tournament registration rules, match lifecycle and concurrency invariants, match event sequence integrity.
 2. **OpenTelemetry tracing** — instrument repository and service layers.
 3. **Prometheus metrics** — request latency histograms, DB pool stats, active sessions counter.
 4. **Password reset flow** — `POST /auth/forgot-password` / `POST /auth/reset-password`.
@@ -901,17 +1078,17 @@ The service-layer guard remains in place as the first line of defence for sequen
 
 ## 10. Next Recommended Phase
 
-**Phase 8B — Match Events**
+**Phase 9 — Live Scoring**
 
-Phase 8A (Matches) is complete. All prerequisite modules are in place: organizations, players, teams, team memberships, tournaments, tournament registrations, and match CRUD with full lifecycle management. The `match_events` table exists in the schema with all FK constraints, triggers, indexes, and the append-only immutability contract already defined. The next step is implementing the Match Events module so scorers can record in-match events and match statistics become derivable from the immutable event log.
+Phase 8B (Match Events) is complete and production-hardened. The immutable event log is in place: every in-match action is recorded as an append-only row with a guaranteed-unique sequence number. The next step is implementing score derivation — reading the event log and computing scores, stats, and match outcomes from it. Phase 9 depends directly on the Phase 8B event pipeline and is the prerequisite for Phase 10 (Rankings & Standings).
 
-**Goals:**
+**Planning goals:**
 
-- Match event timeline — recording and sequencing individual in-match events
-- Scoring events — raid outcomes, tackle results, bonus points, penalties
-- Match statistics — per-team and per-player stats aggregated from the event log on read
-- Event validation — match must be `live`; sequence numbers monotonically increasing; row-level lock on parent match during insert
-- Audit logging — append-only; events are never updated or deleted
+- Score derivation model — which event types contribute points, and how
+- Event-to-score mapping — per-team and per-player aggregation from the effective event log
+- Match score aggregation endpoint
+- Correction handling — cancelled events excluded from score computation
+- Match completion workflow — final score at status = completed
 
 ---
 
@@ -931,6 +1108,8 @@ Phase 8A (Matches) is complete. All prerequisite modules are in place: organizat
 | `backend/internal/tournament_registrations/repository.go` | Reference for row-lock capacity enforcement under concurrency |
 | `backend/internal/matches/service.go` | Match lifecycle, participant validation, winner rules, BOLA guard |
 | `backend/internal/matches/repository.go` | Match transactional writes; FOR SHARE tournament lock pattern |
+| `backend/internal/match_events/service.go` | Event validation, correction rules, participant checks, BOLA guard |
+| `backend/internal/match_events/repository.go` | `CreateWithAudit` — FOR UPDATE lock, sequence computation, all in-transaction validation |
 | `backend/internal/bootstrap/modules.go` | Single place to register new domain modules |
 | `backend/internal/platform/pgutil/pgutil.go` | Shared UUID and constraint helpers used by all domain repositories |
 | `backend/internal/platform/validator/validator.go` | JSON decode + struct-tag validation (no external deps) |
