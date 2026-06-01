@@ -16,11 +16,12 @@ import (
 //
 // Authorization matrix:
 //
-//	POST   /        RequireAuth + RequirePermission("tournament.create")
-//	GET    /        RequireAuth
-//	GET    /{id}    RequireAuth
-//	PATCH  /{id}    RequireAuth + RequirePermission("tournament.update")
-//	DELETE /{id}    RequireAuth + RequirePermission("tournament.delete")
+//	POST   /                  RequireAuth + RequirePermission("tournament.create")
+//	GET    /                  RequireAuth
+//	GET    /{id}              RequireAuth
+//	GET    /{id}/standings    RequireAuth
+//	PATCH  /{id}              RequireAuth + RequirePermission("tournament.update")
+//	DELETE /{id}              RequireAuth + RequirePermission("tournament.delete")
 func RegisterRoutes(
 	r chi.Router,
 	pool *pgxpool.Pool,
@@ -46,6 +47,9 @@ func RegisterRoutes(
 
 		// Get by ID — any authenticated user
 		r.Get("/{id}", h.GetByID)
+
+		// Standings — derived from snapshotted match scores; any authenticated user
+		r.Get("/{id}/standings", h.GetStandings)
 
 		// Update (including status transitions) — requires tournament.update permission
 		r.With(auth.RequirePermission(authz, "tournament.update")).

@@ -11,6 +11,7 @@ import (
 
 	db "github.com/4yushraman-jpg/playarena/db/sqlc"
 	"github.com/4yushraman-jpg/playarena/internal/platform/pgutil"
+	"github.com/4yushraman-jpg/playarena/internal/scoring"
 )
 
 // Repository provides data access for the matches domain.
@@ -242,6 +243,14 @@ type updateMatchTxParams struct {
 	lockTournament bool // true when transitioning to live/completed/abandoned
 	tournamentID   pgtype.UUID
 	organizationID pgtype.UUID
+	// isCompletion is true when the transition is live → completed.
+	// The repository locks the match row, computes the final score from the
+	// effective event log, validates winner consistency, and snapshots
+	// home_score / away_score atomically with the status write.
+	isCompletion bool
+	// isWalkover is passed from the service so the repository can exempt
+	// walkover completions from the winner-vs-score consistency check.
+	isWalkover bool
 }
 
 // UpdateWithAudit atomically updates a match and writes an update audit record.
@@ -271,6 +280,51 @@ func (r *Repository) UpdateWithAudit(ctx context.Context, p updateMatchTxParams)
 		if status != db.TournamentStatusOngoing {
 			return nil, ErrTournamentNotOngoing
 		}
+	}
+
+	// ── Score snapshot for live → completed transitions ─────────────────────
+	// Lock the match row FOR UPDATE to block concurrent event inserts, then
+	// derive the final score from the effective event log while the lock is
+	// held.  Both steps must be inside this transaction so the snapshot cannot
+	// diverge from the log.
+	if p.isCompletion {
+		locked, err := qtx.LockMatchForUpdate(ctx, db.LockMatchForUpdateParams{
+			ID:             p.updateParams.ID,
+			OrganizationID: p.organizationID,
+		})
+		if err != nil {
+			if err == pgx.ErrNoRows {
+				return nil, ErrMatchNotFound
+			}
+			return nil, err
+		}
+		if locked.Status != db.MatchStatusLive {
+			return nil, ErrMatchNotUpdatable
+		}
+
+		events, err := qtx.GetEffectiveMatchEventsForScore(ctx, db.GetEffectiveMatchEventsForScoreParams{
+			MatchID:        p.updateParams.ID,
+			OrganizationID: p.organizationID,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		matchForEngine := &db.Match{
+			ID:           locked.ID,
+			HomeTeamID:   locked.HomeTeamID,
+			AwayTeamID:   locked.AwayTeamID,
+			HomePlayerID: locked.HomePlayerID,
+			AwayPlayerID: locked.AwayPlayerID,
+		}
+		result := scoring.NewScoreEngine().Compute(matchForEngine, events)
+
+		if err := validateWinnerVsScore(p, locked, result.HomeScore, result.AwayScore); err != nil {
+			return nil, err
+		}
+
+		p.updateParams.HomeScore = int32(result.HomeScore)
+		p.updateParams.AwayScore = int32(result.AwayScore)
 	}
 
 	m, err := qtx.UpdateMatch(ctx, p.updateParams)
@@ -381,6 +435,8 @@ func matchToAuditJSON(m *db.Match) ([]byte, error) {
 		"winner_team_id":   pgutil.UUIDToString(m.WinnerTeamID),
 		"winner_player_id": pgutil.UUIDToString(m.WinnerPlayerID),
 		"is_walkover":      m.IsWalkover,
+		"home_score":       m.HomeScore,
+		"away_score":       m.AwayScore,
 		"notes":            m.Notes,
 		"metadata":         metadata,
 		"created_at":       m.CreatedAt.Time.UTC().Format(time.RFC3339),
@@ -401,4 +457,62 @@ func derefStr(s *string) string {
 		return ""
 	}
 	return *s
+}
+
+// validateWinnerVsScore verifies that the declared winner is consistent with
+// the computed final score.  Walkovers are always exempt: the score is 0-0
+// by convention but a winner must be set.
+//
+// Rules (non-walkover):
+//   - homeScore > awayScore  → winner must be the home participant
+//   - awayScore > homeScore  → winner must be the away participant
+//   - homeScore == awayScore → winner must be absent (draw)
+func validateWinnerVsScore(
+	p updateMatchTxParams,
+	locked db.LockMatchForUpdateRow,
+	homeScore, awayScore int,
+) error {
+	if p.isWalkover {
+		return nil
+	}
+
+	// Resolve the declared winner UUID from the update params.
+	var winnerUID pgtype.UUID
+	if p.updateParams.WinnerTeamID.Valid {
+		winnerUID = p.updateParams.WinnerTeamID
+	} else if p.updateParams.WinnerPlayerID.Valid {
+		winnerUID = p.updateParams.WinnerPlayerID
+	}
+
+	// Resolve the home participant UUID from the locked match row.
+	var homeUID pgtype.UUID
+	if locked.HomeTeamID.Valid {
+		homeUID = locked.HomeTeamID
+	} else if locked.HomePlayerID.Valid {
+		homeUID = locked.HomePlayerID
+	}
+
+	// Resolve the away participant UUID from the locked match row.
+	var awayUID pgtype.UUID
+	if locked.AwayTeamID.Valid {
+		awayUID = locked.AwayTeamID
+	} else if locked.AwayPlayerID.Valid {
+		awayUID = locked.AwayPlayerID
+	}
+
+	switch {
+	case homeScore > awayScore:
+		if !winnerUID.Valid || winnerUID.Bytes != homeUID.Bytes {
+			return ErrWinnerScoreMismatch
+		}
+	case awayScore > homeScore:
+		if !winnerUID.Valid || winnerUID.Bytes != awayUID.Bytes {
+			return ErrWinnerScoreMismatch
+		}
+	default: // equal scores → draw
+		if winnerUID.Valid {
+			return ErrWinnerScoreMismatch
+		}
+	}
+	return nil
 }

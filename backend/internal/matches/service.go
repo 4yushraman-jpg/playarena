@@ -268,6 +268,10 @@ func (s *Service) Update(
 	}
 
 	// Start with current state; apply non-nil request fields over it.
+	// HomeScore and AwayScore default to 0 for non-terminal matches.
+	// For the live → completed transition the repository overwrites them with
+	// the computed score under the match row lock, so the value here is only
+	// a placeholder that keeps non-completion updates idempotent.
 	params := db.UpdateMatchParams{
 		ID:             current.ID,
 		OrganizationID: current.OrganizationID,
@@ -286,6 +290,8 @@ func (s *Service) Update(
 		WinnerTeamID:   current.WinnerTeamID,
 		WinnerPlayerID: current.WinnerPlayerID,
 		Notes:          current.Notes,
+		HomeScore:      current.HomeScore,
+		AwayScore:      current.AwayScore,
 	}
 
 	if req.RoundNumber != nil {
@@ -414,6 +420,8 @@ func (s *Service) Update(
 		lockTournament: lockTournament,
 		tournamentID:   current.TournamentID,
 		organizationID: current.OrganizationID,
+		isCompletion:   params.Status == db.MatchStatusCompleted,
+		isWalkover:     current.IsWalkover,
 	})
 	if err != nil {
 		return nil, err
@@ -672,6 +680,8 @@ func matchToResponse(m *db.Match) *Response {
 		WinnerTeamID:   uuidStringPtr(m.WinnerTeamID),
 		WinnerPlayerID: uuidStringPtr(m.WinnerPlayerID),
 		IsWalkover:     m.IsWalkover,
+		HomeScore:      m.HomeScore,
+		AwayScore:      m.AwayScore,
 		Notes:          m.Notes,
 		CreatedAt:      m.CreatedAt.Time.UTC().Format(time.RFC3339),
 		UpdatedAt:      m.UpdatedAt.Time.UTC().Format(time.RFC3339),

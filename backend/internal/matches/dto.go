@@ -78,9 +78,13 @@ type Response struct {
 	WinnerTeamID   *string `json:"winner_team_id,omitempty"`
 	WinnerPlayerID *string `json:"winner_player_id,omitempty"`
 	IsWalkover     bool    `json:"is_walkover"`
-	Notes          *string `json:"notes,omitempty"`
-	CreatedAt      string  `json:"created_at"`
-	UpdatedAt      string  `json:"updated_at"`
+	// HomeScore and AwayScore are the final snapshotted scores.
+	// Both are 0 for any non-completed match and for walkovers.
+	HomeScore int32   `json:"home_score"`
+	AwayScore int32   `json:"away_score"`
+	Notes     *string `json:"notes,omitempty"`
+	CreatedAt string  `json:"created_at"`
+	UpdatedAt string  `json:"updated_at"`
 }
 
 // ListResponse wraps a paginated list of matches.

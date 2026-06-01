@@ -90,6 +90,25 @@ func (r *Repository) Count(ctx context.Context, orgID pgtype.UUID, params ListPa
 	})
 }
 
+// GetCompletedMatchesForStandings returns all completed matches for a
+// tournament in creation order.  Both organization_id and tournament_id are
+// required for multi-tenant isolation.
+func (r *Repository) GetCompletedMatchesForStandings(ctx context.Context, tournamentID, orgID pgtype.UUID) ([]db.ListCompletedMatchesByTournamentRow, error) {
+	return r.queries.ListCompletedMatchesByTournament(ctx, db.ListCompletedMatchesByTournamentParams{
+		TournamentID:   tournamentID,
+		OrganizationID: orgID,
+	})
+}
+
+// GetRegistrationsForStandings returns all approved registrations for a
+// tournament, ordered by registered_at ASC for deterministic tiebreaking.
+// No organization_id filter: registrations may come from any org in
+// multi-club tournaments; the host tournament is already verified by the
+// caller via (tournamentID, hostOrgID) before this method is invoked.
+func (r *Repository) GetRegistrationsForStandings(ctx context.Context, tournamentID pgtype.UUID) ([]db.ListApprovedRegistrationsForStandingsRow, error) {
+	return r.queries.ListApprovedRegistrationsForStandings(ctx, tournamentID)
+}
+
 // ── transactional writes ──────────────────────────────────────────────────────
 
 type createTournamentTxParams struct {

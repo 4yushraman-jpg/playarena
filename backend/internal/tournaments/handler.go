@@ -172,6 +172,35 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 	response.Write(w, http.StatusOK, t)
 }
 
+// GetStandings handles GET /api/v1/organizations/{slug}/tournaments/{id}/standings.
+// Derives current standings from snapshotted match scores.  No permission
+// beyond RequireAuth is required — standings are readable by any authenticated user.
+func (h *Handler) GetStandings(w http.ResponseWriter, r *http.Request) {
+	slug := chi.URLParam(r, "slug")
+	id := chi.URLParam(r, "id")
+
+	resp, err := h.svc.GetStandings(r.Context(), slug, id)
+	if err != nil {
+		if errors.Is(err, ErrOrganizationNotFound) {
+			response.Error(w, http.StatusNotFound, "organization not found")
+			return
+		}
+		if errors.Is(err, ErrTournamentNotFound) {
+			response.Error(w, http.StatusNotFound, "tournament not found")
+			return
+		}
+		h.log.ErrorContext(r.Context(), "tournaments.standings.failed",
+			slog.String("org_slug", slug),
+			slog.String("tournament_id", id),
+			slog.Any("error", err),
+			slog.String("request_id", chimw.GetReqID(r.Context())),
+		)
+		response.Error(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+	response.Write(w, http.StatusOK, resp)
+}
+
 // Delete handles DELETE /api/v1/organizations/{slug}/tournaments/{id}.
 // Soft-cancels by setting status to cancelled. No hard deletes.
 func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {

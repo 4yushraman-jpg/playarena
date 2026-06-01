@@ -18,7 +18,7 @@ SET    status     = 'cancelled',
 WHERE  id              = $1
   AND  organization_id = $2
   AND  status NOT IN ('completed', 'cancelled', 'abandoned')
-RETURNING id, tournament_id, organization_id, round_number, round_name, match_number, home_team_id, away_team_id, home_player_id, away_player_id, venue, scheduled_at, started_at, ended_at, status, winner_team_id, winner_player_id, is_walkover, notes, metadata, created_at, updated_at
+RETURNING id, tournament_id, organization_id, round_number, round_name, match_number, home_team_id, away_team_id, home_player_id, away_player_id, venue, scheduled_at, started_at, ended_at, status, winner_team_id, winner_player_id, is_walkover, notes, metadata, created_at, updated_at, home_score, away_score
 `
 
 type CancelMatchParams struct {
@@ -56,6 +56,8 @@ func (q *Queries) CancelMatch(ctx context.Context, arg CancelMatchParams) (Match
 		&i.Metadata,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.HomeScore,
+		&i.AwayScore,
 	)
 	return i, err
 }
@@ -111,7 +113,7 @@ INSERT INTO matches (
     notes
 )
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-RETURNING id, tournament_id, organization_id, round_number, round_name, match_number, home_team_id, away_team_id, home_player_id, away_player_id, venue, scheduled_at, started_at, ended_at, status, winner_team_id, winner_player_id, is_walkover, notes, metadata, created_at, updated_at
+RETURNING id, tournament_id, organization_id, round_number, round_name, match_number, home_team_id, away_team_id, home_player_id, away_player_id, venue, scheduled_at, started_at, ended_at, status, winner_team_id, winner_player_id, is_walkover, notes, metadata, created_at, updated_at, home_score, away_score
 `
 
 type CreateMatchParams struct {
@@ -174,13 +176,15 @@ func (q *Queries) CreateMatch(ctx context.Context, arg CreateMatchParams) (Match
 		&i.Metadata,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.HomeScore,
+		&i.AwayScore,
 	)
 	return i, err
 }
 
 const getMatchByID = `-- name: GetMatchByID :one
 
-SELECT id, tournament_id, organization_id, round_number, round_name, match_number, home_team_id, away_team_id, home_player_id, away_player_id, venue, scheduled_at, started_at, ended_at, status, winner_team_id, winner_player_id, is_walkover, notes, metadata, created_at, updated_at
+SELECT id, tournament_id, organization_id, round_number, round_name, match_number, home_team_id, away_team_id, home_player_id, away_player_id, venue, scheduled_at, started_at, ended_at, status, winner_team_id, winner_player_id, is_walkover, notes, metadata, created_at, updated_at, home_score, away_score
 FROM   matches
 WHERE  id              = $1
   AND  organization_id = $2
@@ -220,12 +224,86 @@ func (q *Queries) GetMatchByID(ctx context.Context, arg GetMatchByIDParams) (Mat
 		&i.Metadata,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.HomeScore,
+		&i.AwayScore,
 	)
 	return i, err
 }
 
+const listCompletedMatchesByTournament = `-- name: ListCompletedMatchesByTournament :many
+SELECT id,
+       home_team_id,
+       away_team_id,
+       home_player_id,
+       away_player_id,
+       winner_team_id,
+       winner_player_id,
+       is_walkover,
+       home_score,
+       away_score
+FROM   matches
+WHERE  tournament_id   = $1
+  AND  organization_id = $2
+  AND  status          = 'completed'
+ORDER  BY created_at ASC
+`
+
+type ListCompletedMatchesByTournamentParams struct {
+	TournamentID   pgtype.UUID `json:"tournament_id"`
+	OrganizationID pgtype.UUID `json:"organization_id"`
+}
+
+type ListCompletedMatchesByTournamentRow struct {
+	ID             pgtype.UUID `json:"id"`
+	HomeTeamID     pgtype.UUID `json:"home_team_id"`
+	AwayTeamID     pgtype.UUID `json:"away_team_id"`
+	HomePlayerID   pgtype.UUID `json:"home_player_id"`
+	AwayPlayerID   pgtype.UUID `json:"away_player_id"`
+	WinnerTeamID   pgtype.UUID `json:"winner_team_id"`
+	WinnerPlayerID pgtype.UUID `json:"winner_player_id"`
+	IsWalkover     bool        `json:"is_walkover"`
+	HomeScore      int32       `json:"home_score"`
+	AwayScore      int32       `json:"away_score"`
+}
+
+// Returns all completed matches for a tournament, in creation order.
+// Used exclusively by the standings engine — standing computation MUST NOT
+// read match_events; it reads only these pre-snapshotted score columns.
+// Both organization_id and tournament_id are required to enforce multi-tenant
+// isolation: a caller can only read matches belonging to their own tournament.
+func (q *Queries) ListCompletedMatchesByTournament(ctx context.Context, arg ListCompletedMatchesByTournamentParams) ([]ListCompletedMatchesByTournamentRow, error) {
+	rows, err := q.db.Query(ctx, listCompletedMatchesByTournament, arg.TournamentID, arg.OrganizationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListCompletedMatchesByTournamentRow{}
+	for rows.Next() {
+		var i ListCompletedMatchesByTournamentRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.HomeTeamID,
+			&i.AwayTeamID,
+			&i.HomePlayerID,
+			&i.AwayPlayerID,
+			&i.WinnerTeamID,
+			&i.WinnerPlayerID,
+			&i.IsWalkover,
+			&i.HomeScore,
+			&i.AwayScore,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listMatchesByTournament = `-- name: ListMatchesByTournament :many
-SELECT id, tournament_id, organization_id, round_number, round_name, match_number, home_team_id, away_team_id, home_player_id, away_player_id, venue, scheduled_at, started_at, ended_at, status, winner_team_id, winner_player_id, is_walkover, notes, metadata, created_at, updated_at
+SELECT id, tournament_id, organization_id, round_number, round_name, match_number, home_team_id, away_team_id, home_player_id, away_player_id, venue, scheduled_at, started_at, ended_at, status, winner_team_id, winner_player_id, is_walkover, notes, metadata, created_at, updated_at, home_score, away_score
 FROM   matches
 WHERE  tournament_id   = $1
   AND  organization_id = $2
@@ -270,6 +348,8 @@ func (q *Queries) ListMatchesByTournament(ctx context.Context, arg ListMatchesBy
 			&i.Metadata,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.HomeScore,
+			&i.AwayScore,
 		); err != nil {
 			return nil, err
 		}
@@ -282,7 +362,7 @@ func (q *Queries) ListMatchesByTournament(ctx context.Context, arg ListMatchesBy
 }
 
 const listMatchesPaginated = `-- name: ListMatchesPaginated :many
-SELECT id, tournament_id, organization_id, round_number, round_name, match_number, home_team_id, away_team_id, home_player_id, away_player_id, venue, scheduled_at, started_at, ended_at, status, winner_team_id, winner_player_id, is_walkover, notes, metadata, created_at, updated_at
+SELECT id, tournament_id, organization_id, round_number, round_name, match_number, home_team_id, away_team_id, home_player_id, away_player_id, venue, scheduled_at, started_at, ended_at, status, winner_team_id, winner_player_id, is_walkover, notes, metadata, created_at, updated_at, home_score, away_score
 FROM   matches
 WHERE  organization_id = $1
   AND  ($2::uuid IS NULL
@@ -348,6 +428,8 @@ func (q *Queries) ListMatchesPaginated(ctx context.Context, arg ListMatchesPagin
 			&i.Metadata,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.HomeScore,
+			&i.AwayScore,
 		); err != nil {
 			return nil, err
 		}
@@ -401,11 +483,13 @@ SET    round_number     = $3,
        winner_team_id   = $15,
        winner_player_id = $16,
        notes            = $17,
+       home_score       = $18,
+       away_score       = $19,
        updated_at       = NOW()
 WHERE  id              = $1
   AND  organization_id = $2
   AND  status NOT IN ('completed', 'cancelled', 'abandoned')
-RETURNING id, tournament_id, organization_id, round_number, round_name, match_number, home_team_id, away_team_id, home_player_id, away_player_id, venue, scheduled_at, started_at, ended_at, status, winner_team_id, winner_player_id, is_walkover, notes, metadata, created_at, updated_at
+RETURNING id, tournament_id, organization_id, round_number, round_name, match_number, home_team_id, away_team_id, home_player_id, away_player_id, venue, scheduled_at, started_at, ended_at, status, winner_team_id, winner_player_id, is_walkover, notes, metadata, created_at, updated_at, home_score, away_score
 `
 
 type UpdateMatchParams struct {
@@ -426,12 +510,17 @@ type UpdateMatchParams struct {
 	WinnerTeamID   pgtype.UUID        `json:"winner_team_id"`
 	WinnerPlayerID pgtype.UUID        `json:"winner_player_id"`
 	Notes          *string            `json:"notes"`
+	HomeScore      int32              `json:"home_score"`
+	AwayScore      int32              `json:"away_score"`
 }
 
 // Full mutable-field update. Service layer merges partial request fields over
 // current state. id, organization_id, tournament_id, is_walkover, metadata,
 // and created_at are immutable and never appear in the SET clause.
 // started_at and ended_at are stamped by the service during lifecycle transitions.
+// home_score and away_score ($18, $19) are 0 for all non-completion transitions;
+// for the live → completed transition the repository fills them in after computing
+// the final score from the effective event log under a FOR UPDATE lock on this row.
 // The terminal-state guard (status NOT IN ...) is enforced at the DB level so
 // that two concurrent PATCH requests that both pass the service-layer check
 // cannot both succeed: the second update finds 0 rows and returns ErrNoRows,
@@ -455,6 +544,8 @@ func (q *Queries) UpdateMatch(ctx context.Context, arg UpdateMatchParams) (Match
 		arg.WinnerTeamID,
 		arg.WinnerPlayerID,
 		arg.Notes,
+		arg.HomeScore,
+		arg.AwayScore,
 	)
 	var i Match
 	err := row.Scan(
@@ -480,6 +571,8 @@ func (q *Queries) UpdateMatch(ctx context.Context, arg UpdateMatchParams) (Match
 		&i.Metadata,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.HomeScore,
+		&i.AwayScore,
 	)
 	return i, err
 }

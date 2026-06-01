@@ -115,3 +115,39 @@ type ListResponse struct {
 	Limit       int        `json:"limit"`
 	Offset      int        `json:"offset"`
 }
+
+// ── standings response DTOs ───────────────────────────────────────────────────
+
+// StandingsRowResponse is one participant's record in the standings table.
+type StandingsRowResponse struct {
+	Position        int    `json:"position"`
+	ParticipantID   string `json:"participant_id"`
+	Played          int    `json:"played"`
+	Wins            int    `json:"wins"`
+	Losses          int    `json:"losses"`
+	Draws           int    `json:"draws"`
+	Points          int    `json:"points"`
+	ScoreFor        int    `json:"score_for"`
+	ScoreAgainst    int    `json:"score_against"`
+	ScoreDifference int    `json:"score_difference"`
+}
+
+// PointSystemResponse describes the point values in use for this tournament.
+type PointSystemResponse struct {
+	WinPoints       int `json:"win_points"`
+	DrawPoints      int `json:"draw_points"`
+	LossPoints      int `json:"loss_points"`
+	CloseMargin     int `json:"close_margin,omitempty"`
+	CloseLossPoints int `json:"close_loss_points,omitempty"`
+}
+
+// StandingsResponse is the response for
+// GET /api/v1/organizations/{slug}/tournaments/{id}/standings.
+type StandingsResponse struct {
+	TournamentID   string                 `json:"tournament_id"`
+	TournamentName string                 `json:"tournament_name"`
+	Format         string                 `json:"format"`
+	Status         string                 `json:"status"`
+	PointSystem    PointSystemResponse    `json:"point_system"`
+	Standings      []StandingsRowResponse `json:"standings"`
+}

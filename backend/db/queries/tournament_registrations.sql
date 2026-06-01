@@ -109,3 +109,17 @@ WHERE  id            = $1
   AND  tournament_id = $2
   AND  status        IN ('pending', 'approved')
 RETURNING *;
+
+-- name: ListApprovedRegistrationsForStandings :many
+-- Returns all approved registrations for a tournament for standings computation.
+-- Does NOT filter by organization_id: tournament_registrations.organization_id
+-- is the registrant's org (not the host org), and cross-org registrations are
+-- valid for multi-club tournaments.  The host tournament is already verified by
+-- the caller via tournament_id + host organization_id before this query runs.
+-- Ordered by registered_at ASC so the standings engine uses registration time
+-- as the final deterministic tiebreaker without additional sorting.
+SELECT team_id, player_id, seed_number, registered_at
+FROM   tournament_registrations
+WHERE  tournament_id = $1
+  AND  status        = 'approved'
+ORDER  BY registered_at ASC;

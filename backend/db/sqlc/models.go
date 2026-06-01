@@ -911,6 +911,10 @@ type Match struct {
 	Metadata  []byte             `json:"metadata"`
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+	// Final home participant score. Snapshotted atomically inside the live → completed transition transaction under a FOR UPDATE lock. Reflects the effective event log at the exact moment of completion — the log is frozen by the match-status check in CreateWithAudit, so no correction can alter this value after it is written. Always 0 for walkovers (no events produce points) and for any non-completed match status. Standings must read this column, never match_events, for completed match scores.
+	HomeScore int32 `json:"home_score"`
+	// Final away participant score. See home_score for the full contract.
+	AwayScore int32 `json:"away_score"`
 }
 
 // Append-only immutable event log. The single source of truth for all in-match data. Every point, player state change, and lifecycle transition is a row here. No UPDATE or DELETE is ever performed. score_correction events invalidate prior events via cancels_event_id without mutating them. All statistics (team scores, player raid counts, tackle rates) must be derived from this table — never stored redundantly in other tables.

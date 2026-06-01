@@ -221,6 +221,53 @@ func (q *Queries) GetRegistrationByTeam(ctx context.Context, arg GetRegistration
 	return i, err
 }
 
+const listApprovedRegistrationsForStandings = `-- name: ListApprovedRegistrationsForStandings :many
+SELECT team_id, player_id, seed_number, registered_at
+FROM   tournament_registrations
+WHERE  tournament_id = $1
+  AND  status        = 'approved'
+ORDER  BY registered_at ASC
+`
+
+type ListApprovedRegistrationsForStandingsRow struct {
+	TeamID       pgtype.UUID        `json:"team_id"`
+	PlayerID     pgtype.UUID        `json:"player_id"`
+	SeedNumber   *int16             `json:"seed_number"`
+	RegisteredAt pgtype.Timestamptz `json:"registered_at"`
+}
+
+// Returns all approved registrations for a tournament for standings computation.
+// Does NOT filter by organization_id: tournament_registrations.organization_id
+// is the registrant's org (not the host org), and cross-org registrations are
+// valid for multi-club tournaments.  The host tournament is already verified by
+// the caller via tournament_id + host organization_id before this query runs.
+// Ordered by registered_at ASC so the standings engine uses registration time
+// as the final deterministic tiebreaker without additional sorting.
+func (q *Queries) ListApprovedRegistrationsForStandings(ctx context.Context, tournamentID pgtype.UUID) ([]ListApprovedRegistrationsForStandingsRow, error) {
+	rows, err := q.db.Query(ctx, listApprovedRegistrationsForStandings, tournamentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListApprovedRegistrationsForStandingsRow{}
+	for rows.Next() {
+		var i ListApprovedRegistrationsForStandingsRow
+		if err := rows.Scan(
+			&i.TeamID,
+			&i.PlayerID,
+			&i.SeedNumber,
+			&i.RegisteredAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listRegistrationsByTournamentPaginated = `-- name: ListRegistrationsByTournamentPaginated :many
 SELECT id, tournament_id, organization_id, team_id, player_id, seed_number, status, registered_by, registered_at, approved_by, approved_at, notes, metadata, created_at, updated_at
 FROM   tournament_registrations

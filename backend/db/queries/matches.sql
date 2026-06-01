@@ -44,6 +44,9 @@ RETURNING *;
 -- current state. id, organization_id, tournament_id, is_walkover, metadata,
 -- and created_at are immutable and never appear in the SET clause.
 -- started_at and ended_at are stamped by the service during lifecycle transitions.
+-- home_score and away_score ($18, $19) are 0 for all non-completion transitions;
+-- for the live → completed transition the repository fills them in after computing
+-- the final score from the effective event log under a FOR UPDATE lock on this row.
 -- The terminal-state guard (status NOT IN ...) is enforced at the DB level so
 -- that two concurrent PATCH requests that both pass the service-layer check
 -- cannot both succeed: the second update finds 0 rows and returns ErrNoRows,
@@ -64,6 +67,8 @@ SET    round_number     = $3,
        winner_team_id   = $15,
        winner_player_id = $16,
        notes            = $17,
+       home_score       = $18,
+       away_score       = $19,
        updated_at       = NOW()
 WHERE  id              = $1
   AND  organization_id = $2
@@ -126,3 +131,25 @@ FROM   tournaments
 WHERE  id              = $1
   AND  organization_id = $2
 FOR    SHARE;
+
+-- name: ListCompletedMatchesByTournament :many
+-- Returns all completed matches for a tournament, in creation order.
+-- Used exclusively by the standings engine — standing computation MUST NOT
+-- read match_events; it reads only these pre-snapshotted score columns.
+-- Both organization_id and tournament_id are required to enforce multi-tenant
+-- isolation: a caller can only read matches belonging to their own tournament.
+SELECT id,
+       home_team_id,
+       away_team_id,
+       home_player_id,
+       away_player_id,
+       winner_team_id,
+       winner_player_id,
+       is_walkover,
+       home_score,
+       away_score
+FROM   matches
+WHERE  tournament_id   = sqlc.arg(tournament_id)
+  AND  organization_id = sqlc.arg(organization_id)
+  AND  status          = 'completed'
+ORDER  BY created_at ASC;

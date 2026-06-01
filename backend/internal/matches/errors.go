@@ -27,6 +27,11 @@ var (
 	// Winner validation errors.
 	ErrWinnerNotAllowed     = errors.New("winner may only be set when match status is completed")
 	ErrWinnerNotParticipant = errors.New("winner must be one of the match participants (home or away)")
+	// ErrWinnerScoreMismatch is returned when the declared winner is inconsistent
+	// with the computed final score: home wins require winner = home participant,
+	// away wins require winner = away participant, and draws require no winner.
+	// Walkovers are exempt because the score is always 0-0 for administrative wins.
+	ErrWinnerScoreMismatch = errors.New("winner is inconsistent with the final score: home win requires home winner, away win requires away winner, equal score requires no winner")
 
 	// Status lifecycle errors.
 	ErrInvalidStatus           = errors.New("invalid match status; valid values: scheduled, live, completed, cancelled, abandoned")

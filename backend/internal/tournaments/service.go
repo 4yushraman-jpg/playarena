@@ -14,6 +14,7 @@ import (
 
 	db "github.com/4yushraman-jpg/playarena/db/sqlc"
 	"github.com/4yushraman-jpg/playarena/internal/platform/pgutil"
+	"github.com/4yushraman-jpg/playarena/internal/standings"
 )
 
 var (
@@ -615,6 +616,161 @@ func validateDateRange(regOpens, regCloses, startsAt, endsAt pgtype.Timestamptz)
 		}
 	}
 	return nil
+}
+
+// GetStandings derives the current standings table for a tournament.
+//
+// Source of truth for scores is matches.home_score / matches.away_score —
+// the columns snapshotted at match completion.  This method never reads
+// match_events.
+//
+// All approved registrants appear in the result regardless of whether they
+// have played any matches yet (position reflects current standing with 0s).
+func (s *Service) GetStandings(ctx context.Context, orgSlug, tournamentID string) (*StandingsResponse, error) {
+	org, err := s.repo.GetOrgBySlug(ctx, orgSlug)
+	if err != nil {
+		return nil, err
+	}
+
+	tid, err := pgutil.ParseUUID(tournamentID)
+	if err != nil {
+		return nil, ErrTournamentNotFound
+	}
+
+	tournament, err := s.repo.GetByID(ctx, tid, org.ID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Fetch completed matches (org-scoped) and approved registrations.
+	rawMatches, err := s.repo.GetCompletedMatchesForStandings(ctx, tid, org.ID)
+	if err != nil {
+		return nil, err
+	}
+
+	rawRegs, err := s.repo.GetRegistrationsForStandings(ctx, tid)
+	if err != nil {
+		return nil, err
+	}
+
+	settings := parseStandingsSettings(tournament.Settings)
+
+	// Convert DB rows to standings engine input types.
+	matches := make([]standings.CompletedMatch, 0, len(rawMatches))
+	for _, m := range rawMatches {
+		cm := standings.CompletedMatch{
+			HomeParticipantID: participantID(m.HomeTeamID, m.HomePlayerID),
+			AwayParticipantID: participantID(m.AwayTeamID, m.AwayPlayerID),
+			HomeScore:         int(m.HomeScore),
+			AwayScore:         int(m.AwayScore),
+			WinnerID:          participantID(m.WinnerTeamID, m.WinnerPlayerID),
+			IsWalkover:        m.IsWalkover,
+		}
+		if cm.HomeParticipantID == "" || cm.AwayParticipantID == "" {
+			continue // skip TBD bracket matches
+		}
+		matches = append(matches, cm)
+	}
+
+	regs := make([]standings.RegistrationInfo, 0, len(rawRegs))
+	for _, r := range rawRegs {
+		pid := participantID(r.TeamID, r.PlayerID)
+		if pid == "" {
+			continue
+		}
+		var seed *int16
+		if r.SeedNumber != nil {
+			seed = r.SeedNumber
+		}
+		regs = append(regs, standings.RegistrationInfo{
+			ParticipantID: pid,
+			SeedNumber:    seed,
+			RegisteredAt:  r.RegisteredAt.Time.UTC(),
+		})
+	}
+
+	rows := standings.Compute(matches, regs, settings)
+
+	standingsResp := make([]StandingsRowResponse, len(rows))
+	for i, row := range rows {
+		standingsResp[i] = StandingsRowResponse{
+			Position:        row.Position,
+			ParticipantID:   row.ParticipantID,
+			Played:          row.Played,
+			Wins:            row.Wins,
+			Losses:          row.Losses,
+			Draws:           row.Draws,
+			Points:          row.Points,
+			ScoreFor:        row.ScoreFor,
+			ScoreAgainst:    row.ScoreAgainst,
+			ScoreDifference: row.ScoreDifference,
+		}
+	}
+
+	return &StandingsResponse{
+		TournamentID:   pgutil.UUIDToString(tournament.ID),
+		TournamentName: tournament.Name,
+		Format:         string(tournament.Format),
+		Status:         string(tournament.Status),
+		PointSystem: PointSystemResponse{
+			WinPoints:       settings.WinPoints,
+			DrawPoints:      settings.DrawPoints,
+			LossPoints:      settings.LossPoints,
+			CloseMargin:     settings.CloseMargin,
+			CloseLossPoints: settings.CloseLossPoints,
+		},
+		Standings: standingsResp,
+	}, nil
+}
+
+// participantID returns the UUID string for the first valid pgtype.UUID provided.
+// Used to normalise team-vs-player participant references into a single string.
+func participantID(primary, fallback pgtype.UUID) string {
+	if primary.Valid {
+		return pgutil.UUIDToString(primary)
+	}
+	if fallback.Valid {
+		return pgutil.UUIDToString(fallback)
+	}
+	return ""
+}
+
+// standingsSettingsJSON is the subset of tournaments.settings used for standings.
+type standingsSettingsJSON struct {
+	WinPoints       *int `json:"win_points"`
+	DrawPoints      *int `json:"draw_points"`
+	LossPoints      *int `json:"loss_points"`
+	CloseMargin     *int `json:"close_margin"`
+	CloseLossPoints *int `json:"close_loss_points"`
+}
+
+// parseStandingsSettings unmarshals the point system from tournaments.settings
+// JSONB.  Fields absent from the JSON use the standings.DefaultSettings values.
+func parseStandingsSettings(raw []byte) standings.Settings {
+	s := standings.DefaultSettings()
+	if len(raw) == 0 {
+		return s
+	}
+	var js standingsSettingsJSON
+	if err := json.Unmarshal(raw, &js); err != nil {
+		return s
+	}
+	if js.WinPoints != nil {
+		s.WinPoints = *js.WinPoints
+	}
+	if js.DrawPoints != nil {
+		s.DrawPoints = *js.DrawPoints
+	}
+	if js.LossPoints != nil {
+		s.LossPoints = *js.LossPoints
+	}
+	if js.CloseMargin != nil {
+		s.CloseMargin = *js.CloseMargin
+	}
+	if js.CloseLossPoints != nil {
+		s.CloseLossPoints = *js.CloseLossPoints
+	}
+	return s
 }
 
 func tournamentToResponse(t *db.Tournament) *Response {

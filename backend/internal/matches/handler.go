@@ -266,6 +266,7 @@ func (h *Handler) writeMatchError(w http.ResponseWriter, r *http.Request, err er
 		errors.Is(err, ErrParticipantNotRegistered),
 		errors.Is(err, ErrWinnerNotAllowed),
 		errors.Is(err, ErrWinnerNotParticipant),
+		errors.Is(err, ErrWinnerScoreMismatch),
 		errors.Is(err, ErrInvalidStatusTransition),
 		errors.Is(err, ErrMatchNotUpdatable),
 		errors.Is(err, ErrMatchAlreadyCancelled):
@@ -324,6 +325,8 @@ func errKind(err error) string {
 		return "winner_not_allowed"
 	case errors.Is(err, ErrWinnerNotParticipant):
 		return "winner_not_participant"
+	case errors.Is(err, ErrWinnerScoreMismatch):
+		return "winner_score_mismatch"
 	case errors.Is(err, ErrInvalidStatusTransition):
 		return "invalid_status_transition"
 	case errors.Is(err, ErrInvalidStatus):
