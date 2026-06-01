@@ -2,7 +2,7 @@
 
 **Last Updated:** 2026-06-01  
 **Build status:** `go build ./...` passing, `go vet ./...` clean  
-**Migrations applied:** 000001 – 000018 (000018 pending `migrate up` on next deploy)  
+**Migrations applied:** 000001 – 000018  
 **Go version:** 1.25.6  
 **Database:** PostgreSQL 17
 
@@ -35,7 +35,7 @@
 backend/
 ├── cmd/api/main.go                         Entry point — config, DB pool, HTTP server, graceful shutdown
 ├── db/
-│   ├── migrations/                         golang-migrate files (000001–000017, up + down)
+│   ├── migrations/                         golang-migrate files (000001–000018, up + down)
 │   ├── queries/                            Hand-written SQL (sqlc source)
 │   └── sqlc/                              Generated type-safe Go — never edited by hand
 ├── internal/
@@ -85,6 +85,14 @@ backend/
 │   │   ├── handler.go
 │   │   └── routes.go
 │   ├── tournament_registrations/           Tournament registrations domain (fully implemented)
+│   │   ├── errors.go
+│   │   ├── dto.go
+│   │   ├── model.go
+│   │   ├── repository.go
+│   │   ├── service.go
+│   │   ├── handler.go
+│   │   └── routes.go
+│   ├── matches/                            Matches domain (fully implemented)
 │   │   ├── errors.go
 │   │   ├── dto.go
 │   │   ├── model.go
@@ -165,7 +173,7 @@ HTTP request
 | 000015 | Auth Hardening | `user_organization_roles.organization_id` made NULLable; partial unique index for platform grants |
 | 000016 | Email Verification Tokens | `email_verification_tokens` — single-use, SHA-256 hashed |
 | 000017 | Seed RBAC | 18 permissions, 7 system roles, full role→permission mappings |
-| 000018 | Match Delete Permission | `match.delete` permission; granted to `platform_admin`, `org_owner`, `org_admin` |
+| 000018 | Match Delete Permission | `match.delete` permission seeded; granted to `platform_admin`, `org_owner`, `org_admin` |
 
 ### Table Summary
 
@@ -181,7 +189,7 @@ Key columns: `token_hash` (unique), `expires_at`, `revoked_at` (NULL = valid), `
 
 #### RBAC
 
-**`permissions`** — Atomic capability definitions. `slug` format: `<resource>.<action>` (e.g. `tournament.create`). Immutable at runtime. 18 permissions seeded by migration 000017.
+**`permissions`** — Atomic capability definitions. `slug` format: `<resource>.<action>` (e.g. `tournament.create`). Immutable at runtime. 18 permissions seeded by migration 000017; `match.delete` added by migration 000018 (19 total).
 
 **`roles`** — Named permission groups. `scope` is `platform` | `organization` | `tournament`. Platform roles have `organization_id = NULL`; org roles have a non-NULL FK. `is_system` flags protect seed roles from deletion. 7 system roles seeded: `platform_admin`, `org_owner`, `org_admin`, `team_manager`, `coach`, `scorer`, `viewer`.
 
@@ -191,6 +199,30 @@ Key columns: `token_hash` (unique), `expires_at`, `revoked_at` (NULL = valid), `
 `organization_id` is **NULLable** (since migration 000015) to allow platform-scoped grants.  
 Supports `expires_at` for time-limited grants (e.g. guest scorer per tournament).  
 Unique constraints: `(user_id, organization_id, role_id)` for org grants; partial unique index `(user_id, role_id) WHERE organization_id IS NULL` for platform grants.
+
+#### Permission Matrix (complete, as of migration 000018)
+
+| Permission | `platform_admin` | `org_owner` | `org_admin` | `team_manager` | `coach` | `scorer` | `viewer` |
+|-----------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| `organization.create` | ✓ | — | — | — | — | — | — |
+| `organization.update` | ✓ | ✓ | ✓ | — | — | — | — |
+| `organization.delete` | ✓ | ✓ | — | — | — | — | — |
+| `user.manage` | ✓ | ✓ | ✓ | — | — | — | — |
+| `role.assign` | ✓ | ✓ | ✓ | — | — | — | — |
+| `team.create` | ✓ | ✓ | ✓ | ✓ | — | — | — |
+| `team.update` | ✓ | ✓ | ✓ | ✓ | — | — | — |
+| `team.delete` | ✓ | ✓ | ✓ | ✓ | — | — | — |
+| `player.create` | ✓ | ✓ | ✓ | ✓ | — | — | — |
+| `player.update` | ✓ | ✓ | ✓ | ✓ | ✓ | — | — |
+| `player.delete` | ✓ | ✓ | ✓ | ✓ | — | — | — |
+| `tournament.create` | ✓ | ✓ | ✓ | — | — | — | — |
+| `tournament.update` | ✓ | ✓ | ✓ | — | — | — | — |
+| `tournament.delete` | ✓ | ✓ | ✓ | — | — | — | — |
+| `match.create` | ✓ | ✓ | ✓ | — | — | — | — |
+| `match.update` | ✓ | ✓ | ✓ | — | ✓ | ✓ | — |
+| `match.delete` | ✓ | ✓ | ✓ | — | — | — | — |
+| `match.score` | ✓ | ✓ | ✓ | — | — | ✓ | — |
+| `media.upload` | ✓ | ✓ | ✓ | ✓ | ✓ | — | — |
 
 #### Domain Tables
 
@@ -419,7 +451,7 @@ Each access token carries **exactly one** `organization_id`. The token is org-co
 
 ### Empty Stubs (package declaration only, no logic)
 
-`users/`, `matches/`, `media/`, `rankings/`, `news/`
+`users/`, `media/`, `rankings/`, `news/`
 
 ---
 
@@ -493,7 +525,7 @@ Each access token carries **exactly one** `organization_id`. The token is org-co
 
 | Method | Path | Auth | Permission | Description |
 |--------|------|:----:|-----------|-------------|
-| `POST` | `/matches` | Yes | `match.create` | Schedule a match; validates tournament ongoing, participant eligibility, approved registrations; BOLA-guarded |
+| `POST` | `/matches` | Yes | `match.create` | Schedule match; validates tournament ongoing, participant eligibility, approved registrations; BOLA-guarded |
 | `GET` | `/matches` | Yes | — | List matches (paginated; `?limit`, `?offset`, `?tournament_id`, `?status`, `?search`) |
 | `GET` | `/matches/{id}` | Yes | — | Get match by UUID; returns all statuses including cancelled/completed |
 | `PATCH` | `/matches/{id}` | Yes | `match.update` | Partial update; validates status transitions, winner, participant changes; BOLA-guarded |
@@ -590,25 +622,101 @@ Each access token carries **exactly one** `organization_id`. The token is org-co
 - Soft delete: `DELETE` sets `status = withdrawn`. Records never hard-deleted.
 - Audit logging: `create` / `update` / `delete` records with `EntityType = "tournament_registrations"`.
 
+### Phase 7C — RBAC Correction (Complete)
+
+- **Problem identified:** Migration 000017 seeded three match-resource permissions (`match.create`, `match.update`, `match.score`) but omitted `match.delete`. Without it, the DELETE endpoint had to be guarded by `match.update`, which is also granted to `coach` and `scorer`. Coaching staff and scorers could have cancelled match fixtures — an unintended privilege escalation contradicted by both role descriptions and the pattern established by every other resource.
+- **Migration 000018** added the missing `match.delete` permission and granted it exclusively to `platform_admin`, `org_owner`, and `org_admin` — mirroring `tournament.delete` exactly.
+- The `delete` action was already in the `chk_permissions_action` constraint vocabulary from 000017, confirming the omission was accidental. The fix is purely additive: one row in `permissions`, three rows in `role_permissions`. No existing data was touched.
+- **Result:** `coach` and `scorer` retain `match.update` (in-match control) and `match.score` (event recording), but cannot schedule or cancel fixtures. The permission model is now consistent across all resources.
+
 ### Phase 8A — Matches (Complete)
 
 - Full CRUD for match fixtures scoped to an organization.
 - Soft delete: `DELETE` sets `status = cancelled`. No hard deletes.
-- `GetByID` **intentionally returns cancelled and completed matches** for historical match_event and audit_log reference integrity.
-- **Status lifecycle** (Phase 8A statuses): `scheduled → live | cancelled`; `live → completed | abandoned | cancelled`. Terminal states: `completed`, `cancelled`, `abandoned`. Attempting to update or cancel a terminal match returns HTTP 422.
-- **Tournament status guard on Create**: tournament must be `ongoing`. Enforced twice — pre-transaction in service, and inside the transaction under a `FOR SHARE` lock on the tournament row to prevent concurrent cancellation races.
-- **Tournament status guard on lifecycle transitions**: before transitioning to `live`, `completed`, or `abandoned`, a `FOR SHARE` lock is acquired on the tournament row inside the transaction. A cancelled tournament cannot have its matches progressed.
-- **Participant type enforcement**: participants must match `tournaments.participant_type`. Team tournaments require `home_team_id + away_team_id`; individual tournaments require `home_player_id + away_player_id`. Mixing types returns HTTP 422.
-- **Duplicate participant protection**: `home == away` is rejected (`ErrDuplicateParticipants`, HTTP 422).
-- **Cross-org participant guard**: participants are fetched with org scope via `GetTeamByID(id, orgID)` / `GetPlayerByID(id, orgID)`. A participant from another org is not found and returns HTTP 422.
-- **Registration eligibility**: each participant must hold an `approved` registration in the tournament (`GetApprovedRegistrationByTeam` / `GetApprovedRegistrationByPlayer`). Unregistered participants return HTTP 422.
-- **Winner validation**: `winner_team_id` / `winner_player_id` may only be set when resulting status is `completed`. Winner must equal home or away participant. Violations return HTTP 422.
-- **Timestamp auto-stamping**: `started_at` is stamped automatically on `→ live` transition; `ended_at` on `→ completed` or `→ abandoned`.
-- Pagination: `ListMatchesPaginated` with `page_limit` / `page_offset`, optional `tournament_id`, `status`, and `search` (venue / round_name ILIKE) filters.
-- Audit logging: `create` / `update` / `delete` audit records written transactionally with each mutation. `EntityType = "matches"`. `new_data` always derived from the actual DB-returned row.
-- Two new SQL queries added to `tournament_registrations.sql`: `GetApprovedRegistrationByTeam`, `GetApprovedRegistrationByPlayer`.
-- Six new SQL queries added to `matches.sql`: `CreateMatch`, `UpdateMatch`, `CancelMatch`, `ListMatchesPaginated`, `CountMatches`, `LockTournamentForShare`.
-- `match.delete` permission (migration 000018) used for the DELETE endpoint; `coach` and `scorer` cannot cancel fixtures.
+- `GetByID` **intentionally returns cancelled and completed matches** for historical `match_events` and `audit_logs` reference integrity.
+
+#### Files Added
+
+| File | Purpose |
+|------|---------|
+| `internal/matches/errors.go` | Typed domain error sentinels |
+| `internal/matches/model.go` | `ListParams`, pagination constants |
+| `internal/matches/dto.go` | `CreateRequest`, `UpdateRequest`, `Response`, `ListResponse` |
+| `internal/matches/repository.go` | DB access: reads, transactional writes, audit helpers |
+| `internal/matches/service.go` | Business logic: all validation, lifecycle, BOLA guard |
+| `internal/matches/handler.go` | HTTP handlers + error mapping + structured logging |
+| `internal/matches/routes.go` | `RegisterRoutes()` — mounts `/api/v1/organizations/{slug}/matches` |
+
+#### SQL Queries Added
+
+**`db/queries/matches.sql`:**
+
+| Query | Purpose |
+|-------|---------|
+| `CreateMatch` | INSERT fixture; org-consistency enforced by `trg_matches_org_consistency` |
+| `UpdateMatch` | Full mutable-field update; includes DB-level terminal-state guard |
+| `CancelMatch` | Soft-cancel to `cancelled`; includes DB-level terminal-state guard |
+| `ListMatchesPaginated` | Paginated org-scoped listing with optional `tournament_id`, `status`, search filters |
+| `CountMatches` | Count matching the same filters as `ListMatchesPaginated` |
+| `LockTournamentForShare` | `SELECT status … FOR SHARE` — used inside transactions to prevent tournament cancellation races |
+
+**`db/queries/tournament_registrations.sql`:**
+
+| Query | Purpose |
+|-------|---------|
+| `GetApprovedRegistrationByTeam` | Verify team holds an approved registration before being assigned as participant |
+| `GetApprovedRegistrationByPlayer` | Verify player holds an approved registration before being assigned as participant |
+
+#### Match Status Lifecycle
+
+```
+scheduled → live       (stamps started_at; tournament must be ongoing)
+scheduled → cancelled
+
+live → completed       (stamps ended_at; tournament must be ongoing)
+live → abandoned       (stamps ended_at; tournament must be ongoing)
+live → cancelled
+
+completed  → (terminal)
+cancelled  → (terminal)
+abandoned  → (terminal)
+```
+
+Attempting to update or cancel a match in a terminal status returns `ErrMatchNotUpdatable` (HTTP 422).
+
+#### Match Validation Rules
+
+**Participant type compatibility:**
+- Team tournaments (`participant_type = team`): `home_team_id` + `away_team_id` required; player IDs forbidden.
+- Individual tournaments (`participant_type = individual`): `home_player_id` + `away_player_id` required; team IDs forbidden.
+
+**Duplicate participant protection:** `home == away` (team or player) returns `ErrDuplicateParticipants` (HTTP 422).
+
+**Cross-org participant guard:** Participants are fetched with org scope via `GetTeamByID(id, orgID)` / `GetPlayerByID(id, orgID)`. A participant from another org is not found and returns `ErrParticipantCrossOrg` (HTTP 422).
+
+**Registration eligibility:** Each participant must hold an `approved` registration in the tournament. Unregistered participants return `ErrParticipantNotRegistered` (HTTP 422). Checked on Create and when participant fields change during Update.
+
+**Winner validation:** `winner_team_id` / `winner_player_id` may only be set when the resulting status is `completed`. Validation uses `params.Status` (the merged resulting state, not the raw request field). Winner must equal home or away participant. Violations return HTTP 422.
+
+**Tournament status guard:**
+- Match creation requires `tournament.status = ongoing`. Enforced pre-transaction in service and re-enforced inside the transaction under a `FOR SHARE` lock.
+- Transitions to `live`, `completed`, or `abandoned` also require `tournament.status = ongoing`, enforced inside the transaction under a `FOR SHARE` lock.
+
+#### Match Security
+
+- **Multi-tenant isolation:** Every match query scopes by `organization_id`. `GetMatchByID`, `ListMatchesPaginated`, `CountMatches`, `UpdateMatch`, and `CancelMatch` all include `organization_id` in their WHERE clauses.
+- **BOLA protection:** `assertOrgOwnership(actorOrgID, targetOrgID)` called in `Create`, `Update`, and `Delete`. Platform admins (empty `organizationID`) are unconditionally allowed.
+- **Authorization:** `POST → match.create`, `PATCH → match.update`, `DELETE → match.delete`. GET endpoints require auth only.
+
+#### Match Audit Logging
+
+| Operation | Audit action | `old_data` | `new_data` |
+|-----------|-------------|-----------|-----------|
+| Create | `create` | — | DB-returned row |
+| Update | `update` | Pre-update response snapshot | DB-returned row |
+| Cancel | `delete` | Pre-cancel response snapshot | — |
+
+All writes are transactional. `EntityType = "matches"`. `new_data` is always derived from the actual DB-returned row, never from request input.
 
 ### Concurrency Hardening — Registration Capacity
 
@@ -628,8 +736,37 @@ A code review identified a TOCTOU (Time of Check to Time of Use) race condition 
   5. `INSERT` the audit record.
   6. `COMMIT` — releases the tournament lock.
 - The pre-transaction capacity check was removed from `service.go:Register` entirely.
-- Code comment added: *"Capacity enforcement is performed under a tournament row lock to prevent concurrent over-registration."*
 - **Review status: PASS.** Concurrent requests for the same tournament now block at the `FOR UPDATE` step and see the updated count before deciding whether to insert.
+
+### Concurrency Hardening — Match Tournament Cancellation Race
+
+**Problem:** Match creates and lifecycle transitions need to verify the parent tournament is `ongoing`. A tournament cancellation committed between the service-layer check and the DB write would allow a match to be created — or progressed to `live`/`completed`/`abandoned` — inside a tournament that is no longer active.
+
+**Fix applied:**
+
+- A new SQL query `LockTournamentForShare` was added: `SELECT status FROM tournaments WHERE id = $1 AND organization_id = $2 FOR SHARE`.
+- This lock is acquired **inside** the match create/update transaction before any match write executes.
+- `FOR SHARE` blocks any concurrent `UPDATE tournaments SET status = 'cancelled'` on the same row until the match transaction commits, while allowing other concurrent match creates to also acquire `FOR SHARE` (compatible; no deadlock).
+- Tournament status is re-validated after the lock is held. If already `cancelled`, the transaction rolls back and returns `ErrTournamentNotOngoing` (HTTP 422).
+- **Review status: PASS.**
+
+### Concurrency Hardening — Match Terminal-State Race
+
+**Problem:** The service-layer terminal-state guard (`service.go:Update`) reads `current.Status` outside any transaction. Two concurrent PATCH requests that both read a non-terminal status (e.g., `live`) both pass the guard, both enter `UpdateWithAudit`, and both execute `UpdateMatch`. PostgreSQL serialises the two writes on the same row, but the second write has no status filter — it succeeds and overwrites the terminal state committed by the first. A match marked `completed` could be overwritten to `abandoned`, or a `cancelled` match reactivated to `live`.
+
+**Fix applied:**
+
+Both `UpdateMatch` and `CancelMatch` now include a database-level terminal-state guard in their WHERE clauses (`db/queries/matches.sql`):
+
+```sql
+AND  status NOT IN ('completed', 'cancelled', 'abandoned')
+```
+
+PostgreSQL evaluates this predicate atomically as part of the row-level write. If the match is already terminal (committed by a concurrent request between the service read and this transaction), the WHERE condition matches zero rows. `pgx.ErrNoRows` is returned and the repository maps it to `ErrMatchNotUpdatable` (HTTP 422). The terminal state is preserved.
+
+The service-layer guard remains in place as the first line of defence for sequential requests, avoiding unnecessary transaction overhead.
+
+**Review status: PASS.** Concurrent requests that both pass the service-layer check cannot both write to the same match row if the first write transitions the match to a terminal state.
 
 ---
 
@@ -646,7 +783,9 @@ A code review identified a TOCTOU (Time of Check to Time of Use) race condition 
 - [x] **Teams module + memberships** — Phase 6B
 - [x] **Tournaments module** — Phase 7A
 - [x] **Tournament registrations module** — Phase 7B
-- [x] **Audit logging** — wired into all organization, player, team, tournament, and registration mutations
+- [x] **match.delete permission** — migration 000018 (Phase 7C)
+- [x] **Matches module** — Phase 8A (CRUD, lifecycle, participant/registration validation, concurrency hardening)
+- [x] **Audit logging** — wired into all organization, player, team, tournament, registration, and match mutations
 - [x] **BOLA protection** — enforced in every write service across all implemented modules
 
 ### Must-have before first production deployment
@@ -661,10 +800,9 @@ A code review identified a TOCTOU (Time of Check to Time of Use) race condition 
 ### Required for feature completeness
 
 - [ ] **Users module** — User management: list, get, update profile, change password, deactivate.
-- [ ] **Matches module** — Fixture scheduling, status transitions (scheduled → live → completed), walkover handling.
-- [ ] **Match scoring** — `match_events` INSERT pipeline; sequence-number generation with row-level locking; score computation from event log.
-- [ ] **Rankings module** — Computed standings; depends on match and tournament modules.
-- [ ] **Media module** — File upload coordination, `media_attachments` CRUD, storage backend integration.
+- [ ] **Match events module** — `match_events` INSERT pipeline; sequence-number generation with row-level locking; event validation and audit logging. (Phase 8B)
+- [ ] **Rankings module** — Computed standings; depends on match and tournament modules. (Phase 10)
+- [ ] **Media module** — File upload coordination, `media_attachments` CRUD, storage backend integration. (Phase 11)
 - [ ] **News module** — Stub exists; no business logic.
 
 ### Technical debt
@@ -696,37 +834,39 @@ A code review identified a TOCTOU (Time of Check to Time of Use) race condition 
 | Phase 7B | Tournament registrations | **COMPLETE** |
 | Phase 7C | RBAC correction — `match.delete` permission | **COMPLETE** |
 | Phase 8A | Matches | **COMPLETE** |
-| Phase 8B | Match Events & Live Scoring | NOT STARTED |
-| Phase 9 | Rankings & Standings | NOT STARTED |
-| Phase 10 | Media | NOT STARTED |
-| Phase 11 | Notifications | NOT STARTED |
-| Phase 12 | Hardening, Observability & Tests | NOT STARTED |
+| Phase 8B | Match Events | NOT STARTED |
+| Phase 9 | Live Scoring | NOT STARTED |
+| Phase 10 | Rankings & Standings | NOT STARTED |
+| Phase 11 | Media | NOT STARTED |
+| Phase 12 | Notifications | NOT STARTED |
+| Phase 13 | Hardening, Observability & Tests | NOT STARTED |
 
 ---
 
-### Phase 8A — Matches (next)
+### Phase 8B — Match Events (next)
 
-**Goal:** tournament organizers can schedule fixtures; matches follow a defined status lifecycle.
+**Goal:** scorers can record the match event timeline; match statistics are derivable from the immutable event log.
 
-1. **Match CRUD** — create fixtures within a tournament; link to teams/players from registrations. `organization_id` is denormalized from `tournaments.organization_id` and validated by the existing `trg_matches_org_consistency` trigger.
-2. **Status transitions** — `scheduled → live → completed`; also `cancelled`, `postponed`, `abandoned`, `walkover`.
-3. **Walkover handling** — set `winner_team_id` / `winner_player_id` without match events; validate `chk_matches_walkover_has_winner`.
-4. **Bracket slot support** — TBD fixtures (home/away participant columns nullable); fill in as bracket progresses.
-
----
-
-### Phase 8B — Match Events & Live Scoring
-
-**Goal:** scorers can record events in real time; scores are derived from the immutable event log.
-
-1. **`match_events` INSERT pipeline** — `POST /api/v1/matches/{id}/events`. Requires row-level lock (`SELECT … FOR UPDATE`) on the parent `matches` row to safely compute `MAX(sequence_number) + 1` under concurrent scorers — same pattern as the registration capacity fix.
-2. **Score computation** — aggregate `match_events` to derive live scores, player stats. No denormalized score columns exist; all derived on read.
-3. **Score corrections** — `score_correction` event with `cancels_event_id`. Effective event log excludes events whose `id` appears as any `cancels_event_id` within the same match.
-4. **WebSocket / SSE push** (optional) — push live score updates to spectators.
+1. **`match_events` INSERT pipeline** — `POST /api/v1/organizations/{slug}/matches/{id}/events`. Requires a row-level lock (`SELECT … FOR UPDATE`) on the parent `matches` row to safely compute `MAX(sequence_number) + 1` under concurrent scorers — same pattern as the registration capacity fix.
+2. **Scoring events** — raid outcomes, tackle results, bonus points, penalties; payload stored in JSONB.
+3. **Match statistics** — aggregate `match_events` to derive per-team and per-player stats on read. No denormalized score columns exist; all derived.
+4. **Score corrections** — `score_correction` event with `cancels_event_id`. Effective event log excludes events whose `id` appears as any `cancels_event_id` within the same match.
+5. **Event validation** — match must be `live` to accept events; event type must be valid for the sport; sequence number must be monotonically increasing.
+6. **Audit logging** — append-only; no UPDATE or DELETE ever on `match_events`.
 
 ---
 
-### Phase 9 — Rankings & Standings
+### Phase 9 — Live Scoring
+
+**Goal:** real-time score delivery to spectators.
+
+1. **WebSocket / SSE push** — push live score updates as match events are recorded.
+2. **Score computation endpoint** — `GET /api/v1/organizations/{slug}/matches/{id}/score` aggregates the event log to return current scores and team stats.
+3. **Cache strategy** — derived scores are expensive; cache on read and invalidate on new event.
+
+---
+
+### Phase 10 — Rankings & Standings
 
 **Goal:** org dashboards show computed team and player standings.
 
@@ -735,22 +875,22 @@ A code review identified a TOCTOU (Time of Check to Time of Use) race condition 
 
 ---
 
-### Phase 10 — Media
+### Phase 11 — Media
 
 1. **`media_attachments` CRUD** — finalize polymorphic attachment management; wire to object storage backend (S3, GCS, or local).
 2. **Primary attachment swaps** — atomic swap using a single UPDATE; `is_primary` uniqueness enforced at application layer.
 
 ---
 
-### Phase 11 — Notifications
+### Phase 12 — Notifications
 
 *Not designed. Depends on match events and tournament status changes.*
 
 ---
 
-### Phase 12 — Hardening, Observability & Tests
+### Phase 13 — Hardening, Observability & Tests
 
-1. **Test suite** — integration tests using `testcontainers-go` against a real PostgreSQL 17 instance. Priority: auth service, multi-tenant isolation, tournament registration rules, match event pipeline.
+1. **Test suite** — integration tests using `testcontainers-go` against a real PostgreSQL 17 instance. Priority: auth service, multi-tenant isolation, tournament registration rules, match lifecycle and concurrency invariants.
 2. **OpenTelemetry tracing** — instrument repository and service layers.
 3. **Prometheus metrics** — request latency histograms, DB pool stats, active sessions counter.
 4. **Password reset flow** — `POST /auth/forgot-password` / `POST /auth/reset-password`.
@@ -761,9 +901,17 @@ A code review identified a TOCTOU (Time of Check to Time of Use) race condition 
 
 ## 10. Next Recommended Phase
 
-**Phase 8A — Matches**
+**Phase 8B — Match Events**
 
-All prerequisite modules are complete: organizations, players, teams, team memberships, tournaments, and tournament registrations. The `matches` table exists in the schema with all FK constraints, triggers, and indexes already in place. The next natural step is implementing the Matches module so tournament organizers can schedule and track fixtures, which is also a prerequisite for Phase 8B (live scoring) and Phase 9 (rankings).
+Phase 8A (Matches) is complete. All prerequisite modules are in place: organizations, players, teams, team memberships, tournaments, tournament registrations, and match CRUD with full lifecycle management. The `match_events` table exists in the schema with all FK constraints, triggers, indexes, and the append-only immutability contract already defined. The next step is implementing the Match Events module so scorers can record in-match events and match statistics become derivable from the immutable event log.
+
+**Goals:**
+
+- Match event timeline — recording and sequencing individual in-match events
+- Scoring events — raid outcomes, tackle results, bonus points, penalties
+- Match statistics — per-team and per-player stats aggregated from the event log on read
+- Event validation — match must be `live`; sequence numbers monotonically increasing; row-level lock on parent match during insert
+- Audit logging — append-only; events are never updated or deleted
 
 ---
 
@@ -781,6 +929,8 @@ All prerequisite modules are complete: organizations, players, teams, team membe
 | `backend/internal/auth/authorization.go` | `AuthorizationService` — DB-backed permission checks |
 | `backend/internal/organizations/service.go` | BOLA reference implementation (`assertOrgOwnership`) |
 | `backend/internal/tournament_registrations/repository.go` | Reference for row-lock capacity enforcement under concurrency |
+| `backend/internal/matches/service.go` | Match lifecycle, participant validation, winner rules, BOLA guard |
+| `backend/internal/matches/repository.go` | Match transactional writes; FOR SHARE tournament lock pattern |
 | `backend/internal/bootstrap/modules.go` | Single place to register new domain modules |
 | `backend/internal/platform/pgutil/pgutil.go` | Shared UUID and constraint helpers used by all domain repositories |
 | `backend/internal/platform/validator/validator.go` | JSON decode + struct-tag validation (no external deps) |
