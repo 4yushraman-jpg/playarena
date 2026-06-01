@@ -60,6 +60,43 @@ func (q *Queries) CreateMembership(ctx context.Context, arg CreateMembershipPara
 	return i, err
 }
 
+const getActiveMembershipByPlayer = `-- name: GetActiveMembershipByPlayer :one
+SELECT id, team_id, player_id, role, jersey_number, status, joined_at, left_at, notes, created_at, updated_at, organization_id
+FROM   team_memberships
+WHERE  player_id       = $1
+  AND  organization_id = $2
+  AND  status          = 'active'
+LIMIT  1
+`
+
+type GetActiveMembershipByPlayerParams struct {
+	PlayerID       pgtype.UUID `json:"player_id"`
+	OrganizationID pgtype.UUID `json:"organization_id"`
+}
+
+// Enforces the rule: one active team membership per player per organization.
+// Does NOT filter by team_id so that any existing active membership on any
+// team within the org is detected before a new one is created.
+func (q *Queries) GetActiveMembershipByPlayer(ctx context.Context, arg GetActiveMembershipByPlayerParams) (TeamMembership, error) {
+	row := q.db.QueryRow(ctx, getActiveMembershipByPlayer, arg.PlayerID, arg.OrganizationID)
+	var i TeamMembership
+	err := row.Scan(
+		&i.ID,
+		&i.TeamID,
+		&i.PlayerID,
+		&i.Role,
+		&i.JerseyNumber,
+		&i.Status,
+		&i.JoinedAt,
+		&i.LeftAt,
+		&i.Notes,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.OrganizationID,
+	)
+	return i, err
+}
+
 const getActiveMembershipByTeamAndPlayer = `-- name: GetActiveMembershipByTeamAndPlayer :one
 SELECT id, team_id, player_id, role, jersey_number, status, joined_at, left_at, notes, created_at, updated_at, organization_id
 FROM   team_memberships
@@ -77,8 +114,8 @@ type GetActiveMembershipByTeamAndPlayerParams struct {
 }
 
 // Returns the current active membership for a (team, player) pair.
-// Used to enforce the business rule: a player may not hold two simultaneous
-// active memberships on the same team.
+// Retained for internal use; the primary exclusivity check is
+// GetActiveMembershipByPlayer which enforces the org-wide rule.
 func (q *Queries) GetActiveMembershipByTeamAndPlayer(ctx context.Context, arg GetActiveMembershipByTeamAndPlayerParams) (TeamMembership, error) {
 	row := q.db.QueryRow(ctx, getActiveMembershipByTeamAndPlayer, arg.TeamID, arg.PlayerID, arg.OrganizationID)
 	var i TeamMembership

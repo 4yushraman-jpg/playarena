@@ -320,6 +320,8 @@ func (h *Handler) writeTeamError(w http.ResponseWriter, r *http.Request, err err
 		response.Error(w, http.StatusConflict, err.Error())
 	case errors.Is(err, ErrMembershipAlreadyActive):
 		response.Error(w, http.StatusConflict, err.Error())
+	case errors.Is(err, ErrPlayerAlreadyAssigned):
+		response.Error(w, http.StatusConflict, err.Error())
 	case errors.Is(err, ErrCrossOrgMembership):
 		response.Error(w, http.StatusUnprocessableEntity, err.Error())
 	case errors.Is(err, ErrInvalidStatus):
@@ -372,6 +374,8 @@ func errKind(err error) string {
 		return "slug_generation_failed"
 	case errors.Is(err, ErrMembershipAlreadyActive):
 		return "membership_already_active"
+	case errors.Is(err, ErrPlayerAlreadyAssigned):
+		return "player_already_assigned"
 	case errors.Is(err, ErrCrossOrgMembership):
 		return "cross_org_membership"
 	case errors.Is(err, ErrInvalidStatus):

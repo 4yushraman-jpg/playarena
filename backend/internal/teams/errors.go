@@ -24,6 +24,11 @@ var (
 	// membership row is only created when no active one exists.
 	ErrMembershipAlreadyActive = errors.New("player already has an active membership on this team")
 
+	// ErrPlayerAlreadyAssigned enforces the rule: one active team membership per
+	// player per organization. A player must be released from their current team
+	// before joining another.
+	ErrPlayerAlreadyAssigned = errors.New("player already has an active membership in this organization; release them from their current team first")
+
 	// ErrCrossOrgMembership is returned when the player or team does not belong
 	// to the organization identified by the URL slug. Validated in the service
 	// layer before the DB trigger trg_team_memberships_org_consistency fires.

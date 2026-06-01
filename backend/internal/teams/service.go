@@ -304,8 +304,9 @@ func (s *Service) Delete(ctx context.Context, orgSlug, teamID string, actorID, a
 //   - The team must belong to the URL org.
 //   - The player must belong to the same org.
 //
-// Business rule: a player may not hold two simultaneous active memberships on
-// the same team. Historical memberships are preserved in full.
+// Business rule: one active team membership per player per organization.
+// A player must be released from their current team before joining another.
+// Historical (released) memberships are preserved in full.
 //
 // BOLA guard: actorOrgID must match the target org or be empty (platform admin).
 func (s *Service) AddMember(ctx context.Context, orgSlug, teamID string, req AddMemberRequest, actorID, actorOrgID string) (*MembershipResponse, error) {
@@ -339,13 +340,14 @@ func (s *Service) AddMember(ctx context.Context, orgSlug, teamID string, req Add
 		return nil, err
 	}
 
-	// Reject duplicate active memberships.
-	existing, err := s.repo.GetActiveMembership(ctx, tid, pid, org.ID)
+	// Enforce: one active team membership per player per organization.
+	// Check across ALL teams in the org, not just the target team.
+	existing, err := s.repo.GetActiveMembershipByPlayer(ctx, pid, org.ID)
 	if err != nil {
 		return nil, err
 	}
 	if existing != nil {
-		return nil, ErrMembershipAlreadyActive
+		return nil, ErrPlayerAlreadyAssigned
 	}
 
 	actorUID, err := pgutil.ParseUUID(actorID)

@@ -13,13 +13,24 @@ LIMIT  1;
 
 -- name: GetActiveMembershipByTeamAndPlayer :one
 -- Returns the current active membership for a (team, player) pair.
--- Used to enforce the business rule: a player may not hold two simultaneous
--- active memberships on the same team.
+-- Retained for internal use; the primary exclusivity check is
+-- GetActiveMembershipByPlayer which enforces the org-wide rule.
 SELECT *
 FROM   team_memberships
 WHERE  team_id         = $1
   AND  player_id       = $2
   AND  organization_id = $3
+  AND  status          = 'active'
+LIMIT  1;
+
+-- name: GetActiveMembershipByPlayer :one
+-- Enforces the rule: one active team membership per player per organization.
+-- Does NOT filter by team_id so that any existing active membership on any
+-- team within the org is detected before a new one is created.
+SELECT *
+FROM   team_memberships
+WHERE  player_id       = $1
+  AND  organization_id = $2
   AND  status          = 'active'
 LIMIT  1;
 

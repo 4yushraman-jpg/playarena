@@ -106,6 +106,24 @@ func (r *Repository) Count(ctx context.Context, orgID pgtype.UUID, params ListPa
 	})
 }
 
+// GetActiveMembershipByPlayer checks whether a player already holds an active
+// membership on ANY team within the organization.
+// Enforces the rule: one active team membership per player per organization.
+// Returns nil when no active membership exists (safe to create a new one).
+func (r *Repository) GetActiveMembershipByPlayer(ctx context.Context, playerID, orgID pgtype.UUID) (*db.TeamMembership, error) {
+	m, err := r.queries.GetActiveMembershipByPlayer(ctx, db.GetActiveMembershipByPlayerParams{
+		PlayerID:       playerID,
+		OrganizationID: orgID,
+	})
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &m, nil
+}
+
 // GetActiveMembership checks whether a player already has an active membership
 // on the given team. Returns nil error when no such membership exists.
 func (r *Repository) GetActiveMembership(ctx context.Context, teamID, playerID, orgID pgtype.UUID) (*db.TeamMembership, error) {
