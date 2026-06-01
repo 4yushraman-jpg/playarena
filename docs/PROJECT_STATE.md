@@ -2,7 +2,7 @@
 
 **Last Updated:** 2026-06-01  
 **Build status:** `go build ./...` passing, `go vet ./...` clean  
-**Migrations applied:** 000001 – 000017  
+**Migrations applied:** 000001 – 000018  
 **Go version:** 1.25.6  
 **Database:** PostgreSQL 17
 
@@ -165,6 +165,7 @@ HTTP request
 | 000015 | Auth Hardening | `user_organization_roles.organization_id` made NULLable; partial unique index for platform grants |
 | 000016 | Email Verification Tokens | `email_verification_tokens` — single-use, SHA-256 hashed |
 | 000017 | Seed RBAC | 18 permissions, 7 system roles, full role→permission mappings |
+| 000018 | Match Delete Permission | `match.delete` permission; granted to `platform_admin`, `org_owner`, `org_admin` |
 
 ### Table Summary
 
@@ -662,6 +663,7 @@ A code review identified a TOCTOU (Time of Check to Time of Use) race condition 
 | Phase 6B | Teams module + team memberships | **COMPLETE** |
 | Phase 7A | Tournaments module | **COMPLETE** |
 | Phase 7B | Tournament registrations | **COMPLETE** |
+| Phase 7C | RBAC correction — `match.delete` permission | **COMPLETE** |
 | Phase 8A | Matches | NOT STARTED |
 | Phase 8B | Match Events & Live Scoring | NOT STARTED |
 | Phase 9 | Rankings & Standings | NOT STARTED |
