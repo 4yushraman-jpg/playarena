@@ -11,6 +11,131 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const countTeamsByOrganization = `-- name: CountTeamsByOrganization :one
+SELECT COUNT(*)
+FROM   teams
+WHERE  organization_id = $1
+  AND  status != 'disbanded'
+  AND  ($2::text IS NULL OR status::text = $2)
+  AND  ($3::text  IS NULL OR name ILIKE '%' || $3 || '%')
+`
+
+type CountTeamsByOrganizationParams struct {
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	StatusFilter   *string     `json:"status_filter"`
+	SearchQuery    *string     `json:"search_query"`
+}
+
+// Returns the total count matching the same filters as ListTeamsPaginated.
+func (q *Queries) CountTeamsByOrganization(ctx context.Context, arg CountTeamsByOrganizationParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countTeamsByOrganization, arg.OrganizationID, arg.StatusFilter, arg.SearchQuery)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const createTeam = `-- name: CreateTeam :one
+INSERT INTO teams (
+    organization_id, name, short_name, slug, description,
+    logo_url, home_city, home_venue, founded_year,
+    primary_color, secondary_color
+)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+RETURNING id, organization_id, name, short_name, slug, description, logo_url, home_city, home_venue, founded_year, primary_color, secondary_color, status, metadata, created_at, updated_at
+`
+
+type CreateTeamParams struct {
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	Name           string      `json:"name"`
+	ShortName      *string     `json:"short_name"`
+	Slug           string      `json:"slug"`
+	Description    *string     `json:"description"`
+	LogoUrl        *string     `json:"logo_url"`
+	HomeCity       *string     `json:"home_city"`
+	HomeVenue      *string     `json:"home_venue"`
+	FoundedYear    *int16      `json:"founded_year"`
+	PrimaryColor   *string     `json:"primary_color"`
+	SecondaryColor *string     `json:"secondary_color"`
+}
+
+// Inserts a new active team for the given organization.
+// status defaults to 'active', metadata to '{}' per table defaults.
+func (q *Queries) CreateTeam(ctx context.Context, arg CreateTeamParams) (Team, error) {
+	row := q.db.QueryRow(ctx, createTeam,
+		arg.OrganizationID,
+		arg.Name,
+		arg.ShortName,
+		arg.Slug,
+		arg.Description,
+		arg.LogoUrl,
+		arg.HomeCity,
+		arg.HomeVenue,
+		arg.FoundedYear,
+		arg.PrimaryColor,
+		arg.SecondaryColor,
+	)
+	var i Team
+	err := row.Scan(
+		&i.ID,
+		&i.OrganizationID,
+		&i.Name,
+		&i.ShortName,
+		&i.Slug,
+		&i.Description,
+		&i.LogoUrl,
+		&i.HomeCity,
+		&i.HomeVenue,
+		&i.FoundedYear,
+		&i.PrimaryColor,
+		&i.SecondaryColor,
+		&i.Status,
+		&i.Metadata,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const disbandTeam = `-- name: DisbandTeam :one
+UPDATE teams
+SET    status     = 'disbanded',
+       updated_at = NOW()
+WHERE  id              = $1
+  AND  organization_id = $2
+RETURNING id, organization_id, name, short_name, slug, description, logo_url, home_city, home_venue, founded_year, primary_color, secondary_color, status, metadata, created_at, updated_at
+`
+
+type DisbandTeamParams struct {
+	ID             pgtype.UUID `json:"id"`
+	OrganizationID pgtype.UUID `json:"organization_id"`
+}
+
+// Soft-delete: sets status to 'disbanded'. Records are retained permanently
+// because match winner references and ranking history depend on them.
+func (q *Queries) DisbandTeam(ctx context.Context, arg DisbandTeamParams) (Team, error) {
+	row := q.db.QueryRow(ctx, disbandTeam, arg.ID, arg.OrganizationID)
+	var i Team
+	err := row.Scan(
+		&i.ID,
+		&i.OrganizationID,
+		&i.Name,
+		&i.ShortName,
+		&i.Slug,
+		&i.Description,
+		&i.LogoUrl,
+		&i.HomeCity,
+		&i.HomeVenue,
+		&i.FoundedYear,
+		&i.PrimaryColor,
+		&i.SecondaryColor,
+		&i.Status,
+		&i.Metadata,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const getTeamByID = `-- name: GetTeamByID :one
 
 SELECT id, organization_id, name, short_name, slug, description, logo_url, home_city, home_venue, founded_year, primary_color, secondary_color, status, metadata, created_at, updated_at
@@ -130,4 +255,142 @@ func (q *Queries) ListTeamsByOrganization(ctx context.Context, organizationID pg
 		return nil, err
 	}
 	return items, nil
+}
+
+const listTeamsPaginated = `-- name: ListTeamsPaginated :many
+SELECT id, organization_id, name, short_name, slug, description, logo_url, home_city, home_venue, founded_year, primary_color, secondary_color, status, metadata, created_at, updated_at
+FROM   teams
+WHERE  organization_id = $1
+  AND  status != 'disbanded'
+  AND  ($2::text IS NULL OR status::text = $2)
+  AND  ($3::text  IS NULL OR name ILIKE '%' || $3 || '%')
+ORDER  BY name ASC
+LIMIT  $5
+OFFSET $4
+`
+
+type ListTeamsPaginatedParams struct {
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	StatusFilter   *string     `json:"status_filter"`
+	SearchQuery    *string     `json:"search_query"`
+	PageOffset     int32       `json:"page_offset"`
+	PageLimit      int32       `json:"page_limit"`
+}
+
+// Returns non-disbanded teams for an org with optional status and name search.
+// Disbanded teams are excluded from default listings to mirror soft-delete
+// semantics; they remain accessible via GetTeamByID for historical resolution.
+func (q *Queries) ListTeamsPaginated(ctx context.Context, arg ListTeamsPaginatedParams) ([]Team, error) {
+	rows, err := q.db.Query(ctx, listTeamsPaginated,
+		arg.OrganizationID,
+		arg.StatusFilter,
+		arg.SearchQuery,
+		arg.PageOffset,
+		arg.PageLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Team{}
+	for rows.Next() {
+		var i Team
+		if err := rows.Scan(
+			&i.ID,
+			&i.OrganizationID,
+			&i.Name,
+			&i.ShortName,
+			&i.Slug,
+			&i.Description,
+			&i.LogoUrl,
+			&i.HomeCity,
+			&i.HomeVenue,
+			&i.FoundedYear,
+			&i.PrimaryColor,
+			&i.SecondaryColor,
+			&i.Status,
+			&i.Metadata,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const updateTeam = `-- name: UpdateTeam :one
+UPDATE teams
+SET    name            = $3,
+       short_name      = $4,
+       description     = $5,
+       logo_url        = $6,
+       home_city       = $7,
+       home_venue      = $8,
+       founded_year    = $9,
+       primary_color   = $10,
+       secondary_color = $11,
+       status          = $12,
+       updated_at      = NOW()
+WHERE  id              = $1
+  AND  organization_id = $2
+RETURNING id, organization_id, name, short_name, slug, description, logo_url, home_city, home_venue, founded_year, primary_color, secondary_color, status, metadata, created_at, updated_at
+`
+
+type UpdateTeamParams struct {
+	ID             pgtype.UUID `json:"id"`
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	Name           string      `json:"name"`
+	ShortName      *string     `json:"short_name"`
+	Description    *string     `json:"description"`
+	LogoUrl        *string     `json:"logo_url"`
+	HomeCity       *string     `json:"home_city"`
+	HomeVenue      *string     `json:"home_venue"`
+	FoundedYear    *int16      `json:"founded_year"`
+	PrimaryColor   *string     `json:"primary_color"`
+	SecondaryColor *string     `json:"secondary_color"`
+	Status         TeamStatus  `json:"status"`
+}
+
+// Full field update. Service layer merges partial request fields over current
+// state before calling this query. id, organization_id, slug are immutable.
+func (q *Queries) UpdateTeam(ctx context.Context, arg UpdateTeamParams) (Team, error) {
+	row := q.db.QueryRow(ctx, updateTeam,
+		arg.ID,
+		arg.OrganizationID,
+		arg.Name,
+		arg.ShortName,
+		arg.Description,
+		arg.LogoUrl,
+		arg.HomeCity,
+		arg.HomeVenue,
+		arg.FoundedYear,
+		arg.PrimaryColor,
+		arg.SecondaryColor,
+		arg.Status,
+	)
+	var i Team
+	err := row.Scan(
+		&i.ID,
+		&i.OrganizationID,
+		&i.Name,
+		&i.ShortName,
+		&i.Slug,
+		&i.Description,
+		&i.LogoUrl,
+		&i.HomeCity,
+		&i.HomeVenue,
+		&i.FoundedYear,
+		&i.PrimaryColor,
+		&i.SecondaryColor,
+		&i.Status,
+		&i.Metadata,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
 }
