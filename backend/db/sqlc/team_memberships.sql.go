@@ -175,6 +175,30 @@ func (q *Queries) GetMembershipByID(ctx context.Context, arg GetMembershipByIDPa
 	return i, err
 }
 
+const hasActiveMembersByTeam = `-- name: HasActiveMembersByTeam :one
+SELECT EXISTS(
+    SELECT 1
+    FROM   team_memberships
+    WHERE  team_id         = $1
+      AND  organization_id = $2
+      AND  status          = 'active'
+) AS has_members
+`
+
+type HasActiveMembersByTeamParams struct {
+	TeamID         pgtype.UUID `json:"team_id"`
+	OrganizationID pgtype.UUID `json:"organization_id"`
+}
+
+// Returns true if the team has at least one active member.
+// Used by tournament registration to reject empty teams.
+func (q *Queries) HasActiveMembersByTeam(ctx context.Context, arg HasActiveMembersByTeamParams) (bool, error) {
+	row := q.db.QueryRow(ctx, hasActiveMembersByTeam, arg.TeamID, arg.OrganizationID)
+	var has_members bool
+	err := row.Scan(&has_members)
+	return has_members, err
+}
+
 const listActiveMembersByTeam = `-- name: ListActiveMembersByTeam :many
 SELECT id, team_id, player_id, role, jersey_number, status, joined_at, left_at, notes, created_at, updated_at, organization_id
 FROM   team_memberships

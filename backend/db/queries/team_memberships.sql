@@ -56,6 +56,17 @@ INSERT INTO team_memberships (
 VALUES ($1, $2, $3, $4, $5, $6)
 RETURNING *;
 
+-- name: HasActiveMembersByTeam :one
+-- Returns true if the team has at least one active member.
+-- Used by tournament registration to reject empty teams.
+SELECT EXISTS(
+    SELECT 1
+    FROM   team_memberships
+    WHERE  team_id         = $1
+      AND  organization_id = $2
+      AND  status          = 'active'
+) AS has_members;
+
 -- name: RemoveMembership :one
 -- Soft-removes by setting status = 'released' and left_at = NOW().
 -- Scoped by id, team_id, and organization_id to prevent cross-team or
