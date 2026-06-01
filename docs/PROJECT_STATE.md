@@ -2,7 +2,7 @@
 
 **Last Updated:** 2026-06-01  
 **Build status:** `go build ./...` passing, `go vet ./...` clean  
-**Migrations applied:** 000001 – 000018  
+**Migrations applied:** 000001 – 000018 (000018 pending `migrate up` on next deploy)  
 **Go version:** 1.25.6  
 **Database:** PostgreSQL 17
 
@@ -107,7 +107,7 @@ backend/
 ```
 
 **Remaining stubs** (files exist with package declaration only, no logic):
-`users/`, `matches/`, `media/`, `rankings/`, `news/`
+`users/`, `media/`, `rankings/`, `news/`
 
 ### Request Lifecycle
 
@@ -406,6 +406,7 @@ Each access token carries **exactly one** `organization_id`. The token is org-co
 | **Teams** | `errors.go`, `dto.go`, `model.go`, `repository.go`, `service.go`, `handler.go`, `routes.go` | Complete |
 | **Tournaments** | `errors.go`, `dto.go`, `model.go`, `repository.go`, `service.go`, `handler.go`, `routes.go` | Complete |
 | **Tournament Registrations** | `errors.go`, `dto.go`, `model.go`, `repository.go`, `service.go`, `handler.go`, `routes.go` | Complete |
+| **Matches** | `errors.go`, `dto.go`, `model.go`, `repository.go`, `service.go`, `handler.go`, `routes.go` | Complete |
 | **Platform / Config** | `config.go` | Complete |
 | **Platform / Database** | `postgres.go` | Complete |
 | **Platform / Logger** | `logger.go` | Complete |
@@ -487,6 +488,16 @@ Each access token carries **exactly one** `organization_id`. The token is org-co
 | `GET` | `/registrations/{registrationId}` | Yes | — | Get registration by UUID |
 | `PATCH` | `/registrations/{registrationId}` | Yes | `tournament.update` | Update status/notes/seed; validates transitions; BOLA-guarded |
 | `DELETE` | `/registrations/{registrationId}` | Yes | `tournament.update` | Soft-withdraw — sets `status = withdrawn`; BOLA-guarded |
+
+### Matches (`/api/v1/organizations/{slug}/matches`)
+
+| Method | Path | Auth | Permission | Description |
+|--------|------|:----:|-----------|-------------|
+| `POST` | `/matches` | Yes | `match.create` | Schedule a match; validates tournament ongoing, participant eligibility, approved registrations; BOLA-guarded |
+| `GET` | `/matches` | Yes | — | List matches (paginated; `?limit`, `?offset`, `?tournament_id`, `?status`, `?search`) |
+| `GET` | `/matches/{id}` | Yes | — | Get match by UUID; returns all statuses including cancelled/completed |
+| `PATCH` | `/matches/{id}` | Yes | `match.update` | Partial update; validates status transitions, winner, participant changes; BOLA-guarded |
+| `DELETE` | `/matches/{id}` | Yes | `match.delete` | Soft-cancel — sets `status = cancelled`; terminal-state guard; BOLA-guarded |
 
 ### Health
 
@@ -579,6 +590,26 @@ Each access token carries **exactly one** `organization_id`. The token is org-co
 - Soft delete: `DELETE` sets `status = withdrawn`. Records never hard-deleted.
 - Audit logging: `create` / `update` / `delete` records with `EntityType = "tournament_registrations"`.
 
+### Phase 8A — Matches (Complete)
+
+- Full CRUD for match fixtures scoped to an organization.
+- Soft delete: `DELETE` sets `status = cancelled`. No hard deletes.
+- `GetByID` **intentionally returns cancelled and completed matches** for historical match_event and audit_log reference integrity.
+- **Status lifecycle** (Phase 8A statuses): `scheduled → live | cancelled`; `live → completed | abandoned | cancelled`. Terminal states: `completed`, `cancelled`, `abandoned`. Attempting to update or cancel a terminal match returns HTTP 422.
+- **Tournament status guard on Create**: tournament must be `ongoing`. Enforced twice — pre-transaction in service, and inside the transaction under a `FOR SHARE` lock on the tournament row to prevent concurrent cancellation races.
+- **Tournament status guard on lifecycle transitions**: before transitioning to `live`, `completed`, or `abandoned`, a `FOR SHARE` lock is acquired on the tournament row inside the transaction. A cancelled tournament cannot have its matches progressed.
+- **Participant type enforcement**: participants must match `tournaments.participant_type`. Team tournaments require `home_team_id + away_team_id`; individual tournaments require `home_player_id + away_player_id`. Mixing types returns HTTP 422.
+- **Duplicate participant protection**: `home == away` is rejected (`ErrDuplicateParticipants`, HTTP 422).
+- **Cross-org participant guard**: participants are fetched with org scope via `GetTeamByID(id, orgID)` / `GetPlayerByID(id, orgID)`. A participant from another org is not found and returns HTTP 422.
+- **Registration eligibility**: each participant must hold an `approved` registration in the tournament (`GetApprovedRegistrationByTeam` / `GetApprovedRegistrationByPlayer`). Unregistered participants return HTTP 422.
+- **Winner validation**: `winner_team_id` / `winner_player_id` may only be set when resulting status is `completed`. Winner must equal home or away participant. Violations return HTTP 422.
+- **Timestamp auto-stamping**: `started_at` is stamped automatically on `→ live` transition; `ended_at` on `→ completed` or `→ abandoned`.
+- Pagination: `ListMatchesPaginated` with `page_limit` / `page_offset`, optional `tournament_id`, `status`, and `search` (venue / round_name ILIKE) filters.
+- Audit logging: `create` / `update` / `delete` audit records written transactionally with each mutation. `EntityType = "matches"`. `new_data` always derived from the actual DB-returned row.
+- Two new SQL queries added to `tournament_registrations.sql`: `GetApprovedRegistrationByTeam`, `GetApprovedRegistrationByPlayer`.
+- Six new SQL queries added to `matches.sql`: `CreateMatch`, `UpdateMatch`, `CancelMatch`, `ListMatchesPaginated`, `CountMatches`, `LockTournamentForShare`.
+- `match.delete` permission (migration 000018) used for the DELETE endpoint; `coach` and `scorer` cannot cancel fixtures.
+
 ### Concurrency Hardening — Registration Capacity
 
 A code review identified a TOCTOU (Time of Check to Time of Use) race condition in the original capacity enforcement:
@@ -664,7 +695,7 @@ A code review identified a TOCTOU (Time of Check to Time of Use) race condition 
 | Phase 7A | Tournaments module | **COMPLETE** |
 | Phase 7B | Tournament registrations | **COMPLETE** |
 | Phase 7C | RBAC correction — `match.delete` permission | **COMPLETE** |
-| Phase 8A | Matches | NOT STARTED |
+| Phase 8A | Matches | **COMPLETE** |
 | Phase 8B | Match Events & Live Scoring | NOT STARTED |
 | Phase 9 | Rankings & Standings | NOT STARTED |
 | Phase 10 | Media | NOT STARTED |

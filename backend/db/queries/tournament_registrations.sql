@@ -78,6 +78,26 @@ WHERE  id            = $1
   AND  tournament_id = $2
 RETURNING *;
 
+-- name: GetApprovedRegistrationByTeam :one
+-- Used by the matches module to verify a team has an approved registration
+-- before being assigned as a match participant.
+SELECT id
+FROM   tournament_registrations
+WHERE  tournament_id = $1
+  AND  team_id       = $2
+  AND  status        = 'approved'
+LIMIT  1;
+
+-- name: GetApprovedRegistrationByPlayer :one
+-- Used by the matches module to verify a player has an approved registration
+-- before being assigned as a match participant.
+SELECT id
+FROM   tournament_registrations
+WHERE  tournament_id = $1
+  AND  player_id     = $2
+  AND  status        = 'approved'
+LIMIT  1;
+
 -- name: WithdrawRegistration :one
 -- Soft-removes by setting status = 'withdrawn'.
 -- Only acts on pending or approved registrations; returns no rows if already

@@ -15,3 +15,114 @@ WHERE  tournament_id   = $1
   AND  organization_id = $2
 ORDER  BY round_number ASC NULLS LAST,
           match_number  ASC NULLS LAST;
+
+-- name: CreateMatch :one
+-- Inserts a new scheduled match fixture. organization_id must equal the parent
+-- tournament's organization_id; this is enforced by trg_matches_org_consistency.
+-- status is always 'scheduled' on creation; is_walkover always FALSE.
+-- metadata defaults to '{}' via the table default.
+INSERT INTO matches (
+    tournament_id,
+    organization_id,
+    round_number,
+    round_name,
+    match_number,
+    home_team_id,
+    away_team_id,
+    home_player_id,
+    away_player_id,
+    venue,
+    scheduled_at,
+    status,
+    notes
+)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+RETURNING *;
+
+-- name: UpdateMatch :one
+-- Full mutable-field update. Service layer merges partial request fields over
+-- current state. id, organization_id, tournament_id, is_walkover, metadata,
+-- and created_at are immutable and never appear in the SET clause.
+-- started_at and ended_at are stamped by the service during lifecycle transitions.
+-- The terminal-state guard (status NOT IN ...) is enforced at the DB level so
+-- that two concurrent PATCH requests that both pass the service-layer check
+-- cannot both succeed: the second update finds 0 rows and returns ErrNoRows,
+-- which the repository maps to ErrMatchNotUpdatable.
+UPDATE matches
+SET    round_number     = $3,
+       round_name       = $4,
+       match_number     = $5,
+       home_team_id     = $6,
+       away_team_id     = $7,
+       home_player_id   = $8,
+       away_player_id   = $9,
+       venue            = $10,
+       scheduled_at     = $11,
+       started_at       = $12,
+       ended_at         = $13,
+       status           = $14,
+       winner_team_id   = $15,
+       winner_player_id = $16,
+       notes            = $17,
+       updated_at       = NOW()
+WHERE  id              = $1
+  AND  organization_id = $2
+  AND  status NOT IN ('completed', 'cancelled', 'abandoned')
+RETURNING *;
+
+-- name: CancelMatch :one
+-- Soft-cancel: sets status to 'cancelled'. Records are never hard-deleted so
+-- that future match_events and audit_log references remain resolvable.
+-- The terminal-state guard mirrors UpdateMatch: a concurrent cancellation of an
+-- already-terminal match returns 0 rows, mapped to ErrMatchNotUpdatable.
+UPDATE matches
+SET    status     = 'cancelled',
+       updated_at = NOW()
+WHERE  id              = $1
+  AND  organization_id = $2
+  AND  status NOT IN ('completed', 'cancelled', 'abandoned')
+RETURNING *;
+
+-- name: ListMatchesPaginated :many
+-- Paginated listing of matches for an org.
+-- Optional tournament_id, status, and text search (venue / round_name) filters.
+SELECT *
+FROM   matches
+WHERE  organization_id = sqlc.arg(organization_id)
+  AND  (sqlc.narg(tournament_id_filter)::uuid IS NULL
+        OR tournament_id = sqlc.narg(tournament_id_filter)::uuid)
+  AND  (sqlc.narg(status_filter)::text IS NULL
+        OR status::text = sqlc.narg(status_filter))
+  AND  (sqlc.narg(search_query)::text IS NULL
+        OR venue      ILIKE '%' || sqlc.narg(search_query) || '%'
+        OR round_name ILIKE '%' || sqlc.narg(search_query) || '%')
+ORDER  BY scheduled_at ASC NULLS LAST,
+          created_at   DESC
+LIMIT  sqlc.arg(page_limit)
+OFFSET sqlc.arg(page_offset);
+
+-- name: CountMatches :one
+-- Returns the total count matching the same filters as ListMatchesPaginated.
+-- Used to build pagination metadata without fetching rows.
+SELECT COUNT(*)
+FROM   matches
+WHERE  organization_id = sqlc.arg(organization_id)
+  AND  (sqlc.narg(tournament_id_filter)::uuid IS NULL
+        OR tournament_id = sqlc.narg(tournament_id_filter)::uuid)
+  AND  (sqlc.narg(status_filter)::text IS NULL
+        OR status::text = sqlc.narg(status_filter))
+  AND  (sqlc.narg(search_query)::text IS NULL
+        OR venue      ILIKE '%' || sqlc.narg(search_query) || '%'
+        OR round_name ILIKE '%' || sqlc.narg(search_query) || '%');
+
+-- name: LockTournamentForShare :one
+-- Acquires a row-level share lock on the tournament row inside a transaction.
+-- Used during match create/update to prevent a concurrent tournament cancellation
+-- from racing with a status-sensitive match operation.
+-- FOR SHARE: blocks concurrent UPDATEs (cancellation) while allowing other
+-- readers; does not block concurrent match creates for the same tournament.
+SELECT status
+FROM   tournaments
+WHERE  id              = $1
+  AND  organization_id = $2
+FOR    SHARE;

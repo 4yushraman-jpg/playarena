@@ -97,6 +97,52 @@ func (q *Queries) CreateRegistration(ctx context.Context, arg CreateRegistration
 	return i, err
 }
 
+const getApprovedRegistrationByPlayer = `-- name: GetApprovedRegistrationByPlayer :one
+SELECT id
+FROM   tournament_registrations
+WHERE  tournament_id = $1
+  AND  player_id     = $2
+  AND  status        = 'approved'
+LIMIT  1
+`
+
+type GetApprovedRegistrationByPlayerParams struct {
+	TournamentID pgtype.UUID `json:"tournament_id"`
+	PlayerID     pgtype.UUID `json:"player_id"`
+}
+
+// Used by the matches module to verify a player has an approved registration
+// before being assigned as a match participant.
+func (q *Queries) GetApprovedRegistrationByPlayer(ctx context.Context, arg GetApprovedRegistrationByPlayerParams) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, getApprovedRegistrationByPlayer, arg.TournamentID, arg.PlayerID)
+	var id pgtype.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
+const getApprovedRegistrationByTeam = `-- name: GetApprovedRegistrationByTeam :one
+SELECT id
+FROM   tournament_registrations
+WHERE  tournament_id = $1
+  AND  team_id       = $2
+  AND  status        = 'approved'
+LIMIT  1
+`
+
+type GetApprovedRegistrationByTeamParams struct {
+	TournamentID pgtype.UUID `json:"tournament_id"`
+	TeamID       pgtype.UUID `json:"team_id"`
+}
+
+// Used by the matches module to verify a team has an approved registration
+// before being assigned as a match participant.
+func (q *Queries) GetApprovedRegistrationByTeam(ctx context.Context, arg GetApprovedRegistrationByTeamParams) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, getApprovedRegistrationByTeam, arg.TournamentID, arg.TeamID)
+	var id pgtype.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
 const getRegistrationByID = `-- name: GetRegistrationByID :one
 
 SELECT id, tournament_id, organization_id, team_id, player_id, seed_number, status, registered_by, registered_at, approved_by, approved_at, notes, metadata, created_at, updated_at

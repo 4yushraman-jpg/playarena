@@ -11,6 +11,173 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const cancelMatch = `-- name: CancelMatch :one
+UPDATE matches
+SET    status     = 'cancelled',
+       updated_at = NOW()
+WHERE  id              = $1
+  AND  organization_id = $2
+  AND  status NOT IN ('completed', 'cancelled', 'abandoned')
+RETURNING id, tournament_id, organization_id, round_number, round_name, match_number, home_team_id, away_team_id, home_player_id, away_player_id, venue, scheduled_at, started_at, ended_at, status, winner_team_id, winner_player_id, is_walkover, notes, metadata, created_at, updated_at
+`
+
+type CancelMatchParams struct {
+	ID             pgtype.UUID `json:"id"`
+	OrganizationID pgtype.UUID `json:"organization_id"`
+}
+
+// Soft-cancel: sets status to 'cancelled'. Records are never hard-deleted so
+// that future match_events and audit_log references remain resolvable.
+// The terminal-state guard mirrors UpdateMatch: a concurrent cancellation of an
+// already-terminal match returns 0 rows, mapped to ErrMatchNotUpdatable.
+func (q *Queries) CancelMatch(ctx context.Context, arg CancelMatchParams) (Match, error) {
+	row := q.db.QueryRow(ctx, cancelMatch, arg.ID, arg.OrganizationID)
+	var i Match
+	err := row.Scan(
+		&i.ID,
+		&i.TournamentID,
+		&i.OrganizationID,
+		&i.RoundNumber,
+		&i.RoundName,
+		&i.MatchNumber,
+		&i.HomeTeamID,
+		&i.AwayTeamID,
+		&i.HomePlayerID,
+		&i.AwayPlayerID,
+		&i.Venue,
+		&i.ScheduledAt,
+		&i.StartedAt,
+		&i.EndedAt,
+		&i.Status,
+		&i.WinnerTeamID,
+		&i.WinnerPlayerID,
+		&i.IsWalkover,
+		&i.Notes,
+		&i.Metadata,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const countMatches = `-- name: CountMatches :one
+SELECT COUNT(*)
+FROM   matches
+WHERE  organization_id = $1
+  AND  ($2::uuid IS NULL
+        OR tournament_id = $2::uuid)
+  AND  ($3::text IS NULL
+        OR status::text = $3)
+  AND  ($4::text IS NULL
+        OR venue      ILIKE '%' || $4 || '%'
+        OR round_name ILIKE '%' || $4 || '%')
+`
+
+type CountMatchesParams struct {
+	OrganizationID     pgtype.UUID `json:"organization_id"`
+	TournamentIDFilter pgtype.UUID `json:"tournament_id_filter"`
+	StatusFilter       *string     `json:"status_filter"`
+	SearchQuery        *string     `json:"search_query"`
+}
+
+// Returns the total count matching the same filters as ListMatchesPaginated.
+// Used to build pagination metadata without fetching rows.
+func (q *Queries) CountMatches(ctx context.Context, arg CountMatchesParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countMatches,
+		arg.OrganizationID,
+		arg.TournamentIDFilter,
+		arg.StatusFilter,
+		arg.SearchQuery,
+	)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const createMatch = `-- name: CreateMatch :one
+INSERT INTO matches (
+    tournament_id,
+    organization_id,
+    round_number,
+    round_name,
+    match_number,
+    home_team_id,
+    away_team_id,
+    home_player_id,
+    away_player_id,
+    venue,
+    scheduled_at,
+    status,
+    notes
+)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+RETURNING id, tournament_id, organization_id, round_number, round_name, match_number, home_team_id, away_team_id, home_player_id, away_player_id, venue, scheduled_at, started_at, ended_at, status, winner_team_id, winner_player_id, is_walkover, notes, metadata, created_at, updated_at
+`
+
+type CreateMatchParams struct {
+	TournamentID   pgtype.UUID        `json:"tournament_id"`
+	OrganizationID pgtype.UUID        `json:"organization_id"`
+	RoundNumber    *int16             `json:"round_number"`
+	RoundName      *string            `json:"round_name"`
+	MatchNumber    *int16             `json:"match_number"`
+	HomeTeamID     pgtype.UUID        `json:"home_team_id"`
+	AwayTeamID     pgtype.UUID        `json:"away_team_id"`
+	HomePlayerID   pgtype.UUID        `json:"home_player_id"`
+	AwayPlayerID   pgtype.UUID        `json:"away_player_id"`
+	Venue          *string            `json:"venue"`
+	ScheduledAt    pgtype.Timestamptz `json:"scheduled_at"`
+	Status         MatchStatus        `json:"status"`
+	Notes          *string            `json:"notes"`
+}
+
+// Inserts a new scheduled match fixture. organization_id must equal the parent
+// tournament's organization_id; this is enforced by trg_matches_org_consistency.
+// status is always 'scheduled' on creation; is_walkover always FALSE.
+// metadata defaults to '{}' via the table default.
+func (q *Queries) CreateMatch(ctx context.Context, arg CreateMatchParams) (Match, error) {
+	row := q.db.QueryRow(ctx, createMatch,
+		arg.TournamentID,
+		arg.OrganizationID,
+		arg.RoundNumber,
+		arg.RoundName,
+		arg.MatchNumber,
+		arg.HomeTeamID,
+		arg.AwayTeamID,
+		arg.HomePlayerID,
+		arg.AwayPlayerID,
+		arg.Venue,
+		arg.ScheduledAt,
+		arg.Status,
+		arg.Notes,
+	)
+	var i Match
+	err := row.Scan(
+		&i.ID,
+		&i.TournamentID,
+		&i.OrganizationID,
+		&i.RoundNumber,
+		&i.RoundName,
+		&i.MatchNumber,
+		&i.HomeTeamID,
+		&i.AwayTeamID,
+		&i.HomePlayerID,
+		&i.AwayPlayerID,
+		&i.Venue,
+		&i.ScheduledAt,
+		&i.StartedAt,
+		&i.EndedAt,
+		&i.Status,
+		&i.WinnerTeamID,
+		&i.WinnerPlayerID,
+		&i.IsWalkover,
+		&i.Notes,
+		&i.Metadata,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const getMatchByID = `-- name: GetMatchByID :one
 
 SELECT id, tournament_id, organization_id, round_number, round_name, match_number, home_team_id, away_team_id, home_player_id, away_player_id, venue, scheduled_at, started_at, ended_at, status, winner_team_id, winner_player_id, is_walkover, notes, metadata, created_at, updated_at
@@ -112,4 +279,207 @@ func (q *Queries) ListMatchesByTournament(ctx context.Context, arg ListMatchesBy
 		return nil, err
 	}
 	return items, nil
+}
+
+const listMatchesPaginated = `-- name: ListMatchesPaginated :many
+SELECT id, tournament_id, organization_id, round_number, round_name, match_number, home_team_id, away_team_id, home_player_id, away_player_id, venue, scheduled_at, started_at, ended_at, status, winner_team_id, winner_player_id, is_walkover, notes, metadata, created_at, updated_at
+FROM   matches
+WHERE  organization_id = $1
+  AND  ($2::uuid IS NULL
+        OR tournament_id = $2::uuid)
+  AND  ($3::text IS NULL
+        OR status::text = $3)
+  AND  ($4::text IS NULL
+        OR venue      ILIKE '%' || $4 || '%'
+        OR round_name ILIKE '%' || $4 || '%')
+ORDER  BY scheduled_at ASC NULLS LAST,
+          created_at   DESC
+LIMIT  $6
+OFFSET $5
+`
+
+type ListMatchesPaginatedParams struct {
+	OrganizationID     pgtype.UUID `json:"organization_id"`
+	TournamentIDFilter pgtype.UUID `json:"tournament_id_filter"`
+	StatusFilter       *string     `json:"status_filter"`
+	SearchQuery        *string     `json:"search_query"`
+	PageOffset         int32       `json:"page_offset"`
+	PageLimit          int32       `json:"page_limit"`
+}
+
+// Paginated listing of matches for an org.
+// Optional tournament_id, status, and text search (venue / round_name) filters.
+func (q *Queries) ListMatchesPaginated(ctx context.Context, arg ListMatchesPaginatedParams) ([]Match, error) {
+	rows, err := q.db.Query(ctx, listMatchesPaginated,
+		arg.OrganizationID,
+		arg.TournamentIDFilter,
+		arg.StatusFilter,
+		arg.SearchQuery,
+		arg.PageOffset,
+		arg.PageLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Match{}
+	for rows.Next() {
+		var i Match
+		if err := rows.Scan(
+			&i.ID,
+			&i.TournamentID,
+			&i.OrganizationID,
+			&i.RoundNumber,
+			&i.RoundName,
+			&i.MatchNumber,
+			&i.HomeTeamID,
+			&i.AwayTeamID,
+			&i.HomePlayerID,
+			&i.AwayPlayerID,
+			&i.Venue,
+			&i.ScheduledAt,
+			&i.StartedAt,
+			&i.EndedAt,
+			&i.Status,
+			&i.WinnerTeamID,
+			&i.WinnerPlayerID,
+			&i.IsWalkover,
+			&i.Notes,
+			&i.Metadata,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockTournamentForShare = `-- name: LockTournamentForShare :one
+SELECT status
+FROM   tournaments
+WHERE  id              = $1
+  AND  organization_id = $2
+FOR    SHARE
+`
+
+type LockTournamentForShareParams struct {
+	ID             pgtype.UUID `json:"id"`
+	OrganizationID pgtype.UUID `json:"organization_id"`
+}
+
+// Acquires a row-level share lock on the tournament row inside a transaction.
+// Used during match create/update to prevent a concurrent tournament cancellation
+// from racing with a status-sensitive match operation.
+// FOR SHARE: blocks concurrent UPDATEs (cancellation) while allowing other
+// readers; does not block concurrent match creates for the same tournament.
+func (q *Queries) LockTournamentForShare(ctx context.Context, arg LockTournamentForShareParams) (TournamentStatus, error) {
+	row := q.db.QueryRow(ctx, lockTournamentForShare, arg.ID, arg.OrganizationID)
+	var status TournamentStatus
+	err := row.Scan(&status)
+	return status, err
+}
+
+const updateMatch = `-- name: UpdateMatch :one
+UPDATE matches
+SET    round_number     = $3,
+       round_name       = $4,
+       match_number     = $5,
+       home_team_id     = $6,
+       away_team_id     = $7,
+       home_player_id   = $8,
+       away_player_id   = $9,
+       venue            = $10,
+       scheduled_at     = $11,
+       started_at       = $12,
+       ended_at         = $13,
+       status           = $14,
+       winner_team_id   = $15,
+       winner_player_id = $16,
+       notes            = $17,
+       updated_at       = NOW()
+WHERE  id              = $1
+  AND  organization_id = $2
+  AND  status NOT IN ('completed', 'cancelled', 'abandoned')
+RETURNING id, tournament_id, organization_id, round_number, round_name, match_number, home_team_id, away_team_id, home_player_id, away_player_id, venue, scheduled_at, started_at, ended_at, status, winner_team_id, winner_player_id, is_walkover, notes, metadata, created_at, updated_at
+`
+
+type UpdateMatchParams struct {
+	ID             pgtype.UUID        `json:"id"`
+	OrganizationID pgtype.UUID        `json:"organization_id"`
+	RoundNumber    *int16             `json:"round_number"`
+	RoundName      *string            `json:"round_name"`
+	MatchNumber    *int16             `json:"match_number"`
+	HomeTeamID     pgtype.UUID        `json:"home_team_id"`
+	AwayTeamID     pgtype.UUID        `json:"away_team_id"`
+	HomePlayerID   pgtype.UUID        `json:"home_player_id"`
+	AwayPlayerID   pgtype.UUID        `json:"away_player_id"`
+	Venue          *string            `json:"venue"`
+	ScheduledAt    pgtype.Timestamptz `json:"scheduled_at"`
+	StartedAt      pgtype.Timestamptz `json:"started_at"`
+	EndedAt        pgtype.Timestamptz `json:"ended_at"`
+	Status         MatchStatus        `json:"status"`
+	WinnerTeamID   pgtype.UUID        `json:"winner_team_id"`
+	WinnerPlayerID pgtype.UUID        `json:"winner_player_id"`
+	Notes          *string            `json:"notes"`
+}
+
+// Full mutable-field update. Service layer merges partial request fields over
+// current state. id, organization_id, tournament_id, is_walkover, metadata,
+// and created_at are immutable and never appear in the SET clause.
+// started_at and ended_at are stamped by the service during lifecycle transitions.
+// The terminal-state guard (status NOT IN ...) is enforced at the DB level so
+// that two concurrent PATCH requests that both pass the service-layer check
+// cannot both succeed: the second update finds 0 rows and returns ErrNoRows,
+// which the repository maps to ErrMatchNotUpdatable.
+func (q *Queries) UpdateMatch(ctx context.Context, arg UpdateMatchParams) (Match, error) {
+	row := q.db.QueryRow(ctx, updateMatch,
+		arg.ID,
+		arg.OrganizationID,
+		arg.RoundNumber,
+		arg.RoundName,
+		arg.MatchNumber,
+		arg.HomeTeamID,
+		arg.AwayTeamID,
+		arg.HomePlayerID,
+		arg.AwayPlayerID,
+		arg.Venue,
+		arg.ScheduledAt,
+		arg.StartedAt,
+		arg.EndedAt,
+		arg.Status,
+		arg.WinnerTeamID,
+		arg.WinnerPlayerID,
+		arg.Notes,
+	)
+	var i Match
+	err := row.Scan(
+		&i.ID,
+		&i.TournamentID,
+		&i.OrganizationID,
+		&i.RoundNumber,
+		&i.RoundName,
+		&i.MatchNumber,
+		&i.HomeTeamID,
+		&i.AwayTeamID,
+		&i.HomePlayerID,
+		&i.AwayPlayerID,
+		&i.Venue,
+		&i.ScheduledAt,
+		&i.StartedAt,
+		&i.EndedAt,
+		&i.Status,
+		&i.WinnerTeamID,
+		&i.WinnerPlayerID,
+		&i.IsWalkover,
+		&i.Notes,
+		&i.Metadata,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
 }

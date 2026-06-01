@@ -9,6 +9,7 @@ import (
 	db "github.com/4yushraman-jpg/playarena/db/sqlc"
 	"github.com/4yushraman-jpg/playarena/internal/auth"
 	"github.com/4yushraman-jpg/playarena/internal/health"
+	"github.com/4yushraman-jpg/playarena/internal/matches"
 	"github.com/4yushraman-jpg/playarena/internal/organizations"
 	"github.com/4yushraman-jpg/playarena/internal/platform/config"
 	"github.com/4yushraman-jpg/playarena/internal/players"
@@ -32,4 +33,5 @@ func registerModules(r chi.Router, pool *pgxpool.Pool, log *slog.Logger, cfg *co
 	teams.RegisterRoutes(r, pool, cfg, log, authz)
 	tournaments.RegisterRoutes(r, pool, cfg, log, authz)
 	tournament_registrations.RegisterRoutes(r, pool, cfg, log, authz)
+	matches.RegisterRoutes(r, pool, cfg, log, authz)
 }
