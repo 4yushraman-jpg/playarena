@@ -11,6 +11,36 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const getRoleBySlug = `-- name: GetRoleBySlug :one
+
+SELECT id, organization_id, name, slug, description, scope, is_system, created_at, updated_at
+FROM   roles
+WHERE  slug = $1
+  AND  organization_id IS NULL
+LIMIT  1
+`
+
+// ── role grant operations ─────────────────────────────────────────────────────
+// Looks up a system role by its slug. System roles (is_system=TRUE) always
+// have organization_id IS NULL — they are platform-wide templates assigned
+// to users within specific org contexts via user_organization_roles.
+func (q *Queries) GetRoleBySlug(ctx context.Context, slug string) (Role, error) {
+	row := q.db.QueryRow(ctx, getRoleBySlug, slug)
+	var i Role
+	err := row.Scan(
+		&i.ID,
+		&i.OrganizationID,
+		&i.Name,
+		&i.Slug,
+		&i.Description,
+		&i.Scope,
+		&i.IsSystem,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const getUserOrganizations = `-- name: GetUserOrganizations :many
 SELECT DISTINCT o.id, o.name, o.slug, o.description, o.type, o.status, o.logo_url, o.website, o.email, o.phone, o.country, o.city, o.settings, o.created_at, o.updated_at
 FROM   user_organization_roles uor
@@ -46,6 +76,55 @@ func (q *Queries) GetUserOrganizations(ctx context.Context, userID pgtype.UUID) 
 			&i.Settings,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const getUserPermissions = `-- name: GetUserPermissions :many
+SELECT DISTINCT p.id, p.name, p.slug, p.description, p.resource, p.action, p.created_at
+FROM   user_organization_roles uor
+JOIN   roles r          ON uor.role_id = r.id
+JOIN   role_permissions rp ON r.id = rp.role_id
+JOIN   permissions p    ON rp.permission_id = p.id
+WHERE  uor.user_id = $1
+  AND  (uor.organization_id = $2 OR uor.organization_id IS NULL)
+  AND  (uor.expires_at IS NULL OR uor.expires_at > NOW())
+ORDER  BY p.slug ASC
+`
+
+type GetUserPermissionsParams struct {
+	UserID         pgtype.UUID `json:"user_id"`
+	OrganizationID pgtype.UUID `json:"organization_id"`
+}
+
+// Returns all distinct permissions for a user, combining org-specific and
+// platform-level role grants. The four-table JOIN resolves the full chain
+// uor → role → role_permissions → permission in one query (no N+1).
+// Pass organization_id = NULL to evaluate platform grants only.
+func (q *Queries) GetUserPermissions(ctx context.Context, arg GetUserPermissionsParams) ([]Permission, error) {
+	rows, err := q.db.Query(ctx, getUserPermissions, arg.UserID, arg.OrganizationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Permission{}
+	for rows.Next() {
+		var i Permission
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.Slug,
+			&i.Description,
+			&i.Resource,
+			&i.Action,
+			&i.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -97,7 +176,61 @@ func (q *Queries) GetUserPlatformRoles(ctx context.Context, userID pgtype.UUID) 
 	return items, nil
 }
 
+const getUserRoles = `-- name: GetUserRoles :many
+
+SELECT r.id, r.organization_id, r.name, r.slug, r.description, r.scope, r.is_system, r.created_at, r.updated_at
+FROM   user_organization_roles uor
+JOIN   roles r ON uor.role_id = r.id
+WHERE  uor.user_id = $1
+  AND  (uor.organization_id = $2 OR uor.organization_id IS NULL)
+  AND  (uor.expires_at IS NULL OR uor.expires_at > NOW())
+ORDER  BY r.name ASC
+`
+
+type GetUserRolesParams struct {
+	UserID         pgtype.UUID `json:"user_id"`
+	OrganizationID pgtype.UUID `json:"organization_id"`
+}
+
+// ── authorization-layer queries ───────────────────────────────────────────────
+// Returns all active roles for a user, combining:
+//   - org-specific grants   (uor.organization_id = $2)
+//   - platform-level grants (uor.organization_id IS NULL)
+//
+// Pass organization_id = NULL to retrieve only platform grants.
+// No N+1: single JOIN fetches roles in one round trip.
+func (q *Queries) GetUserRoles(ctx context.Context, arg GetUserRolesParams) ([]Role, error) {
+	rows, err := q.db.Query(ctx, getUserRoles, arg.UserID, arg.OrganizationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Role{}
+	for rows.Next() {
+		var i Role
+		if err := rows.Scan(
+			&i.ID,
+			&i.OrganizationID,
+			&i.Name,
+			&i.Slug,
+			&i.Description,
+			&i.Scope,
+			&i.IsSystem,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const getUserRolesByOrganization = `-- name: GetUserRolesByOrganization :many
+
 
 SELECT r.id, r.organization_id, r.name, r.slug, r.description, r.scope, r.is_system, r.created_at, r.updated_at
 FROM   user_organization_roles uor
@@ -115,6 +248,7 @@ type GetUserRolesByOrganizationParams struct {
 
 // RBAC queries
 // Role and permission lookups for authorization
+// ── existing queries (used by auth service login flow) ────────────────────────
 func (q *Queries) GetUserRolesByOrganization(ctx context.Context, arg GetUserRolesByOrganizationParams) ([]Role, error) {
 	rows, err := q.db.Query(ctx, getUserRolesByOrganization, arg.UserID, arg.OrganizationID)
 	if err != nil {
@@ -143,4 +277,61 @@ func (q *Queries) GetUserRolesByOrganization(ctx context.Context, arg GetUserRol
 		return nil, err
 	}
 	return items, nil
+}
+
+const grantRoleToUserInOrg = `-- name: GrantRoleToUserInOrg :exec
+INSERT INTO user_organization_roles (user_id, organization_id, role_id, granted_by)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT DO NOTHING
+`
+
+type GrantRoleToUserInOrgParams struct {
+	UserID         pgtype.UUID `json:"user_id"`
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	RoleID         pgtype.UUID `json:"role_id"`
+	GrantedBy      pgtype.UUID `json:"granted_by"`
+}
+
+// Grants a role to a user within a specific organization.
+// ON CONFLICT DO NOTHING: if the exact same grant already exists it is
+// silently skipped (idempotent).
+func (q *Queries) GrantRoleToUserInOrg(ctx context.Context, arg GrantRoleToUserInOrgParams) error {
+	_, err := q.db.Exec(ctx, grantRoleToUserInOrg,
+		arg.UserID,
+		arg.OrganizationID,
+		arg.RoleID,
+		arg.GrantedBy,
+	)
+	return err
+}
+
+const hasPermission = `-- name: HasPermission :one
+SELECT EXISTS(
+    SELECT 1
+    FROM   user_organization_roles uor
+    JOIN   roles r          ON uor.role_id = r.id
+    JOIN   role_permissions rp ON r.id = rp.role_id
+    JOIN   permissions p    ON rp.permission_id = p.id
+    WHERE  uor.user_id = $1
+      AND  (uor.organization_id = $2 OR uor.organization_id IS NULL)
+      AND  (uor.expires_at IS NULL OR uor.expires_at > NOW())
+      AND  p.slug = $3
+) AS has_permission
+`
+
+type HasPermissionParams struct {
+	UserID         pgtype.UUID `json:"user_id"`
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	Slug           string      `json:"slug"`
+}
+
+// Returns TRUE when the user holds the given permission slug in the given
+// org context. Uses EXISTS for short-circuit evaluation — stops as soon as
+// one matching grant is found without fetching extra rows.
+// Pass organization_id = NULL to check platform-level grants only.
+func (q *Queries) HasPermission(ctx context.Context, arg HasPermissionParams) (bool, error) {
+	row := q.db.QueryRow(ctx, hasPermission, arg.UserID, arg.OrganizationID, arg.Slug)
+	var has_permission bool
+	err := row.Scan(&has_permission)
+	return has_permission, err
 }

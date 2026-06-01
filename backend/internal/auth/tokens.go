@@ -2,8 +2,8 @@ package auth
 
 import (
 	"crypto/rand"
-	"encoding/base64"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"time"
 
@@ -12,9 +12,13 @@ import (
 )
 
 const (
-	accessTokenDuration  = 15 * time.Minute
-	refreshTokenDuration = 7 * 24 * time.Hour
-	refreshTokenLength   = 32
+	accessTokenDuration       = 15 * time.Minute
+	refreshTokenDuration      = 7 * 24 * time.Hour
+	verificationTokenDuration = 24 * time.Hour
+
+	// randomTokenLength is the number of raw bytes used for both refresh tokens
+	// and email verification tokens (base64url-encoded to ~43 chars).
+	randomTokenLength = 32
 
 	jwtIssuer = "playarena"
 )
@@ -44,7 +48,21 @@ func GenerateAccessToken(userID, organizationID, role, email, jwtSecret string) 
 // GenerateRefreshToken returns a cryptographically random, URL-safe base64 token.
 // The raw token is never stored; callers must hash it with HashTokenForStorage.
 func GenerateRefreshToken() (string, error) {
-	b := make([]byte, refreshTokenLength)
+	return generateRandomToken()
+}
+
+// GenerateVerificationToken returns a cryptographically random, URL-safe base64
+// token for email verification. Same entropy and encoding as refresh tokens.
+// The raw token is never stored; callers must hash it with HashTokenForStorage.
+func GenerateVerificationToken() (string, error) {
+	return generateRandomToken()
+}
+
+// generateRandomToken is the shared implementation for all random-token
+// generation. Generates randomTokenLength bytes of CSPRNG output and
+// encodes them as base64url.
+func generateRandomToken() (string, error) {
+	b := make([]byte, randomTokenLength)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}
@@ -60,7 +78,6 @@ func ParseToken(tokenString, jwtSecret string) (*JWTClaims, error) {
 		tokenString,
 		claims,
 		func(token *jwt.Token) (interface{}, error) {
-			// Reject anything that is not HMAC-SHA256.
 			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 				return nil, ErrInvalidAlgorithm
 			}
@@ -69,7 +86,6 @@ func ParseToken(tokenString, jwtSecret string) (*JWTClaims, error) {
 			}
 			return []byte(jwtSecret), nil
 		},
-		// Enforce issuer validation; tokens from any other service are rejected.
 		jwt.WithIssuer(jwtIssuer),
 		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
 		jwt.WithExpirationRequired(),
@@ -81,7 +97,6 @@ func ParseToken(tokenString, jwtSecret string) (*JWTClaims, error) {
 		return nil, ErrInvalidToken
 	}
 
-	// Validate custom claims that jwt/v5 cannot enforce.
 	if claims.UserID == "" {
 		return nil, ErrInvalidToken
 	}
@@ -112,6 +127,14 @@ func GetRefreshTokenExpiryTime() pgtype.Timestamptz {
 	}
 }
 
+// GetVerificationTokenExpiryTime returns a timestamptz set to now + 24 hours.
+func GetVerificationTokenExpiryTime() pgtype.Timestamptz {
+	return pgtype.Timestamptz{
+		Time:  time.Now().Add(verificationTokenDuration),
+		Valid: true,
+	}
+}
+
 // mapJWTError converts jwt/v5 library errors to our domain error types.
 func mapJWTError(err error) error {
 	switch {
@@ -133,7 +156,6 @@ func containsError(err, target error) bool {
 	if err == target {
 		return true
 	}
-	// jwt/v5 wraps errors; unwrap chain
 	type unwrapper interface{ Unwrap() error }
 	if u, ok := err.(unwrapper); ok {
 		return containsError(u.Unwrap(), target)

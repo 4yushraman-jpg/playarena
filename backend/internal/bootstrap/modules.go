@@ -6,14 +6,22 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	db "github.com/4yushraman-jpg/playarena/db/sqlc"
 	"github.com/4yushraman-jpg/playarena/internal/auth"
 	"github.com/4yushraman-jpg/playarena/internal/health"
+	"github.com/4yushraman-jpg/playarena/internal/organizations"
 	"github.com/4yushraman-jpg/playarena/internal/platform/config"
 )
 
 // registerModules wires all domain modules into the router.
 // Add new modules here as the application grows — one call per domain.
-func registerModules(r chi.Router, db *pgxpool.Pool, log *slog.Logger, cfg *config.Config) {
-	health.RegisterRoutes(r, db)
-	auth.RegisterRoutes(r, db, cfg, log)
+func registerModules(r chi.Router, pool *pgxpool.Pool, log *slog.Logger, cfg *config.Config) {
+	// AuthorizationService is constructed once and shared across all modules
+	// that need permission checks. It is cheap to create (wraps a *db.Queries).
+	queries := db.New(pool)
+	authz := auth.NewAuthorizationService(queries)
+
+	health.RegisterRoutes(r, pool)
+	auth.RegisterRoutes(r, pool, cfg, log)
+	organizations.RegisterRoutes(r, pool, cfg, log, authz)
 }

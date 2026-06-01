@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 var (
@@ -37,7 +38,7 @@ func (e *ValidationError) Error() string {
 //
 // Returns:
 //   - *ValidationError  when decoding succeeds but field rules fail (→ 400)
-//   - another error     when the body is missing or is not valid JSON (→ 400)
+//   - another error     when the body is missing or not valid JSON (→ 400)
 //   - nil               when everything is valid
 func DecodeJSON(r *http.Request, dst any) error {
 	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
@@ -53,11 +54,14 @@ func DecodeJSON(r *http.Request, dst any) error {
 // the "validate" tag on each field.
 //
 // Supported rules (comma-separated, processed in order):
-//   - omitempty  skip all subsequent rules when the field value is empty
-//   - required   value must be non-empty after trimming whitespace
-//   - email      value must match a basic e-mail pattern
-//   - uuid       value must be a standard hyphenated UUID
-//   - min=N      string length must be at least N characters
+//
+//   - omitempty        skip all subsequent rules when the field value is empty
+//   - required         value must be non-empty after trimming whitespace
+//   - email            value must match a basic e-mail pattern
+//   - uuid             value must be a standard hyphenated UUID
+//   - alphanum_under   value must contain only letters, digits, and underscores
+//   - min=N            string length must be at least N characters
+//   - max=N            string length must be at most N characters
 func validateStruct(v any) error {
 	rv := reflect.ValueOf(v)
 	if rv.Kind() == reflect.Pointer {
@@ -110,7 +114,7 @@ func validateStruct(v any) error {
 func applyRule(rule, value string) string {
 	switch {
 	case rule == "omitempty":
-		return "" // handled by the caller
+		return ""
 
 	case rule == "required":
 		if strings.TrimSpace(value) == "" {
@@ -127,10 +131,23 @@ func applyRule(rule, value string) string {
 			return "must be a valid UUID"
 		}
 
+	case rule == "alphanum_under":
+		for _, c := range value {
+			if !unicode.IsLetter(c) && !unicode.IsDigit(c) && c != '_' {
+				return "must contain only letters, numbers, and underscores"
+			}
+		}
+
 	case strings.HasPrefix(rule, "min="):
 		n, err := strconv.Atoi(strings.TrimPrefix(rule, "min="))
 		if err == nil && len([]rune(value)) < n {
 			return fmt.Sprintf("must be at least %d characters", n)
+		}
+
+	case strings.HasPrefix(rule, "max="):
+		n, err := strconv.Atoi(strings.TrimPrefix(rule, "max="))
+		if err == nil && len([]rune(value)) > n {
+			return fmt.Sprintf("must be at most %d characters", n)
 		}
 	}
 

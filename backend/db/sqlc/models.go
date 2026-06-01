@@ -870,6 +870,18 @@ type AuditLog struct {
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
 }
 
+// Single-use email verification tokens. Stores a SHA-256 hash of the raw token — the raw value is never persisted. A token is valid when: used_at IS NULL AND expires_at > NOW(). Expired and used rows are cleaned up by a periodic background job.
+type EmailVerificationToken struct {
+	ID     pgtype.UUID `json:"id"`
+	UserID pgtype.UUID `json:"user_id"`
+	// SHA-256 hex-encoded hash of the raw token sent to the user. Lookup: WHERE token_hash = encode(digest($raw_token, 'sha256'), 'hex').
+	TokenHash string             `json:"token_hash"`
+	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
+	// Set to NOW() the first time the token is successfully consumed. NULL means the token is still valid (pending use).
+	UsedAt    pgtype.Timestamptz `json:"used_at"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
 // Individual match fixture within a tournament. organization_id is denormalized from tournaments.organization_id to avoid a JOIN on every match-list query — must always equal the parent tournament org. Participant columns are NULL for bracket matches whose opponents are TBD. winner_* columns are set at completion: they are a final-state conclusion, not a running statistic, so denormalization is justified here.
 type Match struct {
 	ID           pgtype.UUID `json:"id"`

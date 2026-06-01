@@ -11,6 +11,52 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const createUser = `-- name: CreateUser :one
+INSERT INTO users (email, username, password_hash, first_name, last_name)
+VALUES ($1, $2, $3, $4, $5)
+RETURNING id, email, username, password_hash, first_name, last_name, phone, avatar_url, date_of_birth, gender, status, email_verified_at, last_login_at, last_login_ip, created_at, updated_at
+`
+
+type CreateUserParams struct {
+	Email        string `json:"email"`
+	Username     string `json:"username"`
+	PasswordHash string `json:"password_hash"`
+	FirstName    string `json:"first_name"`
+	LastName     string `json:"last_name"`
+}
+
+// Inserts a new platform user. status defaults to pending_verification;
+// all nullable profile columns are left NULL until the user fills them in.
+func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, error) {
+	row := q.db.QueryRow(ctx, createUser,
+		arg.Email,
+		arg.Username,
+		arg.PasswordHash,
+		arg.FirstName,
+		arg.LastName,
+	)
+	var i User
+	err := row.Scan(
+		&i.ID,
+		&i.Email,
+		&i.Username,
+		&i.PasswordHash,
+		&i.FirstName,
+		&i.LastName,
+		&i.Phone,
+		&i.AvatarUrl,
+		&i.DateOfBirth,
+		&i.Gender,
+		&i.Status,
+		&i.EmailVerifiedAt,
+		&i.LastLoginAt,
+		&i.LastLoginIp,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const getUserByEmail = `-- name: GetUserByEmail :one
 SELECT id, email, username, password_hash, first_name, last_name, phone, avatar_url, date_of_birth, gender, status, email_verified_at, last_login_at, last_login_ip, created_at, updated_at
 FROM   users
@@ -149,4 +195,22 @@ func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
 		return nil, err
 	}
 	return items, nil
+}
+
+const verifyUserEmail = `-- name: VerifyUserEmail :exec
+UPDATE users
+SET    email_verified_at = NOW(),
+       status            = 'active',
+       updated_at        = NOW()
+WHERE  id     = $1
+  AND  status = 'pending_verification'
+`
+
+// Activates the account after the user clicks the verification link.
+// The AND status = 'pending_verification' guard makes the call idempotent:
+// if the account is already active (e.g. concurrent verification), it is a
+// safe no-op.
+func (q *Queries) VerifyUserEmail(ctx context.Context, id pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, verifyUserEmail, id)
+	return err
 }

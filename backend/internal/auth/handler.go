@@ -29,11 +29,6 @@ func NewHandler(svc *Service, cfg *config.Config, log *slog.Logger) *Handler {
 // ---- endpoints --------------------------------------------------------------
 
 // Login handles POST /api/v1/auth/login.
-//
-// On success:           200 with access + refresh tokens
-// Multi-org selection:  409 with organization list (client must re-submit with organization_id)
-// Bad credentials:      401
-// Account blocked:      403
 func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	var req LoginRequest
 	if err := validator.DecodeJSON(r, &req); err != nil {
@@ -58,11 +53,6 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 }
 
 // Refresh handles POST /api/v1/auth/refresh.
-//
-// Always rotates the refresh token: the client must store the new one.
-// On success:       200 with new access + refresh tokens
-// Invalid token:    401
-// Token reuse:      401 (all sessions revoked)
 func (h *Handler) Refresh(w http.ResponseWriter, r *http.Request) {
 	var req RefreshRequest
 	if err := validator.DecodeJSON(r, &req); err != nil {
@@ -87,10 +77,6 @@ func (h *Handler) Refresh(w http.ResponseWriter, r *http.Request) {
 }
 
 // Logout handles POST /api/v1/auth/logout.
-//
-// Revokes the presented refresh token. The corresponding access token continues
-// to be valid until it expires naturally (15-minute window). No authentication
-// middleware is required — the refresh token itself proves identity.
 func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 	var req LogoutRequest
 	if err := validator.DecodeJSON(r, &req); err != nil {
@@ -116,13 +102,10 @@ func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 }
 
 // Me handles GET /api/v1/auth/me.
-//
-// Protected by RequireAuth middleware. Combines DB profile data with the
-// org context and role already present in the validated access token.
+// Protected by RequireAuth middleware.
 func (h *Handler) Me(w http.ResponseWriter, r *http.Request) {
 	principal := GetAuthUser(r.Context())
 	if principal == nil {
-		// Should never happen — RequireAuth runs before this handler.
 		response.Error(w, http.StatusUnauthorized, "authorization required")
 		return
 	}
@@ -144,17 +127,107 @@ func (h *Handler) Me(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// Register handles POST /api/v1/auth/register.
+//
+// Creates a new user with status pending_verification and returns a
+// verification token. In production, remove verification_token from the
+// response and deliver it only via email.
+func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
+	var req RegisterRequest
+	if err := validator.DecodeJSON(r, &req); err != nil {
+		h.writeDecodeError(w, err)
+		return
+	}
+
+	resp, err := h.svc.Register(r.Context(), req)
+	if err != nil {
+		h.log.WarnContext(r.Context(), "auth.register.failed",
+			slog.String("kind", errorKind(err)),
+			slog.String("request_id", chimw.GetReqID(r.Context())),
+		)
+		h.writeAuthError(w, r, err)
+		return
+	}
+
+	h.log.InfoContext(r.Context(), "auth.register.success",
+		slog.String("request_id", chimw.GetReqID(r.Context())),
+	)
+
+	// H2 fix: strip the verification token in production.
+	// In development it is returned for testing convenience (no email transport needed).
+	// In production the raw token must only be delivered via email — returning it in
+	// the API response allows any interceptor to bypass email verification entirely.
+	if !h.config.IsDevelopment() {
+		resp.VerificationToken = "" // json:"...,omitempty" ensures the field is absent
+	}
+	response.Write(w, http.StatusCreated, resp)
+}
+
+// VerifyEmail handles GET /api/v1/auth/verify-email?token=<raw_token>.
+//
+// Consumes the single-use verification token, activates the account, and
+// returns a plain success message. The client should redirect to login.
+func (h *Handler) VerifyEmail(w http.ResponseWriter, r *http.Request) {
+	rawToken := r.URL.Query().Get("token")
+	if rawToken == "" {
+		response.Error(w, http.StatusBadRequest, "token query parameter is required")
+		return
+	}
+
+	if err := h.svc.VerifyEmail(r.Context(), rawToken); err != nil {
+		h.log.WarnContext(r.Context(), "auth.verify_email.failed",
+			slog.String("kind", errorKind(err)),
+			slog.String("request_id", chimw.GetReqID(r.Context())),
+		)
+		h.writeAuthError(w, r, err)
+		return
+	}
+
+	h.log.InfoContext(r.Context(), "auth.verify_email.success",
+		slog.String("request_id", chimw.GetReqID(r.Context())),
+	)
+	response.Write(w, http.StatusOK, struct {
+		Message string `json:"message"`
+	}{Message: "email verified successfully"})
+}
+
+// AdminOnly handles GET /api/v1/auth/admin-only.
+//
+// This is a demonstration endpoint that requires RequireAuth +
+// RequirePermission("role.assign") in the middleware chain. It exercises
+// the authorization layer without doing real business logic.
+//
+// Response: the caller's principal (user_id, email, role, org_id).
+func (h *Handler) AdminOnly(w http.ResponseWriter, r *http.Request) {
+	principal := GetAuthUser(r.Context())
+	if principal == nil {
+		response.Error(w, http.StatusUnauthorized, "authorization required")
+		return
+	}
+
+	response.Write(w, http.StatusOK, struct {
+		Message        string `json:"message"`
+		UserID         string `json:"user_id"`
+		Email          string `json:"email"`
+		Role           string `json:"role"`
+		OrganizationID string `json:"organization_id"`
+	}{
+		Message:        "access granted",
+		UserID:         principal.UserID,
+		Email:          principal.Email,
+		Role:           principal.Role,
+		OrganizationID: principal.OrganizationID,
+	})
+}
+
 // ---- response types ---------------------------------------------------------
 
-// orgRequiredBody is the response sent when a multi-org user must specify
-// organization_id before a token can be issued.
 type orgRequiredBody struct {
 	Error         string       `json:"error"`
 	Code          string       `json:"code"`
 	Organizations []OrgSummary `json:"organizations"`
 }
 
-// meResponse is the combined DB profile + JWT-context representation.
 type meResponse struct {
 	ID             string `json:"id"`
 	Email          string `json:"email"`
@@ -169,21 +242,21 @@ type meResponse struct {
 
 // writeAuthError maps domain errors to HTTP responses.
 //
-// Mapping (per task specification):
-//
-//	ErrInvalidCredentials      → 401
-//	ErrInvalidToken            → 401
-//	ErrExpiredToken            → 401
-//	ErrRevokedToken            → 401
-//	ErrTokenReuse              → 401 (all sessions revoked)
-//	ErrUserSuspended           → 403
-//	ErrUserInactive            → 403
-//	ErrUserPendingVerification → 403
-//	ErrOrganizationRequired    → 409 with org list
-//	ErrOrganizationNotFound    → 422
-//	anything else              → 500
+//	ErrInvalidCredentials        → 401
+//	ErrInvalidToken / Expired /
+//	  Revoked / TokenReuse       → 401
+//	ErrUserSuspended             → 403
+//	ErrUserInactive              → 403
+//	ErrUserPendingVerification   → 403
+//	ErrEmailAlreadyRegistered    → 409
+//	ErrUsernameAlreadyTaken      → 409
+//	ErrOrganizationRequired      → 409 (with org list)
+//	ErrVerificationTokenInvalid  → 400
+//	ErrVerificationTokenExpired  → 400
+//	ErrVerificationTokenUsed     → 400
+//	ErrOrganizationNotFound      → 422
+//	anything else                → 500
 func (h *Handler) writeAuthError(w http.ResponseWriter, r *http.Request, err error) {
-	// ErrOrganizationRequired is a struct error carrying the org list.
 	var orgReq *ErrOrganizationRequired
 	if errors.As(err, &orgReq) {
 		response.Write(w, http.StatusConflict, orgRequiredBody{
@@ -208,6 +281,16 @@ func (h *Handler) writeAuthError(w http.ResponseWriter, r *http.Request, err err
 		response.Error(w, http.StatusForbidden, "account inactive")
 	case errors.Is(err, ErrUserPendingVerification):
 		response.Error(w, http.StatusForbidden, "email address not verified")
+	case errors.Is(err, ErrEmailAlreadyRegistered):
+		response.Error(w, http.StatusConflict, "email address is already registered")
+	case errors.Is(err, ErrUsernameAlreadyTaken):
+		response.Error(w, http.StatusConflict, "username is already taken")
+	case errors.Is(err, ErrVerificationTokenInvalid):
+		response.Error(w, http.StatusBadRequest, "invalid verification token")
+	case errors.Is(err, ErrVerificationTokenExpired):
+		response.Error(w, http.StatusBadRequest, "verification token has expired")
+	case errors.Is(err, ErrVerificationTokenUsed):
+		response.Error(w, http.StatusBadRequest, "verification token has already been used")
 	case errors.Is(err, ErrOrganizationNotFound):
 		response.Error(w, http.StatusUnprocessableEntity, "organization not found or access denied")
 	default:
@@ -219,7 +302,7 @@ func (h *Handler) writeAuthError(w http.ResponseWriter, r *http.Request, err err
 	}
 }
 
-// writeDecodeError writes a 400 response for body decoding or validation failures.
+// writeDecodeError writes a 400 response for body decode or validation failures.
 func (h *Handler) writeDecodeError(w http.ResponseWriter, err error) {
 	var ve *validator.ValidationError
 	if errors.As(err, &ve) {
@@ -237,8 +320,6 @@ func (h *Handler) writeDecodeError(w http.ResponseWriter, err error) {
 
 // ---- request helpers --------------------------------------------------------
 
-// extractIP parses the client IP from r.RemoteAddr, which chi's RealIP
-// middleware has already populated from X-Forwarded-For / X-Real-IP.
 func extractIP(r *http.Request) *netip.Addr {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
@@ -251,8 +332,6 @@ func extractIP(r *http.Request) *netip.Addr {
 	return &addr
 }
 
-// extractUserAgent returns a pointer to the User-Agent header value,
-// or nil when the header is absent.
 func extractUserAgent(r *http.Request) *string {
 	if ua := r.Header.Get("User-Agent"); ua != "" {
 		return &ua
@@ -260,8 +339,8 @@ func extractUserAgent(r *http.Request) *string {
 	return nil
 }
 
-// errorKind returns a stable, loggable string identifying the error type
-// without exposing the error message, which may contain sensitive context.
+// errorKind returns a stable loggable string identifying the error type
+// without exposing the message contents.
 func errorKind(err error) string {
 	var orgReq *ErrOrganizationRequired
 	switch {
@@ -269,6 +348,10 @@ func errorKind(err error) string {
 		return "organization_required"
 	case errors.Is(err, ErrInvalidCredentials):
 		return "invalid_credentials"
+	case errors.Is(err, ErrEmailAlreadyRegistered):
+		return "email_already_registered"
+	case errors.Is(err, ErrUsernameAlreadyTaken):
+		return "username_already_taken"
 	case errors.Is(err, ErrUserSuspended):
 		return "user_suspended"
 	case errors.Is(err, ErrUserInactive):
@@ -283,6 +366,12 @@ func errorKind(err error) string {
 		return "revoked_token"
 	case errors.Is(err, ErrTokenReuse):
 		return "token_reuse_detected"
+	case errors.Is(err, ErrVerificationTokenInvalid):
+		return "verification_token_invalid"
+	case errors.Is(err, ErrVerificationTokenExpired):
+		return "verification_token_expired"
+	case errors.Is(err, ErrVerificationTokenUsed):
+		return "verification_token_used"
 	case errors.Is(err, ErrOrganizationNotFound):
 		return "organization_not_found"
 	default:

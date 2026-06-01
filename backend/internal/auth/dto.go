@@ -1,5 +1,7 @@
 package auth
 
+// ---- login ------------------------------------------------------------------
+
 // LoginRequest is the payload for POST /api/v1/auth/login.
 //
 // Multi-org behaviour:
@@ -23,6 +25,8 @@ type LoginResponse struct {
 	TokenType    string `json:"token_type"`
 }
 
+// ---- refresh ----------------------------------------------------------------
+
 // RefreshRequest is the payload for POST /api/v1/auth/refresh.
 //
 // The refresh token is org-agnostic. organization_id selects which org context
@@ -43,10 +47,41 @@ type RefreshResponse struct {
 	TokenType    string `json:"token_type"`
 }
 
+// ---- logout -----------------------------------------------------------------
+
 // LogoutRequest is the payload for POST /api/v1/auth/logout.
 type LogoutRequest struct {
 	RefreshToken string `json:"refresh_token" validate:"required"`
 }
+
+// ---- register ---------------------------------------------------------------
+
+// RegisterRequest is the payload for POST /api/v1/auth/register.
+//
+// full_name is split by the service into first_name / last_name for storage.
+// username must be 3–30 characters and contain only letters, digits, and
+// underscores (mirrors the DB CHECK constraint on users.username).
+type RegisterRequest struct {
+	Email    string `json:"email"     validate:"required,email"`
+	Username string `json:"username"  validate:"required,min=3,max=30,alphanum_under"`
+	FullName string `json:"full_name" validate:"required,min=1"`
+	Password string `json:"password"  validate:"required,min=8"`
+}
+
+// RegisterResponse is returned on a successful registration.
+//
+// NOTE: verification_token is included here to allow testing without a live
+// email service. In production this field must be removed from the response
+// and the token delivered only via email.
+type RegisterResponse struct {
+	ID                string `json:"id"`
+	Email             string `json:"email"`
+	Username          string `json:"username"`
+	Message           string `json:"message"`
+	VerificationToken string `json:"verification_token,omitempty"` // dev only — stripped by handler in production (H2)
+}
+
+// ---- me ---------------------------------------------------------------------
 
 // MeResponse is the payload returned by GET /api/v1/auth/me (service layer).
 // The HTTP handler augments this with role and organization_id from the token.

@@ -11,17 +11,26 @@ var (
 	ErrInvalidCredentials = errors.New("invalid email or password")
 
 	// User state errors
-	ErrUserSuspended            = errors.New("user account is suspended")
-	ErrUserInactive             = errors.New("user account is inactive")
-	ErrUserPendingVerification  = errors.New("email address has not been verified")
-	ErrUserNotFound             = errors.New("user not found")
+	ErrUserSuspended           = errors.New("user account is suspended")
+	ErrUserInactive            = errors.New("user account is inactive")
+	ErrUserPendingVerification = errors.New("email address has not been verified")
+	ErrUserNotFound            = errors.New("user not found")
+
+	// Registration errors
+	ErrEmailAlreadyRegistered = errors.New("email address is already registered")
+	ErrUsernameAlreadyTaken   = errors.New("username is already taken")
 
 	// Token errors
-	ErrInvalidToken  = errors.New("invalid token")
-	ErrExpiredToken  = errors.New("token has expired")
-	ErrRevokedToken  = errors.New("token has been revoked")
-	ErrTokenReuse    = errors.New("refresh token already used; all sessions have been revoked")
+	ErrInvalidToken     = errors.New("invalid token")
+	ErrExpiredToken     = errors.New("token has expired")
+	ErrRevokedToken     = errors.New("token has been revoked")
+	ErrTokenReuse       = errors.New("refresh token already used; all sessions have been revoked")
 	ErrInvalidAlgorithm = errors.New("invalid token signing algorithm")
+
+	// Email verification errors
+	ErrVerificationTokenInvalid = errors.New("invalid verification token")
+	ErrVerificationTokenExpired = errors.New("verification token has expired")
+	ErrVerificationTokenUsed    = errors.New("verification token has already been used")
 
 	// Organization errors
 	ErrOrganizationNotFound = errors.New("organization not found or access denied")

@@ -2,13 +2,17 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/netip"
+	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 
 	db "github.com/4yushraman-jpg/playarena/db/sqlc"
 	"github.com/4yushraman-jpg/playarena/internal/platform/config"
+	"github.com/4yushraman-jpg/playarena/internal/platform/pgutil"
 )
 
 // Service implements the auth domain use-cases.
@@ -23,18 +27,24 @@ func NewService(repo *Repository, cfg *config.Config) *Service {
 
 // Login authenticates a user and returns a token pair.
 //
-// Multi-tenancy rules (fixes C1, C2, C3):
+// Multi-tenancy rules:
 //   - Platform admins (users with platform-scoped roles): omit organization_id
 //     to receive a platform-level access token (OrganizationID = "").
 //   - Single-org users: organization_id is optional; selected automatically.
 //   - Multi-org users: organization_id is required; ErrOrganizationRequired
 //     is returned with the org list when it is missing.
 //
-// Status rules (fixes H3):
-//   - Suspended, Inactive, and PendingVerification all block login.
+// Status rules: Suspended, Inactive, and PendingVerification all block login.
+//
+// Timing note: a dummy bcrypt comparison is always performed when the email is
+// not found, so the response time is indistinguishable from a wrong-password
+// failure. This prevents timing-based email enumeration (H3).
 func (s *Service) Login(ctx context.Context, req LoginRequest, ipAddress *netip.Addr, userAgent *string) (*LoginResponse, error) {
 	user, err := s.repo.GetUserByEmail(ctx, req.Email)
 	if err != nil {
+		// H3 fix: equalise timing regardless of whether the email exists.
+		// dummyBcryptHash was pre-computed at bcrypt cost 12 (matches real cost).
+		_ = VerifyPassword(req.Password, dummyBcryptHash)
 		return nil, ErrInvalidCredentials
 	}
 
@@ -52,7 +62,7 @@ func (s *Service) Login(ctx context.Context, req LoginRequest, ipAddress *netip.
 	}
 
 	accessToken, err := GenerateAccessToken(
-		uuidToString(user.ID),
+		pgutil.UUIDToString(user.ID),
 		orgID,
 		role,
 		user.Email,
@@ -71,7 +81,7 @@ func (s *Service) Login(ctx context.Context, req LoginRequest, ipAddress *netip.
 		UserID:    user.ID,
 		TokenHash: HashTokenForStorage(refreshTokenRaw),
 		ExpiresAt: GetRefreshTokenExpiryTime(),
-		IpAddress: parseNetIP(ipAddress),
+		IpAddress: ipAddress,
 		UserAgent: userAgent,
 	})
 	if err != nil {
@@ -89,11 +99,9 @@ func (s *Service) Login(ctx context.Context, req LoginRequest, ipAddress *netip.
 // Refresh validates a refresh token, rotates it, re-validates user status,
 // and issues a new access token + refresh token pair.
 //
-// Token rotation (fixes H1): every successful call revokes the presented
-// token and issues a new one. Replayed (already-revoked) tokens trigger
-// immediate revocation of all user sessions.
-//
-// Status re-validation (fixes H2): suspended/inactive users cannot refresh.
+// Token rotation: every successful call revokes the presented token and issues
+// a new one. Replayed (already-revoked) tokens trigger immediate revocation of
+// all user sessions.
 func (s *Service) Refresh(ctx context.Context, req RefreshRequest, ipAddress *netip.Addr, userAgent *string) (*RefreshResponse, error) {
 	if req.RefreshToken == "" {
 		return nil, ErrInvalidToken
@@ -101,16 +109,18 @@ func (s *Service) Refresh(ctx context.Context, req RefreshRequest, ipAddress *ne
 
 	oldHash := HashTokenForStorage(req.RefreshToken)
 
-	// Resolve user before rotation so we can re-validate status.
-	// We peek at the token first without locking to get the user ID.
 	existingToken, err := s.repo.GetRefreshTokenByHash(ctx, oldHash)
 	if err != nil {
 		return nil, err
 	}
 
-	// Re-validate user status on every refresh (fixes H2).
 	user, err := s.repo.GetUserByID(ctx, existingToken.UserID)
 	if err != nil {
+		// H5 fix: a deleted user with a live refresh token must return 401,
+		// not 500. ErrUserNotFound is an expected condition here.
+		if errors.Is(err, ErrUserNotFound) {
+			return nil, ErrInvalidToken
+		}
 		return nil, err
 	}
 	if err := assertUserActive(user); err != nil {
@@ -122,8 +132,6 @@ func (s *Service) Refresh(ctx context.Context, req RefreshRequest, ipAddress *ne
 		return nil, err
 	}
 
-	// Generate the replacement token before the transaction so we can pass it
-	// atomically to RotateRefreshToken.
 	newRefreshTokenRaw, err := GenerateRefreshToken()
 	if err != nil {
 		return nil, err
@@ -133,18 +141,16 @@ func (s *Service) Refresh(ctx context.Context, req RefreshRequest, ipAddress *ne
 		UserID:    user.ID,
 		TokenHash: HashTokenForStorage(newRefreshTokenRaw),
 		ExpiresAt: GetRefreshTokenExpiryTime(),
-		IpAddress: parseNetIP(ipAddress),
+		IpAddress: ipAddress,
 		UserAgent: userAgent,
 	}
 
-	// Atomically revoke old token and insert new one (fixes H1).
-	_, err = s.repo.RotateRefreshToken(ctx, oldHash, newParams)
-	if err != nil {
+	if _, err = s.repo.RotateRefreshToken(ctx, oldHash, newParams); err != nil {
 		return nil, err
 	}
 
 	accessToken, err := GenerateAccessToken(
-		uuidToString(user.ID),
+		pgutil.UUIDToString(user.ID),
 		orgID,
 		role,
 		user.Email,
@@ -163,8 +169,6 @@ func (s *Service) Refresh(ctx context.Context, req RefreshRequest, ipAddress *ne
 }
 
 // Logout revokes the presented refresh token.
-// The corresponding access token remains valid until it expires naturally;
-// its 15-minute lifetime makes this an acceptable trade-off.
 func (s *Service) Logout(ctx context.Context, refreshToken string) error {
 	if refreshToken == "" {
 		return ErrInvalidToken
@@ -179,7 +183,6 @@ func (s *Service) Logout(ctx context.Context, refreshToken string) error {
 }
 
 // Me returns profile information for the authenticated user.
-// The AuthUser is populated from the validated access token by middleware.
 func (s *Service) Me(ctx context.Context, principal *AuthUser) (*MeResponse, error) {
 	uid := pgtype.UUID{}
 	if err := uid.Scan(principal.UserID); err != nil {
@@ -188,27 +191,100 @@ func (s *Service) Me(ctx context.Context, principal *AuthUser) (*MeResponse, err
 
 	user, err := s.repo.GetUserByID(ctx, uid)
 	if err != nil {
-		// ErrUserNotFound here means the account was deleted after the token
-		// was issued. Return ErrInvalidToken so the handler returns 401.
-		if err == ErrUserNotFound {
+		if errors.Is(err, ErrUserNotFound) {
 			return nil, ErrInvalidToken
 		}
 		return nil, err
 	}
 
 	return &MeResponse{
-		ID:       uuidToString(user.ID),
+		ID:       pgutil.UUIDToString(user.ID),
 		Email:    user.Email,
 		Username: user.Username,
-		FullName: user.FirstName + " " + user.LastName,
+		FullName: buildFullName(user.FirstName, user.LastName),
 		Status:   string(user.Status),
 	}, nil
 }
 
+// Register creates a new user account with status pending_verification.
+// Both the user row and the email verification token are written in a single
+// transaction (H1 fix): if either write fails, the entire operation rolls back
+// so there are no orphaned accounts that can never be verified.
+//
+// NOTE: VerificationToken is returned here to allow testing without a live
+// email service. The handler gates this field behind IsDevelopment() (H2 fix).
+func (s *Service) Register(ctx context.Context, req RegisterRequest) (*RegisterResponse, error) {
+	hash, err := HashPassword(req.Password)
+	if err != nil {
+		return nil, err
+	}
+
+	firstName, lastName := splitFullName(req.FullName)
+
+	// Generate the token BEFORE the transaction so the transaction only does
+	// DB work and we avoid holding the connection open during crypto ops.
+	rawToken, err := GenerateVerificationToken()
+	if err != nil {
+		return nil, err
+	}
+
+	user, _, err := s.repo.RegisterTransaction(ctx, RegisterTxParams{
+		UserParams: db.CreateUserParams{
+			Email:        strings.ToLower(strings.TrimSpace(req.Email)),
+			Username:     strings.TrimSpace(req.Username),
+			PasswordHash: hash,
+			FirstName:    firstName,
+			LastName:     lastName,
+		},
+		TokenHash:   HashTokenForStorage(rawToken),
+		TokenExpiry: GetVerificationTokenExpiryTime(),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &RegisterResponse{
+		ID:                pgutil.UUIDToString(user.ID),
+		Email:             user.Email,
+		Username:          user.Username,
+		Message:           "registration successful, please verify your email address",
+		VerificationToken: rawToken,
+	}, nil
+}
+
+// VerifyEmail consumes a single-use verification token and activates the account.
+func (s *Service) VerifyEmail(ctx context.Context, rawToken string) error {
+	if rawToken == "" {
+		return ErrVerificationTokenInvalid
+	}
+
+	token, err := s.repo.GetEmailVerificationTokenByHash(ctx, HashTokenForStorage(rawToken))
+	if err != nil {
+		return err
+	}
+
+	if token.UsedAt.Valid {
+		return ErrVerificationTokenUsed
+	}
+
+	if token.ExpiresAt.Time.Before(time.Now()) {
+		return ErrVerificationTokenExpired
+	}
+
+	return s.repo.VerifyEmailTransaction(ctx, token.ID, token.UserID)
+}
+
+// DeleteExpiredVerificationTokens removes tokens that have passed their expiry.
+// Intended to be called from a background cleanup job (e.g. hourly cron).
+func (s *Service) DeleteExpiredVerificationTokens(ctx context.Context) error {
+	return s.repo.DeleteExpiredEmailVerificationTokens(ctx, pgtype.Timestamptz{
+		Time:  time.Now(),
+		Valid: true,
+	})
+}
+
 // ---- internal helpers -------------------------------------------------------
 
-// assertUserActive returns a typed error if the account is not in a state that
-// permits login. PendingVerification is treated as blocking (fixes H3).
 func assertUserActive(user *db.User) error {
 	switch user.Status {
 	case db.UserStatusSuspended:
@@ -221,22 +297,11 @@ func assertUserActive(user *db.User) error {
 	return nil
 }
 
-// resolveOrgContext determines the organization context for a token.
-//
-// Strategy:
-//  1. If orgIDHint is provided: validate the user has a role in that org
-//     and return that org's first role slug.
-//  2. If the user has platform-level grants: return platform context ("", role).
-//  3. If the user has exactly one org: select it automatically.
-//  4. If the user has multiple orgs and no hint: return ErrOrganizationRequired.
-//
-// Returns (organizationID string, roleSlug string, error).
 func (s *Service) resolveOrgContext(ctx context.Context, userID pgtype.UUID, orgIDHint string) (string, string, error) {
 	if orgIDHint != "" {
 		return s.resolveExplicitOrg(ctx, userID, orgIDHint)
 	}
 
-	// No hint provided — try platform roles first.
 	platformRoles, err := s.repo.GetUserPlatformRoles(ctx, userID)
 	if err != nil {
 		return "", "", err
@@ -245,7 +310,6 @@ func (s *Service) resolveOrgContext(ctx context.Context, userID pgtype.UUID, org
 		return "", platformRoles[0].Slug, nil
 	}
 
-	// Fall back to org membership.
 	orgs, err := s.repo.GetUserOrganizations(ctx, userID)
 	if err != nil {
 		return "", "", err
@@ -255,12 +319,12 @@ func (s *Service) resolveOrgContext(ctx context.Context, userID pgtype.UUID, org
 	case 0:
 		return "", "", &ErrOrganizationRequired{Organizations: nil}
 	case 1:
-		return s.resolveExplicitOrg(ctx, userID, uuidToString(orgs[0].ID))
+		return s.resolveExplicitOrg(ctx, userID, pgutil.UUIDToString(orgs[0].ID))
 	default:
 		summaries := make([]OrgSummary, len(orgs))
 		for i, o := range orgs {
 			summaries[i] = OrgSummary{
-				ID:   uuidToString(o.ID),
+				ID:   pgutil.UUIDToString(o.ID),
 				Name: o.Name,
 				Slug: o.Slug,
 			}
@@ -269,11 +333,9 @@ func (s *Service) resolveOrgContext(ctx context.Context, userID pgtype.UUID, org
 	}
 }
 
-// resolveExplicitOrg validates that the user holds at least one active role in
-// the specified organization and returns the first role slug.
 func (s *Service) resolveExplicitOrg(ctx context.Context, userID pgtype.UUID, orgIDStr string) (string, string, error) {
-	orgUUID := pgtype.UUID{}
-	if err := orgUUID.Scan(orgIDStr); err != nil {
+	orgUUID, err := pgutil.ParseUUID(orgIDStr)
+	if err != nil {
 		return "", "", ErrOrganizationNotFound
 	}
 
@@ -291,16 +353,21 @@ func (s *Service) resolveExplicitOrg(ctx context.Context, userID pgtype.UUID, or
 	return orgIDStr, roles[0].Slug, nil
 }
 
-// uuidToString converts a pgtype.UUID to its canonical hyphenated string form.
-func uuidToString(uid pgtype.UUID) string {
-	if !uid.Valid {
-		return ""
+func splitFullName(fullName string) (firstName, lastName string) {
+	trimmed := strings.TrimSpace(fullName)
+	if trimmed == "" {
+		return "", ""
 	}
-	return fmt.Sprintf("%x-%x-%x-%x-%x",
-		uid.Bytes[0:4],
-		uid.Bytes[4:6],
-		uid.Bytes[6:8],
-		uid.Bytes[8:10],
-		uid.Bytes[10:16],
-	)
+	idx := strings.IndexByte(trimmed, ' ')
+	if idx == -1 {
+		return trimmed, trimmed
+	}
+	return trimmed[:idx], strings.TrimSpace(trimmed[idx+1:])
+}
+
+func buildFullName(firstName, lastName string) string {
+	if firstName == lastName {
+		return firstName
+	}
+	return strings.TrimSpace(fmt.Sprintf("%s %s", firstName, lastName))
 }

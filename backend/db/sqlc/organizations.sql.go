@@ -11,6 +11,70 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const createOrganization = `-- name: CreateOrganization :one
+INSERT INTO organizations (name, slug, description, type, website, email, phone, country, city)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+RETURNING id, name, slug, description, type, status, logo_url, website, email, phone, country, city, settings, created_at, updated_at
+`
+
+type CreateOrganizationParams struct {
+	Name        string  `json:"name"`
+	Slug        string  `json:"slug"`
+	Description *string `json:"description"`
+	Type        OrgType `json:"type"`
+	Website     *string `json:"website"`
+	Email       *string `json:"email"`
+	Phone       *string `json:"phone"`
+	Country     *string `json:"country"`
+	City        *string `json:"city"`
+}
+
+func (q *Queries) CreateOrganization(ctx context.Context, arg CreateOrganizationParams) (Organization, error) {
+	row := q.db.QueryRow(ctx, createOrganization,
+		arg.Name,
+		arg.Slug,
+		arg.Description,
+		arg.Type,
+		arg.Website,
+		arg.Email,
+		arg.Phone,
+		arg.Country,
+		arg.City,
+	)
+	var i Organization
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Slug,
+		&i.Description,
+		&i.Type,
+		&i.Status,
+		&i.LogoUrl,
+		&i.Website,
+		&i.Email,
+		&i.Phone,
+		&i.Country,
+		&i.City,
+		&i.Settings,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const deleteOrganization = `-- name: DeleteOrganization :exec
+DELETE FROM organizations
+WHERE  id = $1
+`
+
+// Hard delete. Cascades to all child records (teams, players, tournaments, etc.)
+// via the FK ON DELETE CASCADE chain. Caller must verify authorization before
+// invoking.
+func (q *Queries) DeleteOrganization(ctx context.Context, id pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, deleteOrganization, id)
+	return err
+}
+
 const getOrganizationByID = `-- name: GetOrganizationByID :one
 
 SELECT id, name, slug, description, type, status, logo_url, website, email, phone, country, city, settings, created_at, updated_at
@@ -20,7 +84,6 @@ LIMIT  1
 `
 
 // Organizations queries
-// All writes go through the service layer; only reads are generated here.
 func (q *Queries) GetOrganizationByID(ctx context.Context, id pgtype.UUID) (Organization, error) {
 	row := q.db.QueryRow(ctx, getOrganizationByID, id)
 	var i Organization
@@ -114,4 +177,119 @@ func (q *Queries) ListOrganizations(ctx context.Context) ([]Organization, error)
 		return nil, err
 	}
 	return items, nil
+}
+
+const listOrganizationsPaginated = `-- name: ListOrganizationsPaginated :many
+SELECT id, name, slug, description, type, status, logo_url, website, email, phone, country, city, settings, created_at, updated_at
+FROM   organizations
+ORDER  BY created_at DESC
+LIMIT  $2
+OFFSET $1
+`
+
+type ListOrganizationsPaginatedParams struct {
+	PageOffset int32 `json:"page_offset"`
+	PageLimit  int32 `json:"page_limit"`
+}
+
+// Paginated listing. limit is capped by the application layer (default 50, max 200).
+// offset is zero-based. Use created_at DESC for stable ordering across pages.
+func (q *Queries) ListOrganizationsPaginated(ctx context.Context, arg ListOrganizationsPaginatedParams) ([]Organization, error) {
+	rows, err := q.db.Query(ctx, listOrganizationsPaginated, arg.PageOffset, arg.PageLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Organization{}
+	for rows.Next() {
+		var i Organization
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.Slug,
+			&i.Description,
+			&i.Type,
+			&i.Status,
+			&i.LogoUrl,
+			&i.Website,
+			&i.Email,
+			&i.Phone,
+			&i.Country,
+			&i.City,
+			&i.Settings,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const updateOrganization = `-- name: UpdateOrganization :one
+UPDATE organizations
+SET    name        = $2,
+       description = $3,
+       type        = $4,
+       website     = $5,
+       email       = $6,
+       phone       = $7,
+       country     = $8,
+       city        = $9,
+       updated_at  = NOW()
+WHERE  id = $1
+RETURNING id, name, slug, description, type, status, logo_url, website, email, phone, country, city, settings, created_at, updated_at
+`
+
+type UpdateOrganizationParams struct {
+	ID          pgtype.UUID `json:"id"`
+	Name        string      `json:"name"`
+	Description *string     `json:"description"`
+	Type        OrgType     `json:"type"`
+	Website     *string     `json:"website"`
+	Email       *string     `json:"email"`
+	Phone       *string     `json:"phone"`
+	Country     *string     `json:"country"`
+	City        *string     `json:"city"`
+}
+
+// All updatable fields are passed explicitly; the service layer applies the
+// caller's partial-update fields over the current org state before calling
+// this query.
+// slug and id are not updatable. status is managed via dedicated transitions.
+func (q *Queries) UpdateOrganization(ctx context.Context, arg UpdateOrganizationParams) (Organization, error) {
+	row := q.db.QueryRow(ctx, updateOrganization,
+		arg.ID,
+		arg.Name,
+		arg.Description,
+		arg.Type,
+		arg.Website,
+		arg.Email,
+		arg.Phone,
+		arg.Country,
+		arg.City,
+	)
+	var i Organization
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Slug,
+		&i.Description,
+		&i.Type,
+		&i.Status,
+		&i.LogoUrl,
+		&i.Website,
+		&i.Email,
+		&i.Phone,
+		&i.Country,
+		&i.City,
+		&i.Settings,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
 }
