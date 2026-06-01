@@ -1,3 +1,653 @@
 package tournaments
 
-// TODO: Implement tournament use cases and orchestration.
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgtype"
+
+	db "github.com/4yushraman-jpg/playarena/db/sqlc"
+	"github.com/4yushraman-jpg/playarena/internal/platform/pgutil"
+)
+
+var (
+	reCurrency    = regexp.MustCompile(`^[A-Z]{3}$`)
+	reNonSlugChar = regexp.MustCompile(`[^a-z0-9]+`)
+
+	// allowedTransitions defines the permitted lifecycle moves.
+	// Any status may transition to cancelled.
+	// completed → cancelled is allowed for admin corrections.
+	// cancelled is a terminal state: no transitions out.
+	allowedTransitions = map[db.TournamentStatus][]db.TournamentStatus{
+		db.TournamentStatusDraft: {
+			db.TournamentStatusRegistrationOpen,
+			db.TournamentStatusCancelled,
+		},
+		db.TournamentStatusRegistrationOpen: {
+			db.TournamentStatusRegistrationClosed,
+			db.TournamentStatusCancelled,
+		},
+		db.TournamentStatusRegistrationClosed: {
+			db.TournamentStatusOngoing,
+			db.TournamentStatusCancelled,
+		},
+		db.TournamentStatusOngoing: {
+			db.TournamentStatusCompleted,
+			db.TournamentStatusCancelled,
+		},
+		db.TournamentStatusCompleted: {
+			db.TournamentStatusCancelled,
+		},
+		db.TournamentStatusCancelled: {}, // terminal
+	}
+)
+
+// Service implements tournament use-cases.
+type Service struct {
+	repo *Repository
+	log  *slog.Logger
+}
+
+// NewService constructs a Service.
+func NewService(repo *Repository, log *slog.Logger) *Service {
+	return &Service{repo: repo, log: log}
+}
+
+// ── tournament CRUD ───────────────────────────────────────────────────────────
+
+// Create registers a new tournament in draft status.
+// BOLA guard: actorOrgID must match the target org or be empty (platform admin).
+func (s *Service) Create(ctx context.Context, orgSlug string, req CreateRequest, actorID, actorOrgID string) (*Response, error) {
+	org, err := s.repo.GetOrgBySlug(ctx, orgSlug)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := assertOrgOwnership(actorOrgID, pgutil.UUIDToString(org.ID)); err != nil {
+		return nil, err
+	}
+
+	actorUID, err := pgutil.ParseUUID(actorID)
+	if err != nil {
+		return nil, errors.New("invalid actor user id")
+	}
+
+	format, err := parseTournamentFormat(req.Format)
+	if err != nil {
+		return nil, err
+	}
+
+	participantType, err := parseParticipantType(req.ParticipantType)
+	if err != nil {
+		return nil, err
+	}
+
+	currency, err := normalizeCurrency(req.Currency)
+	if err != nil {
+		return nil, err
+	}
+
+	country, err := normalizeCountry(req.Country)
+	if err != nil {
+		return nil, err
+	}
+
+	prizePool, err := parsePrizePool(req.PrizePool)
+	if err != nil {
+		return nil, err
+	}
+
+	regOpensAt, err := parseTimestamp(req.RegistrationOpensAt)
+	if err != nil {
+		return nil, err
+	}
+	regClosesAt, err := parseTimestamp(req.RegistrationClosesAt)
+	if err != nil {
+		return nil, err
+	}
+	startsAt, err := parseTimestamp(req.StartsAt)
+	if err != nil {
+		return nil, err
+	}
+	endsAt, err := parseTimestamp(req.EndsAt)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := validateDateRange(regOpensAt, regClosesAt, startsAt, endsAt); err != nil {
+		return nil, err
+	}
+
+	baseSlug := generateTournamentSlug(req.Name)
+	params := db.CreateTournamentParams{
+		OrganizationID:       org.ID,
+		Name:                 strings.TrimSpace(req.Name),
+		Description:          req.Description,
+		Sport:                strings.ToLower(strings.TrimSpace(req.Sport)),
+		Format:               format,
+		ParticipantType:      participantType,
+		BannerUrl:            req.BannerURL,
+		PrizePool:            prizePool,
+		Currency:             currency,
+		MaxParticipants:      req.MaxParticipants,
+		MinParticipants:      req.MinParticipants,
+		RegistrationOpensAt:  regOpensAt,
+		RegistrationClosesAt: regClosesAt,
+		StartsAt:             startsAt,
+		EndsAt:               endsAt,
+		Venue:                req.Venue,
+		City:                 req.City,
+		Country:              country,
+		Rules:                req.Rules,
+		CreatedBy:            actorUID,
+	}
+
+	var t *db.Tournament
+	for attempt := 1; attempt <= 10; attempt++ {
+		if attempt == 1 {
+			params.Slug = baseSlug
+		} else {
+			params.Slug = fmt.Sprintf("%s-%d", baseSlug, attempt)
+		}
+		t, err = s.repo.CreateWithAudit(ctx, createTournamentTxParams{
+			createParams: params,
+			actorID:      actorUID,
+		})
+		if errors.Is(err, ErrSlugAlreadyTaken) {
+			continue
+		}
+		break
+	}
+	if err != nil {
+		if errors.Is(err, ErrSlugAlreadyTaken) {
+			return nil, ErrSlugGenerationFailed
+		}
+		return nil, err
+	}
+	return tournamentToResponse(t), nil
+}
+
+// List returns a paginated page of non-cancelled tournaments for an organization.
+// No ownership check: any authenticated user may list any org's tournaments.
+func (s *Service) List(ctx context.Context, orgSlug string, params ListParams) (*ListResponse, error) {
+	org, err := s.repo.GetOrgBySlug(ctx, orgSlug)
+	if err != nil {
+		return nil, err
+	}
+
+	if params.Limit <= 0 || params.Limit > MaxListLimit {
+		params.Limit = DefaultListLimit
+	}
+	if params.Offset < 0 {
+		params.Offset = 0
+	}
+
+	ts, err := s.repo.List(ctx, org.ID, params)
+	if err != nil {
+		return nil, err
+	}
+
+	total, err := s.repo.Count(ctx, org.ID, params)
+	if err != nil {
+		return nil, err
+	}
+
+	resp := make([]Response, len(ts))
+	for i := range ts {
+		resp[i] = *tournamentToResponse(&ts[i])
+	}
+	return &ListResponse{
+		Tournaments: resp,
+		Total:       total,
+		Limit:       int(params.Limit),
+		Offset:      int(params.Offset),
+	}, nil
+}
+
+// GetByID retrieves a single tournament by UUID within an organization.
+// No ownership check: any authenticated user may read tournament details.
+//
+// Cancelled tournaments (soft-deleted via DELETE) are intentionally returned.
+// Status "cancelled" in the response signals that the tournament no longer
+// runs. Records are retained so that future registration and match references
+// remain resolvable.
+func (s *Service) GetByID(ctx context.Context, orgSlug, tournamentID string) (*Response, error) {
+	org, err := s.repo.GetOrgBySlug(ctx, orgSlug)
+	if err != nil {
+		return nil, err
+	}
+
+	tid, err := pgutil.ParseUUID(tournamentID)
+	if err != nil {
+		return nil, ErrTournamentNotFound
+	}
+
+	t, err := s.repo.GetByID(ctx, tid, org.ID)
+	if err != nil {
+		return nil, err
+	}
+	return tournamentToResponse(t), nil
+}
+
+// Update applies a partial update to a tournament.
+// Status changes are validated against the allowed transition table.
+// BOLA guard: actorOrgID must match the target org or be empty (platform admin).
+func (s *Service) Update(ctx context.Context, orgSlug, tournamentID string, req UpdateRequest, actorID, actorOrgID string) (*Response, error) {
+	org, err := s.repo.GetOrgBySlug(ctx, orgSlug)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := assertOrgOwnership(actorOrgID, pgutil.UUIDToString(org.ID)); err != nil {
+		return nil, err
+	}
+
+	tid, err := pgutil.ParseUUID(tournamentID)
+	if err != nil {
+		return nil, ErrTournamentNotFound
+	}
+
+	current, err := s.repo.GetByID(ctx, tid, org.ID)
+	if err != nil {
+		return nil, err
+	}
+
+	actorUID, err := pgutil.ParseUUID(actorID)
+	if err != nil {
+		return nil, errors.New("invalid actor user id")
+	}
+
+	oldData, err := json.Marshal(tournamentToResponse(current))
+	if err != nil {
+		return nil, err
+	}
+
+	// Start with current state; apply non-nil request fields over it.
+	params := db.UpdateTournamentParams{
+		ID:                   current.ID,
+		OrganizationID:       current.OrganizationID,
+		Name:                 current.Name,
+		Description:          current.Description,
+		Sport:                current.Sport,
+		Format:               current.Format,
+		ParticipantType:      current.ParticipantType,
+		BannerUrl:            current.BannerUrl,
+		PrizePool:            current.PrizePool,
+		Currency:             current.Currency,
+		MaxParticipants:      current.MaxParticipants,
+		MinParticipants:      current.MinParticipants,
+		RegistrationOpensAt:  current.RegistrationOpensAt,
+		RegistrationClosesAt: current.RegistrationClosesAt,
+		StartsAt:             current.StartsAt,
+		EndsAt:               current.EndsAt,
+		Venue:                current.Venue,
+		City:                 current.City,
+		Country:              current.Country,
+		Rules:                current.Rules,
+		Status:               current.Status,
+	}
+
+	if req.Name != nil {
+		params.Name = strings.TrimSpace(*req.Name)
+	}
+	if req.Description != nil {
+		params.Description = req.Description
+	}
+	if req.Sport != nil {
+		params.Sport = strings.ToLower(strings.TrimSpace(*req.Sport))
+	}
+	if req.Format != nil {
+		f, err := parseTournamentFormat(*req.Format)
+		if err != nil {
+			return nil, err
+		}
+		params.Format = f
+	}
+	if req.ParticipantType != nil {
+		pt, err := parseParticipantType(req.ParticipantType)
+		if err != nil {
+			return nil, err
+		}
+		params.ParticipantType = pt
+	}
+	if req.BannerURL != nil {
+		params.BannerUrl = req.BannerURL
+	}
+	if req.PrizePool != nil {
+		pp, err := parsePrizePool(req.PrizePool)
+		if err != nil {
+			return nil, err
+		}
+		params.PrizePool = pp
+	}
+	if req.Currency != nil {
+		c, err := normalizeCurrency(req.Currency)
+		if err != nil {
+			return nil, err
+		}
+		params.Currency = c
+	}
+	if req.MaxParticipants != nil {
+		params.MaxParticipants = req.MaxParticipants
+	}
+	if req.MinParticipants != nil {
+		params.MinParticipants = req.MinParticipants
+	}
+	if req.RegistrationOpensAt != nil {
+		ts, err := parseTimestamp(req.RegistrationOpensAt)
+		if err != nil {
+			return nil, err
+		}
+		params.RegistrationOpensAt = ts
+	}
+	if req.RegistrationClosesAt != nil {
+		ts, err := parseTimestamp(req.RegistrationClosesAt)
+		if err != nil {
+			return nil, err
+		}
+		params.RegistrationClosesAt = ts
+	}
+	if req.StartsAt != nil {
+		ts, err := parseTimestamp(req.StartsAt)
+		if err != nil {
+			return nil, err
+		}
+		params.StartsAt = ts
+	}
+	if req.EndsAt != nil {
+		ts, err := parseTimestamp(req.EndsAt)
+		if err != nil {
+			return nil, err
+		}
+		params.EndsAt = ts
+	}
+	if req.Venue != nil {
+		params.Venue = req.Venue
+	}
+	if req.City != nil {
+		params.City = req.City
+	}
+	if req.Country != nil {
+		c, err := normalizeCountry(req.Country)
+		if err != nil {
+			return nil, err
+		}
+		params.Country = c
+	}
+	if req.Rules != nil {
+		params.Rules = req.Rules
+	}
+	if req.Status != nil {
+		newStatus, err := parseTournamentStatus(*req.Status)
+		if err != nil {
+			return nil, err
+		}
+		if err := validateStatusTransition(current.Status, newStatus); err != nil {
+			return nil, err
+		}
+		params.Status = newStatus
+	}
+
+	if err := validateDateRange(
+		params.RegistrationOpensAt, params.RegistrationClosesAt,
+		params.StartsAt, params.EndsAt,
+	); err != nil {
+		return nil, err
+	}
+
+	updated, err := s.repo.UpdateWithAudit(ctx, updateTournamentTxParams{
+		updateParams: params,
+		actorID:      actorUID,
+		oldData:      oldData,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return tournamentToResponse(updated), nil
+}
+
+// Delete soft-cancels the tournament (status → cancelled).
+// Records are retained permanently for future registration and match references.
+// BOLA guard: actorOrgID must match the target org or be empty (platform admin).
+func (s *Service) Delete(ctx context.Context, orgSlug, tournamentID string, actorID, actorOrgID string) error {
+	org, err := s.repo.GetOrgBySlug(ctx, orgSlug)
+	if err != nil {
+		return err
+	}
+
+	if err := assertOrgOwnership(actorOrgID, pgutil.UUIDToString(org.ID)); err != nil {
+		return err
+	}
+
+	tid, err := pgutil.ParseUUID(tournamentID)
+	if err != nil {
+		return ErrTournamentNotFound
+	}
+
+	current, err := s.repo.GetByID(ctx, tid, org.ID)
+	if err != nil {
+		return err
+	}
+
+	actorUID, err := pgutil.ParseUUID(actorID)
+	if err != nil {
+		return errors.New("invalid actor user id")
+	}
+
+	oldData, err := json.Marshal(tournamentToResponse(current))
+	if err != nil {
+		return err
+	}
+
+	return s.repo.CancelWithAudit(ctx, cancelTournamentTxParams{
+		id:      current.ID,
+		orgID:   current.OrganizationID,
+		actorID: actorUID,
+		oldData: oldData,
+	})
+}
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+func assertOrgOwnership(actorOrgID, targetOrgID string) error {
+	if actorOrgID == "" {
+		return nil
+	}
+	if actorOrgID != targetOrgID {
+		return ErrForbidden
+	}
+	return nil
+}
+
+func generateTournamentSlug(name string) string {
+	s := strings.ToLower(strings.TrimSpace(name))
+	s = reNonSlugChar.ReplaceAllString(s, "-")
+	s = strings.Trim(s, "-")
+	if len(s) > 90 {
+		s = s[:90]
+		s = strings.TrimRight(s, "-")
+	}
+	if len(s) < 3 {
+		s = "tournament-" + s
+	}
+	if len(s) < 3 {
+		s = "tournament-x"
+	}
+	return s
+}
+
+func parseTournamentFormat(s string) (db.TournamentFormat, error) {
+	f := db.TournamentFormat(strings.ToLower(strings.TrimSpace(s)))
+	switch f {
+	case db.TournamentFormatLeague, db.TournamentFormatKnockout,
+		db.TournamentFormatGroupKnockout, db.TournamentFormatRoundRobin,
+		db.TournamentFormatDoubleElimination:
+		return f, nil
+	}
+	return "", ErrInvalidFormat
+}
+
+func parseParticipantType(s *string) (db.ParticipantType, error) {
+	if s == nil || *s == "" {
+		return db.ParticipantTypeTeam, nil
+	}
+	pt := db.ParticipantType(strings.ToLower(strings.TrimSpace(*s)))
+	switch pt {
+	case db.ParticipantTypeTeam, db.ParticipantTypeIndividual:
+		return pt, nil
+	}
+	return "", ErrInvalidParticipantType
+}
+
+func parseTournamentStatus(s string) (db.TournamentStatus, error) {
+	st := db.TournamentStatus(strings.ToLower(strings.TrimSpace(s)))
+	switch st {
+	case db.TournamentStatusDraft, db.TournamentStatusRegistrationOpen,
+		db.TournamentStatusRegistrationClosed, db.TournamentStatusOngoing,
+		db.TournamentStatusCompleted, db.TournamentStatusCancelled:
+		return st, nil
+	}
+	return "", ErrInvalidStatus
+}
+
+func validateStatusTransition(from, to db.TournamentStatus) error {
+	targets, ok := allowedTransitions[from]
+	if !ok {
+		return ErrInvalidStatusTransition
+	}
+	for _, t := range targets {
+		if t == to {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: %s → %s", ErrInvalidStatusTransition, from, to)
+}
+
+func normalizeCurrency(s *string) (string, error) {
+	if s == nil || *s == "" {
+		return DefaultCurrency, nil
+	}
+	c := strings.ToUpper(strings.TrimSpace(*s))
+	if !reCurrency.MatchString(c) {
+		return "", ErrInvalidCurrency
+	}
+	return c, nil
+}
+
+func normalizeCountry(s *string) (*string, error) {
+	if s == nil || *s == "" {
+		return nil, nil
+	}
+	code := strings.ToUpper(strings.TrimSpace(*s))
+	if len(code) != 2 {
+		return nil, ErrInvalidCountry
+	}
+	return &code, nil
+}
+
+func parsePrizePool(s *string) (pgtype.Numeric, error) {
+	if s == nil || *s == "" {
+		return pgtype.Numeric{}, nil
+	}
+	var n pgtype.Numeric
+	if err := n.Scan(*s); err != nil {
+		return pgtype.Numeric{}, ErrInvalidPrizePool
+	}
+	return n, nil
+}
+
+func numericToString(n pgtype.Numeric) *string {
+	if !n.Valid {
+		return nil
+	}
+	v, err := n.Value()
+	if err != nil || v == nil {
+		return nil
+	}
+	s := fmt.Sprintf("%v", v)
+	return &s
+}
+
+func parseTimestamp(s *string) (pgtype.Timestamptz, error) {
+	if s == nil || *s == "" {
+		return pgtype.Timestamptz{}, nil
+	}
+	t, err := time.Parse(time.RFC3339, *s)
+	if err != nil {
+		return pgtype.Timestamptz{}, ErrInvalidTimestamp
+	}
+	return pgtype.Timestamptz{Time: t.UTC(), Valid: true}, nil
+}
+
+func timestampToString(ts pgtype.Timestamptz) *string {
+	if !ts.Valid {
+		return nil
+	}
+	s := ts.Time.UTC().Format(time.RFC3339)
+	return &s
+}
+
+// validateDateRange enforces:
+//
+//	registration_opens_at  < registration_closes_at  (if both set)
+//	registration_closes_at <= starts_at              (if both set)
+//	starts_at              <= ends_at                (if both set)
+func validateDateRange(regOpens, regCloses, startsAt, endsAt pgtype.Timestamptz) error {
+	if regOpens.Valid && regCloses.Valid {
+		if !regOpens.Time.Before(regCloses.Time) {
+			return ErrInvalidDateRange
+		}
+	}
+	if regCloses.Valid && startsAt.Valid {
+		if regCloses.Time.After(startsAt.Time) {
+			return ErrInvalidDateRange
+		}
+	}
+	if startsAt.Valid && endsAt.Valid {
+		if startsAt.Time.After(endsAt.Time) {
+			return ErrInvalidDateRange
+		}
+	}
+	return nil
+}
+
+func tournamentToResponse(t *db.Tournament) *Response {
+	var createdBy *string
+	if t.CreatedBy.Valid {
+		uid := pgutil.UUIDToString(t.CreatedBy)
+		createdBy = &uid
+	}
+	return &Response{
+		ID:                   pgutil.UUIDToString(t.ID),
+		OrganizationID:       pgutil.UUIDToString(t.OrganizationID),
+		Name:                 t.Name,
+		Slug:                 t.Slug,
+		Description:          t.Description,
+		Sport:                t.Sport,
+		Format:               string(t.Format),
+		ParticipantType:      string(t.ParticipantType),
+		Status:               string(t.Status),
+		BannerURL:            t.BannerUrl,
+		PrizePool:            numericToString(t.PrizePool),
+		Currency:             t.Currency,
+		MaxParticipants:      t.MaxParticipants,
+		MinParticipants:      t.MinParticipants,
+		RegistrationOpensAt:  timestampToString(t.RegistrationOpensAt),
+		RegistrationClosesAt: timestampToString(t.RegistrationClosesAt),
+		StartsAt:             timestampToString(t.StartsAt),
+		EndsAt:               timestampToString(t.EndsAt),
+		Venue:                t.Venue,
+		City:                 t.City,
+		Country:              t.Country,
+		Rules:                t.Rules,
+		CreatedBy:            createdBy,
+		CreatedAt:            t.CreatedAt.Time.UTC().Format("2006-01-02T15:04:05Z"),
+		UpdatedAt:            t.UpdatedAt.Time.UTC().Format("2006-01-02T15:04:05Z"),
+	}
+}

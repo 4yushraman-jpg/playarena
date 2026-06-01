@@ -13,6 +13,7 @@ import (
 	"github.com/4yushraman-jpg/playarena/internal/platform/config"
 	"github.com/4yushraman-jpg/playarena/internal/players"
 	"github.com/4yushraman-jpg/playarena/internal/teams"
+	"github.com/4yushraman-jpg/playarena/internal/tournaments"
 )
 
 // registerModules wires all domain modules into the router.
@@ -28,4 +29,5 @@ func registerModules(r chi.Router, pool *pgxpool.Pool, log *slog.Logger, cfg *co
 	organizations.RegisterRoutes(r, pool, cfg, log, authz)
 	players.RegisterRoutes(r, pool, cfg, log, authz)
 	teams.RegisterRoutes(r, pool, cfg, log, authz)
+	tournaments.RegisterRoutes(r, pool, cfg, log, authz)
 }

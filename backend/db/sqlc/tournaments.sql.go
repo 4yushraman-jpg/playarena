@@ -11,6 +11,171 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const cancelTournament = `-- name: CancelTournament :one
+UPDATE tournaments
+SET    status     = 'cancelled',
+       updated_at = NOW()
+WHERE  id              = $1
+  AND  organization_id = $2
+RETURNING id, organization_id, name, slug, description, sport, format, participant_type, status, banner_url, prize_pool, currency, max_participants, min_participants, registration_opens_at, registration_closes_at, starts_at, ends_at, venue, city, country, rules, settings, created_by, created_at, updated_at
+`
+
+type CancelTournamentParams struct {
+	ID             pgtype.UUID `json:"id"`
+	OrganizationID pgtype.UUID `json:"organization_id"`
+}
+
+// Soft-delete: sets status to 'cancelled'. Records are retained permanently
+// because future registrations and match history will reference them.
+func (q *Queries) CancelTournament(ctx context.Context, arg CancelTournamentParams) (Tournament, error) {
+	row := q.db.QueryRow(ctx, cancelTournament, arg.ID, arg.OrganizationID)
+	var i Tournament
+	err := row.Scan(
+		&i.ID,
+		&i.OrganizationID,
+		&i.Name,
+		&i.Slug,
+		&i.Description,
+		&i.Sport,
+		&i.Format,
+		&i.ParticipantType,
+		&i.Status,
+		&i.BannerUrl,
+		&i.PrizePool,
+		&i.Currency,
+		&i.MaxParticipants,
+		&i.MinParticipants,
+		&i.RegistrationOpensAt,
+		&i.RegistrationClosesAt,
+		&i.StartsAt,
+		&i.EndsAt,
+		&i.Venue,
+		&i.City,
+		&i.Country,
+		&i.Rules,
+		&i.Settings,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const countTournamentsByOrganization = `-- name: CountTournamentsByOrganization :one
+SELECT COUNT(*)
+FROM   tournaments
+WHERE  organization_id = $1
+  AND  status != 'cancelled'
+  AND  ($2::text IS NULL OR status::text = $2)
+  AND  ($3::text  IS NULL OR name ILIKE '%' || $3 || '%')
+`
+
+type CountTournamentsByOrganizationParams struct {
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	StatusFilter   *string     `json:"status_filter"`
+	SearchQuery    *string     `json:"search_query"`
+}
+
+// Returns the total row count matching the same filters as ListTournamentsPaginated.
+func (q *Queries) CountTournamentsByOrganization(ctx context.Context, arg CountTournamentsByOrganizationParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countTournamentsByOrganization, arg.OrganizationID, arg.StatusFilter, arg.SearchQuery)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const createTournament = `-- name: CreateTournament :one
+INSERT INTO tournaments (
+    organization_id, name, slug, description, sport, format, participant_type,
+    banner_url, prize_pool, currency, max_participants, min_participants,
+    registration_opens_at, registration_closes_at, starts_at, ends_at,
+    venue, city, country, rules, created_by
+)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+RETURNING id, organization_id, name, slug, description, sport, format, participant_type, status, banner_url, prize_pool, currency, max_participants, min_participants, registration_opens_at, registration_closes_at, starts_at, ends_at, venue, city, country, rules, settings, created_by, created_at, updated_at
+`
+
+type CreateTournamentParams struct {
+	OrganizationID       pgtype.UUID        `json:"organization_id"`
+	Name                 string             `json:"name"`
+	Slug                 string             `json:"slug"`
+	Description          *string            `json:"description"`
+	Sport                string             `json:"sport"`
+	Format               TournamentFormat   `json:"format"`
+	ParticipantType      ParticipantType    `json:"participant_type"`
+	BannerUrl            *string            `json:"banner_url"`
+	PrizePool            pgtype.Numeric     `json:"prize_pool"`
+	Currency             string             `json:"currency"`
+	MaxParticipants      *int16             `json:"max_participants"`
+	MinParticipants      *int16             `json:"min_participants"`
+	RegistrationOpensAt  pgtype.Timestamptz `json:"registration_opens_at"`
+	RegistrationClosesAt pgtype.Timestamptz `json:"registration_closes_at"`
+	StartsAt             pgtype.Timestamptz `json:"starts_at"`
+	EndsAt               pgtype.Timestamptz `json:"ends_at"`
+	Venue                *string            `json:"venue"`
+	City                 *string            `json:"city"`
+	Country              *string            `json:"country"`
+	Rules                *string            `json:"rules"`
+	CreatedBy            pgtype.UUID        `json:"created_by"`
+}
+
+// Inserts a new tournament in draft status. settings defaults to '{}'.
+func (q *Queries) CreateTournament(ctx context.Context, arg CreateTournamentParams) (Tournament, error) {
+	row := q.db.QueryRow(ctx, createTournament,
+		arg.OrganizationID,
+		arg.Name,
+		arg.Slug,
+		arg.Description,
+		arg.Sport,
+		arg.Format,
+		arg.ParticipantType,
+		arg.BannerUrl,
+		arg.PrizePool,
+		arg.Currency,
+		arg.MaxParticipants,
+		arg.MinParticipants,
+		arg.RegistrationOpensAt,
+		arg.RegistrationClosesAt,
+		arg.StartsAt,
+		arg.EndsAt,
+		arg.Venue,
+		arg.City,
+		arg.Country,
+		arg.Rules,
+		arg.CreatedBy,
+	)
+	var i Tournament
+	err := row.Scan(
+		&i.ID,
+		&i.OrganizationID,
+		&i.Name,
+		&i.Slug,
+		&i.Description,
+		&i.Sport,
+		&i.Format,
+		&i.ParticipantType,
+		&i.Status,
+		&i.BannerUrl,
+		&i.PrizePool,
+		&i.Currency,
+		&i.MaxParticipants,
+		&i.MinParticipants,
+		&i.RegistrationOpensAt,
+		&i.RegistrationClosesAt,
+		&i.StartsAt,
+		&i.EndsAt,
+		&i.Venue,
+		&i.City,
+		&i.Country,
+		&i.Rules,
+		&i.Settings,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const getTournamentByID = `-- name: GetTournamentByID :one
 
 SELECT id, organization_id, name, slug, description, sport, format, participant_type, status, banner_url, prize_pool, currency, max_participants, min_participants, registration_opens_at, registration_closes_at, starts_at, ends_at, venue, city, country, rules, settings, created_by, created_at, updated_at
@@ -160,4 +325,188 @@ func (q *Queries) ListTournamentsByOrganization(ctx context.Context, organizatio
 		return nil, err
 	}
 	return items, nil
+}
+
+const listTournamentsPaginated = `-- name: ListTournamentsPaginated :many
+SELECT id, organization_id, name, slug, description, sport, format, participant_type, status, banner_url, prize_pool, currency, max_participants, min_participants, registration_opens_at, registration_closes_at, starts_at, ends_at, venue, city, country, rules, settings, created_by, created_at, updated_at
+FROM   tournaments
+WHERE  organization_id = $1
+  AND  status != 'cancelled'
+  AND  ($2::text IS NULL OR status::text = $2)
+  AND  ($3::text  IS NULL OR name ILIKE '%' || $3 || '%')
+ORDER  BY created_at DESC
+LIMIT  $5
+OFFSET $4
+`
+
+type ListTournamentsPaginatedParams struct {
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	StatusFilter   *string     `json:"status_filter"`
+	SearchQuery    *string     `json:"search_query"`
+	PageOffset     int32       `json:"page_offset"`
+	PageLimit      int32       `json:"page_limit"`
+}
+
+// Returns non-cancelled tournaments for an org with optional status and name
+// search filters. Cancelled tournaments remain accessible via GetTournamentByID.
+func (q *Queries) ListTournamentsPaginated(ctx context.Context, arg ListTournamentsPaginatedParams) ([]Tournament, error) {
+	rows, err := q.db.Query(ctx, listTournamentsPaginated,
+		arg.OrganizationID,
+		arg.StatusFilter,
+		arg.SearchQuery,
+		arg.PageOffset,
+		arg.PageLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Tournament{}
+	for rows.Next() {
+		var i Tournament
+		if err := rows.Scan(
+			&i.ID,
+			&i.OrganizationID,
+			&i.Name,
+			&i.Slug,
+			&i.Description,
+			&i.Sport,
+			&i.Format,
+			&i.ParticipantType,
+			&i.Status,
+			&i.BannerUrl,
+			&i.PrizePool,
+			&i.Currency,
+			&i.MaxParticipants,
+			&i.MinParticipants,
+			&i.RegistrationOpensAt,
+			&i.RegistrationClosesAt,
+			&i.StartsAt,
+			&i.EndsAt,
+			&i.Venue,
+			&i.City,
+			&i.Country,
+			&i.Rules,
+			&i.Settings,
+			&i.CreatedBy,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const updateTournament = `-- name: UpdateTournament :one
+UPDATE tournaments
+SET    name                   = $3,
+       description            = $4,
+       sport                  = $5,
+       format                 = $6,
+       participant_type       = $7,
+       banner_url             = $8,
+       prize_pool             = $9,
+       currency               = $10,
+       max_participants       = $11,
+       min_participants       = $12,
+       registration_opens_at  = $13,
+       registration_closes_at = $14,
+       starts_at              = $15,
+       ends_at                = $16,
+       venue                  = $17,
+       city                   = $18,
+       country                = $19,
+       rules                  = $20,
+       status                 = $21,
+       updated_at             = NOW()
+WHERE  id              = $1
+  AND  organization_id = $2
+RETURNING id, organization_id, name, slug, description, sport, format, participant_type, status, banner_url, prize_pool, currency, max_participants, min_participants, registration_opens_at, registration_closes_at, starts_at, ends_at, venue, city, country, rules, settings, created_by, created_at, updated_at
+`
+
+type UpdateTournamentParams struct {
+	ID                   pgtype.UUID        `json:"id"`
+	OrganizationID       pgtype.UUID        `json:"organization_id"`
+	Name                 string             `json:"name"`
+	Description          *string            `json:"description"`
+	Sport                string             `json:"sport"`
+	Format               TournamentFormat   `json:"format"`
+	ParticipantType      ParticipantType    `json:"participant_type"`
+	BannerUrl            *string            `json:"banner_url"`
+	PrizePool            pgtype.Numeric     `json:"prize_pool"`
+	Currency             string             `json:"currency"`
+	MaxParticipants      *int16             `json:"max_participants"`
+	MinParticipants      *int16             `json:"min_participants"`
+	RegistrationOpensAt  pgtype.Timestamptz `json:"registration_opens_at"`
+	RegistrationClosesAt pgtype.Timestamptz `json:"registration_closes_at"`
+	StartsAt             pgtype.Timestamptz `json:"starts_at"`
+	EndsAt               pgtype.Timestamptz `json:"ends_at"`
+	Venue                *string            `json:"venue"`
+	City                 *string            `json:"city"`
+	Country              *string            `json:"country"`
+	Rules                *string            `json:"rules"`
+	Status               TournamentStatus   `json:"status"`
+}
+
+// Full field update. Service layer merges partial request fields over current
+// state. id, organization_id, slug, and created_by are immutable.
+func (q *Queries) UpdateTournament(ctx context.Context, arg UpdateTournamentParams) (Tournament, error) {
+	row := q.db.QueryRow(ctx, updateTournament,
+		arg.ID,
+		arg.OrganizationID,
+		arg.Name,
+		arg.Description,
+		arg.Sport,
+		arg.Format,
+		arg.ParticipantType,
+		arg.BannerUrl,
+		arg.PrizePool,
+		arg.Currency,
+		arg.MaxParticipants,
+		arg.MinParticipants,
+		arg.RegistrationOpensAt,
+		arg.RegistrationClosesAt,
+		arg.StartsAt,
+		arg.EndsAt,
+		arg.Venue,
+		arg.City,
+		arg.Country,
+		arg.Rules,
+		arg.Status,
+	)
+	var i Tournament
+	err := row.Scan(
+		&i.ID,
+		&i.OrganizationID,
+		&i.Name,
+		&i.Slug,
+		&i.Description,
+		&i.Sport,
+		&i.Format,
+		&i.ParticipantType,
+		&i.Status,
+		&i.BannerUrl,
+		&i.PrizePool,
+		&i.Currency,
+		&i.MaxParticipants,
+		&i.MinParticipants,
+		&i.RegistrationOpensAt,
+		&i.RegistrationClosesAt,
+		&i.StartsAt,
+		&i.EndsAt,
+		&i.Venue,
+		&i.City,
+		&i.Country,
+		&i.Rules,
+		&i.Settings,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
 }
