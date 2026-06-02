@@ -17,21 +17,23 @@ SET    status     = 'cancelled',
        updated_at = NOW()
 WHERE  id              = $1
   AND  organization_id = $2
-  AND  status NOT IN ('completed', 'cancelled', 'abandoned')
+  AND  status          = $3
 RETURNING id, tournament_id, organization_id, round_number, round_name, match_number, home_team_id, away_team_id, home_player_id, away_player_id, venue, scheduled_at, started_at, ended_at, status, winner_team_id, winner_player_id, is_walkover, notes, metadata, created_at, updated_at, home_score, away_score
 `
 
 type CancelMatchParams struct {
 	ID             pgtype.UUID `json:"id"`
 	OrganizationID pgtype.UUID `json:"organization_id"`
+	Status         MatchStatus `json:"status"`
 }
 
 // Soft-cancel: sets status to 'cancelled'. Records are never hard-deleted so
 // that future match_events and audit_log references remain resolvable.
-// The terminal-state guard mirrors UpdateMatch: a concurrent cancellation of an
-// already-terminal match returns 0 rows, mapped to ErrMatchNotUpdatable.
+// CAS guard: AND status = $3 (previous_status) ensures a concurrent transition
+// that already moved the match to a terminal state causes this UPDATE to match
+// 0 rows, returning ErrNoRows → ErrMatchNotUpdatable in the repository.
 func (q *Queries) CancelMatch(ctx context.Context, arg CancelMatchParams) (Match, error) {
-	row := q.db.QueryRow(ctx, cancelMatch, arg.ID, arg.OrganizationID)
+	row := q.db.QueryRow(ctx, cancelMatch, arg.ID, arg.OrganizationID, arg.Status)
 	var i Match
 	err := row.Scan(
 		&i.ID,
@@ -488,7 +490,7 @@ SET    round_number     = $3,
        updated_at       = NOW()
 WHERE  id              = $1
   AND  organization_id = $2
-  AND  status NOT IN ('completed', 'cancelled', 'abandoned')
+  AND  status          = $20
 RETURNING id, tournament_id, organization_id, round_number, round_name, match_number, home_team_id, away_team_id, home_player_id, away_player_id, venue, scheduled_at, started_at, ended_at, status, winner_team_id, winner_player_id, is_walkover, notes, metadata, created_at, updated_at, home_score, away_score
 `
 
@@ -512,19 +514,21 @@ type UpdateMatchParams struct {
 	Notes          *string            `json:"notes"`
 	HomeScore      int32              `json:"home_score"`
 	AwayScore      int32              `json:"away_score"`
+	Status_2       MatchStatus        `json:"status_2"`
 }
 
-// Full mutable-field update. Service layer merges partial request fields over
-// current state. id, organization_id, tournament_id, is_walkover, metadata,
-// and created_at are immutable and never appear in the SET clause.
+// Full mutable-field update with compare-and-swap (CAS) status guard.
+// Service layer merges partial request fields over current state.
+// id, organization_id, tournament_id, is_walkover, metadata, and created_at
+// are immutable and never appear in the SET clause.
 // started_at and ended_at are stamped by the service during lifecycle transitions.
 // home_score and away_score ($18, $19) are 0 for all non-completion transitions;
 // for the live → completed transition the repository fills them in after computing
 // the final score from the effective event log under a FOR UPDATE lock on this row.
-// The terminal-state guard (status NOT IN ...) is enforced at the DB level so
-// that two concurrent PATCH requests that both pass the service-layer check
-// cannot both succeed: the second update finds 0 rows and returns ErrNoRows,
-// which the repository maps to ErrMatchNotUpdatable.
+// CAS guard: AND status = $20 (previous_status from the service read) ensures
+// that if a concurrent request already changed the status between the service
+// read and this write, this UPDATE matches 0 rows and returns ErrNoRows, which
+// the repository maps to ErrMatchNotUpdatable.
 func (q *Queries) UpdateMatch(ctx context.Context, arg UpdateMatchParams) (Match, error) {
 	row := q.db.QueryRow(ctx, updateMatch,
 		arg.ID,
@@ -546,6 +550,7 @@ func (q *Queries) UpdateMatch(ctx context.Context, arg UpdateMatchParams) (Match
 		arg.Notes,
 		arg.HomeScore,
 		arg.AwayScore,
+		arg.Status_2,
 	)
 	var i Match
 	err := row.Scan(

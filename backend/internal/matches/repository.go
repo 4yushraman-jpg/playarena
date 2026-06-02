@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	db "github.com/4yushraman-jpg/playarena/db/sqlc"
+	"github.com/4yushraman-jpg/playarena/internal/notifications/trigger"
 	"github.com/4yushraman-jpg/playarena/internal/platform/pgutil"
 	"github.com/4yushraman-jpg/playarena/internal/scoring"
 )
@@ -184,6 +185,7 @@ type createMatchTxParams struct {
 //  2. Re-validates tournament.status == ongoing inside the transaction.
 //  3. Inserts the match row.
 //  4. Inserts a create audit record (new_data from the DB-returned row).
+//  5. Writes a match_created outbox entry for notification fan-out.
 func (r *Repository) CreateWithAudit(ctx context.Context, p createMatchTxParams) (*db.Match, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -230,6 +232,22 @@ func (r *Repository) CreateWithAudit(ctx context.Context, p createMatchTxParams)
 		return nil, err
 	}
 
+	// Write outbox entry for notification fan-out (post-commit drain).
+	if err := trigger.WriteOutboxEntry(ctx, qtx, trigger.OutboxParams{
+		OrganizationID: m.OrganizationID,
+		EventType:      db.NotificationEventTypeMatchCreated,
+		ActorID:        p.actorID,
+		EntityType:     "matches",
+		EntityID:       m.ID,
+		Payload: map[string]any{
+			"match_id":      pgutil.UUIDToString(m.ID),
+			"tournament_id": pgutil.UUIDToString(m.TournamentID),
+			"status":        string(m.Status),
+		},
+	}); err != nil {
+		return nil, err
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
@@ -244,19 +262,22 @@ type updateMatchTxParams struct {
 	tournamentID   pgtype.UUID
 	organizationID pgtype.UUID
 	// isCompletion is true when the transition is live → completed.
-	// The repository locks the match row, computes the final score from the
-	// effective event log, validates winner consistency, and snapshots
-	// home_score / away_score atomically with the status write.
 	isCompletion bool
 	// isWalkover is passed from the service so the repository can exempt
 	// walkover completions from the winner-vs-score consistency check.
 	isWalkover bool
+	// previousStatus is the match status observed by the service before the
+	// transaction. Used as the CAS guard in UpdateMatch.
+	previousStatus db.MatchStatus
 }
 
 // UpdateWithAudit atomically updates a match and writes an update audit record.
 // When lockTournament is true (status transitioning to live, completed, or
 // abandoned), a FOR SHARE lock is acquired on the tournament row first to
 // prevent a concurrent tournament cancellation from racing with the transition.
+// Uses compare-and-swap (AND status = previousStatus) to prevent split-brain
+// on concurrent PATCH requests.
+// Writes a status-change outbox entry when the status transitions.
 func (r *Repository) UpdateWithAudit(ctx context.Context, p updateMatchTxParams) (*db.Match, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -283,10 +304,6 @@ func (r *Repository) UpdateWithAudit(ctx context.Context, p updateMatchTxParams)
 	}
 
 	// ── Score snapshot for live → completed transitions ─────────────────────
-	// Lock the match row FOR UPDATE to block concurrent event inserts, then
-	// derive the final score from the effective event log while the lock is
-	// held.  Both steps must be inside this transaction so the snapshot cannot
-	// diverge from the log.
 	if p.isCompletion {
 		locked, err := qtx.LockMatchForUpdate(ctx, db.LockMatchForUpdateParams{
 			ID:             p.updateParams.ID,
@@ -330,10 +347,8 @@ func (r *Repository) UpdateWithAudit(ctx context.Context, p updateMatchTxParams)
 	m, err := qtx.UpdateMatch(ctx, p.updateParams)
 	if err != nil {
 		if err == pgx.ErrNoRows {
-			// The match exists (verified by GetByID in the service) but the
-			// DB-level terminal-state guard rejected the write — another
-			// concurrent request already transitioned the match to a terminal
-			// status between the service read and this transaction.
+			// CAS failed: the match status changed between the service read and
+			// this transaction (concurrent request or terminal-state race).
 			return nil, ErrMatchNotUpdatable
 		}
 		return nil, err
@@ -356,6 +371,25 @@ func (r *Repository) UpdateWithAudit(ctx context.Context, p updateMatchTxParams)
 		return nil, err
 	}
 
+	// Write outbox entry when the status changed.
+	if eventType, ok := matchStatusToEventType(m.Status); ok && m.Status != p.previousStatus {
+		if err := trigger.WriteOutboxEntry(ctx, qtx, trigger.OutboxParams{
+			OrganizationID: m.OrganizationID,
+			EventType:      eventType,
+			ActorID:        p.actorID,
+			EntityType:     "matches",
+			EntityID:       m.ID,
+			Payload: map[string]any{
+				"match_id":        pgutil.UUIDToString(m.ID),
+				"tournament_id":   pgutil.UUIDToString(m.TournamentID),
+				"previous_status": string(p.previousStatus),
+				"new_status":      string(m.Status),
+			},
+		}); err != nil {
+			return nil, err
+		}
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
@@ -363,14 +397,17 @@ func (r *Repository) UpdateWithAudit(ctx context.Context, p updateMatchTxParams)
 }
 
 type cancelMatchTxParams struct {
-	id      pgtype.UUID
-	orgID   pgtype.UUID
-	actorID pgtype.UUID
-	oldData []byte
+	id             pgtype.UUID
+	orgID          pgtype.UUID
+	actorID        pgtype.UUID
+	oldData        []byte
+	previousStatus db.MatchStatus
 }
 
 // CancelWithAudit atomically sets the match status to cancelled and writes
 // a delete audit record. Records are never hard-deleted.
+// Uses CAS (AND status = previousStatus) to guard against concurrent transitions.
+// Writes a match_cancelled outbox entry for notification fan-out.
 func (r *Repository) CancelWithAudit(ctx context.Context, p cancelMatchTxParams) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -380,16 +417,14 @@ func (r *Repository) CancelWithAudit(ctx context.Context, p cancelMatchTxParams)
 
 	qtx := r.queries.WithTx(tx)
 
-	_, err = qtx.CancelMatch(ctx, db.CancelMatchParams{
+	cancelled, err := qtx.CancelMatch(ctx, db.CancelMatchParams{
 		ID:             p.id,
 		OrganizationID: p.orgID,
+		Status:         p.previousStatus, // CAS guard: $3 = previous_status
 	})
 	if err != nil {
 		if err == pgx.ErrNoRows {
-			// The match exists (verified by GetByID in the service) but the
-			// DB-level terminal-state guard rejected the write — another
-			// concurrent request already transitioned the match to a terminal
-			// status between the service read and this transaction.
+			// CAS failed: status changed between service read and this transaction.
 			return ErrMatchNotUpdatable
 		}
 		return err
@@ -402,6 +437,23 @@ func (r *Repository) CancelWithAudit(ctx context.Context, p cancelMatchTxParams)
 		EntityType:     "matches",
 		EntityID:       p.id,
 		OldData:        p.oldData,
+	}); err != nil {
+		return err
+	}
+
+	// Write outbox entry for notification fan-out.
+	if err := trigger.WriteOutboxEntry(ctx, qtx, trigger.OutboxParams{
+		OrganizationID: p.orgID,
+		EventType:      db.NotificationEventTypeMatchCancelled,
+		ActorID:        p.actorID,
+		EntityType:     "matches",
+		EntityID:       p.id,
+		Payload: map[string]any{
+			"match_id":        pgutil.UUIDToString(cancelled.ID),
+			"tournament_id":   pgutil.UUIDToString(cancelled.TournamentID),
+			"previous_status": string(p.previousStatus),
+			"new_status":      "cancelled",
+		},
 	}); err != nil {
 		return err
 	}
@@ -459,6 +511,22 @@ func derefStr(s *string) string {
 	return *s
 }
 
+// matchStatusToEventType maps match status transitions to outbox event types.
+// Returns (eventType, true) when the status has a corresponding event type.
+func matchStatusToEventType(status db.MatchStatus) (db.NotificationEventType, bool) {
+	switch status {
+	case db.MatchStatusLive:
+		return db.NotificationEventTypeMatchStarted, true
+	case db.MatchStatusCompleted:
+		return db.NotificationEventTypeMatchCompleted, true
+	case db.MatchStatusCancelled:
+		return db.NotificationEventTypeMatchCancelled, true
+	case db.MatchStatusAbandoned:
+		return db.NotificationEventTypeMatchAbandoned, true
+	}
+	return "", false
+}
+
 // validateWinnerVsScore verifies that the declared winner is consistent with
 // the computed final score.  Walkovers are always exempt: the score is 0-0
 // by convention but a winner must be set.
@@ -476,7 +544,6 @@ func validateWinnerVsScore(
 		return nil
 	}
 
-	// Resolve the declared winner UUID from the update params.
 	var winnerUID pgtype.UUID
 	if p.updateParams.WinnerTeamID.Valid {
 		winnerUID = p.updateParams.WinnerTeamID
@@ -484,7 +551,6 @@ func validateWinnerVsScore(
 		winnerUID = p.updateParams.WinnerPlayerID
 	}
 
-	// Resolve the home participant UUID from the locked match row.
 	var homeUID pgtype.UUID
 	if locked.HomeTeamID.Valid {
 		homeUID = locked.HomeTeamID
@@ -492,7 +558,6 @@ func validateWinnerVsScore(
 		homeUID = locked.HomePlayerID
 	}
 
-	// Resolve the away participant UUID from the locked match row.
 	var awayUID pgtype.UUID
 	if locked.AwayTeamID.Valid {
 		awayUID = locked.AwayTeamID

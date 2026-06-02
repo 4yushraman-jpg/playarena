@@ -13,6 +13,7 @@ import (
 	"github.com/4yushraman-jpg/playarena/internal/matches"
 	"github.com/4yushraman-jpg/playarena/internal/media"
 	mediastorage "github.com/4yushraman-jpg/playarena/internal/media/storage"
+	"github.com/4yushraman-jpg/playarena/internal/notifications"
 	"github.com/4yushraman-jpg/playarena/internal/organizations"
 	"github.com/4yushraman-jpg/playarena/internal/platform/config"
 	"github.com/4yushraman-jpg/playarena/internal/players"
@@ -29,15 +30,23 @@ func registerModules(r chi.Router, pool *pgxpool.Pool, log *slog.Logger, cfg *co
 	queries := db.New(pool)
 	authz := auth.NewAuthorizationService(queries)
 
+	// Notifications service is constructed once and shared with domain modules
+	// that perform outbox drain after their transactions commit.
+	notifRepo := notifications.NewRepository(queries, pool)
+	notifSvc := notifications.NewService(notifRepo, log)
+
 	health.RegisterRoutes(r, pool)
 	auth.RegisterRoutes(r, pool, cfg, log)
 	organizations.RegisterRoutes(r, pool, cfg, log, authz)
 	players.RegisterRoutes(r, pool, cfg, log, authz)
 	teams.RegisterRoutes(r, pool, cfg, log, authz)
-	tournaments.RegisterRoutes(r, pool, cfg, log, authz)
-	tournament_registrations.RegisterRoutes(r, pool, cfg, log, authz)
-	matches.RegisterRoutes(r, pool, cfg, log, authz)
+	tournaments.RegisterRoutes(r, pool, cfg, log, authz, notifSvc)
+	tournament_registrations.RegisterRoutes(r, pool, cfg, log, authz, notifSvc)
+	matches.RegisterRoutes(r, pool, cfg, log, authz, notifSvc)
 	match_events.RegisterRoutes(r, pool, cfg, log, authz)
+
+	// Notifications API — personal inbox and preferences endpoints.
+	notifications.RegisterRoutes(r, pool, cfg, log, authz)
 
 	// Media — storage backend constructed here so it is shared across requests.
 	// Construction fails fast at startup if the configuration is invalid.

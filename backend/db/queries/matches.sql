@@ -40,17 +40,18 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 RETURNING *;
 
 -- name: UpdateMatch :one
--- Full mutable-field update. Service layer merges partial request fields over
--- current state. id, organization_id, tournament_id, is_walkover, metadata,
--- and created_at are immutable and never appear in the SET clause.
+-- Full mutable-field update with compare-and-swap (CAS) status guard.
+-- Service layer merges partial request fields over current state.
+-- id, organization_id, tournament_id, is_walkover, metadata, and created_at
+-- are immutable and never appear in the SET clause.
 -- started_at and ended_at are stamped by the service during lifecycle transitions.
 -- home_score and away_score ($18, $19) are 0 for all non-completion transitions;
 -- for the live → completed transition the repository fills them in after computing
 -- the final score from the effective event log under a FOR UPDATE lock on this row.
--- The terminal-state guard (status NOT IN ...) is enforced at the DB level so
--- that two concurrent PATCH requests that both pass the service-layer check
--- cannot both succeed: the second update finds 0 rows and returns ErrNoRows,
--- which the repository maps to ErrMatchNotUpdatable.
+-- CAS guard: AND status = $20 (previous_status from the service read) ensures
+-- that if a concurrent request already changed the status between the service
+-- read and this write, this UPDATE matches 0 rows and returns ErrNoRows, which
+-- the repository maps to ErrMatchNotUpdatable.
 UPDATE matches
 SET    round_number     = $3,
        round_name       = $4,
@@ -72,20 +73,21 @@ SET    round_number     = $3,
        updated_at       = NOW()
 WHERE  id              = $1
   AND  organization_id = $2
-  AND  status NOT IN ('completed', 'cancelled', 'abandoned')
+  AND  status          = $20
 RETURNING *;
 
 -- name: CancelMatch :one
 -- Soft-cancel: sets status to 'cancelled'. Records are never hard-deleted so
 -- that future match_events and audit_log references remain resolvable.
--- The terminal-state guard mirrors UpdateMatch: a concurrent cancellation of an
--- already-terminal match returns 0 rows, mapped to ErrMatchNotUpdatable.
+-- CAS guard: AND status = $3 (previous_status) ensures a concurrent transition
+-- that already moved the match to a terminal state causes this UPDATE to match
+-- 0 rows, returning ErrNoRows → ErrMatchNotUpdatable in the repository.
 UPDATE matches
 SET    status     = 'cancelled',
        updated_at = NOW()
 WHERE  id              = $1
   AND  organization_id = $2
-  AND  status NOT IN ('completed', 'cancelled', 'abandoned')
+  AND  status          = $3
 RETURNING *;
 
 -- name: ListMatchesPaginated :many

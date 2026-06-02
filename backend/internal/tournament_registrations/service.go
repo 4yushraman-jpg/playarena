@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	db "github.com/4yushraman-jpg/playarena/db/sqlc"
+	"github.com/4yushraman-jpg/playarena/internal/notifications"
 	"github.com/4yushraman-jpg/playarena/internal/platform/pgutil"
 )
 
@@ -34,13 +35,14 @@ var allowedTransitions = map[db.RegistrationStatus][]db.RegistrationStatus{
 
 // Service implements tournament registration use-cases.
 type Service struct {
-	repo *Repository
-	log  *slog.Logger
+	repo     *Repository
+	log      *slog.Logger
+	notifSvc *notifications.Service
 }
 
 // NewService constructs a Service.
-func NewService(repo *Repository, log *slog.Logger) *Service {
-	return &Service{repo: repo, log: log}
+func NewService(repo *Repository, log *slog.Logger, notifSvc *notifications.Service) *Service {
+	return &Service{repo: repo, log: log, notifSvc: notifSvc}
 }
 
 // ── public methods ────────────────────────────────────────────────────────────
@@ -311,14 +313,19 @@ func (s *Service) Update(
 	}
 
 	updated, err := s.repo.UpdateWithAudit(ctx, updateRegistrationTxParams{
-		updateParams: params,
-		actorID:      actorUID,
-		orgID:        org.ID,
-		oldData:      oldData,
+		updateParams:   params,
+		actorID:        actorUID,
+		orgID:          org.ID,
+		oldData:        oldData,
+		previousStatus: current.Status,
 	})
 	if err != nil {
 		return nil, err
 	}
+
+	// Synchronous post-commit drain.
+	s.notifSvc.DrainOutbox(ctx, org.ID, s.log)
+
 	return registrationToResponse(updated), nil
 }
 
@@ -367,13 +374,21 @@ func (s *Service) Withdraw(
 		return err
 	}
 
-	return s.repo.WithdrawWithAudit(ctx, withdrawRegistrationTxParams{
-		id:           current.ID,
-		tournamentID: tid,
-		orgID:        org.ID,
-		actorID:      actorUID,
-		oldData:      oldData,
-	})
+	if err := s.repo.WithdrawWithAudit(ctx, withdrawRegistrationTxParams{
+		id:             current.ID,
+		tournamentID:   tid,
+		orgID:          org.ID,
+		actorID:        actorUID,
+		oldData:        oldData,
+		previousStatus: current.Status,
+	}); err != nil {
+		return err
+	}
+
+	// Synchronous post-commit drain.
+	s.notifSvc.DrainOutbox(ctx, org.ID, s.log)
+
+	return nil
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────

@@ -398,6 +398,100 @@ func (ns NullMembershipStatus) Value() (driver.Value, error) {
 	return string(ns.MembershipStatus), nil
 }
 
+// Delivery channel for a notification. in_app: DB-persisted; read via API; sent_at = NOW() on drain. email: future transactional email; sent_at NULL until confirmed sent. webhook: future org-configured HTTP callback; sent_at NULL until confirmed.
+type NotificationChannel string
+
+const (
+	NotificationChannelInApp   NotificationChannel = "in_app"
+	NotificationChannelEmail   NotificationChannel = "email"
+	NotificationChannelWebhook NotificationChannel = "webhook"
+)
+
+func (e *NotificationChannel) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = NotificationChannel(s)
+	case string:
+		*e = NotificationChannel(s)
+	default:
+		return fmt.Errorf("unsupported scan type for NotificationChannel: %T", src)
+	}
+	return nil
+}
+
+type NullNotificationChannel struct {
+	NotificationChannel NotificationChannel `json:"notification_channel"`
+	Valid               bool                `json:"valid"` // Valid is true if NotificationChannel is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullNotificationChannel) Scan(value interface{}) error {
+	if value == nil {
+		ns.NotificationChannel, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.NotificationChannel.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullNotificationChannel) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.NotificationChannel), nil
+}
+
+// Domain events that trigger notifications. match_*: lifecycle transitions on match fixtures. tournament_status_changed: any tournament status transition. registration_*: registration lifecycle changes.
+type NotificationEventType string
+
+const (
+	NotificationEventTypeMatchCreated            NotificationEventType = "match_created"
+	NotificationEventTypeMatchStarted            NotificationEventType = "match_started"
+	NotificationEventTypeMatchCompleted          NotificationEventType = "match_completed"
+	NotificationEventTypeMatchCancelled          NotificationEventType = "match_cancelled"
+	NotificationEventTypeMatchAbandoned          NotificationEventType = "match_abandoned"
+	NotificationEventTypeTournamentStatusChanged NotificationEventType = "tournament_status_changed"
+	NotificationEventTypeRegistrationApproved    NotificationEventType = "registration_approved"
+	NotificationEventTypeRegistrationRejected    NotificationEventType = "registration_rejected"
+	NotificationEventTypeRegistrationWithdrawn   NotificationEventType = "registration_withdrawn"
+)
+
+func (e *NotificationEventType) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = NotificationEventType(s)
+	case string:
+		*e = NotificationEventType(s)
+	default:
+		return fmt.Errorf("unsupported scan type for NotificationEventType: %T", src)
+	}
+	return nil
+}
+
+type NullNotificationEventType struct {
+	NotificationEventType NotificationEventType `json:"notification_event_type"`
+	Valid                 bool                  `json:"valid"` // Valid is true if NotificationEventType is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullNotificationEventType) Scan(value interface{}) error {
+	if value == nil {
+		ns.NotificationEventType, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.NotificationEventType.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullNotificationEventType) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.NotificationEventType), nil
+}
+
 // Operational status of an organization. A suspended organization cannot host tournaments or register for new events. All historical data is preserved intact.
 type OrgStatus string
 
@@ -971,6 +1065,51 @@ type MediaAttachment struct {
 	StorageKey string `json:"storage_key"`
 	// SHA-256 hex digest of the raw uploaded file bytes, computed before any processing. Used for duplicate detection: if (entity_type, entity_id, content_hash) already exists, the existing attachment is returned instead of creating a duplicate. Also used for integrity verification.
 	ContentHash string `json:"content_hash"`
+}
+
+// Personal notification inbox. Written ONLY by DrainOutbox — never by domain code directly. Every row is scoped to one user within one organization. UNIQUE (outbox_id, user_id, channel) ensures a drain retry is idempotent.
+type Notification struct {
+	ID             pgtype.UUID           `json:"id"`
+	OrganizationID pgtype.UUID           `json:"organization_id"`
+	UserID         pgtype.UUID           `json:"user_id"`
+	OutboxID       pgtype.UUID           `json:"outbox_id"`
+	Channel        NotificationChannel   `json:"channel"`
+	EventType      NotificationEventType `json:"event_type"`
+	EntityType     string                `json:"entity_type"`
+	EntityID       pgtype.UUID           `json:"entity_id"`
+	Payload        []byte                `json:"payload"`
+	ReadAt         pgtype.Timestamptz    `json:"read_at"`
+	// Delivery timestamp. Contract: in_app → set to NOW() on drain insert; email/webhook → NULL until the respective delivery worker confirms send.
+	SentAt pgtype.Timestamptz `json:"sent_at"`
+	// Soft-delete timestamp. NULL = visible. Set by DELETE endpoint. Deleted notifications are excluded from list queries but retained for audit.
+	DeletedAt pgtype.Timestamptz `json:"deleted_at"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
+// Transactional outbox for domain-event notifications. Rows are written inside domain transactions (matches, tournaments, registrations). DrainOutbox reads pending rows (processed_at IS NULL) using FOR UPDATE SKIP LOCKED and fans them out into the notifications table. All rows are retained permanently for auditability.
+type NotificationOutbox struct {
+	ID             pgtype.UUID           `json:"id"`
+	OrganizationID pgtype.UUID           `json:"organization_id"`
+	EventType      NotificationEventType `json:"event_type"`
+	ActorID        pgtype.UUID           `json:"actor_id"`
+	EntityType     string                `json:"entity_type"`
+	EntityID       pgtype.UUID           `json:"entity_id"`
+	Payload        []byte                `json:"payload"`
+	// Set to NOW() by DrainOutbox after all notifications for this entry have been inserted. NULL = pending. Once set, the entry is never modified again.
+	ProcessedAt pgtype.Timestamptz `json:"processed_at"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+}
+
+// Per-user notification preferences within an organization. A missing row means notifications are enabled (opt-out model). Writes use UPSERT (last-writer-wins) on (organization_id, user_id, event_type, channel).
+type NotificationPreference struct {
+	ID             pgtype.UUID           `json:"id"`
+	OrganizationID pgtype.UUID           `json:"organization_id"`
+	UserID         pgtype.UUID           `json:"user_id"`
+	EventType      NotificationEventType `json:"event_type"`
+	Channel        NotificationChannel   `json:"channel"`
+	Enabled        bool                  `json:"enabled"`
+	CreatedAt      pgtype.Timestamptz    `json:"created_at"`
+	UpdatedAt      pgtype.Timestamptz    `json:"updated_at"`
 }
 
 // Root multi-tenant entity. Every business-domain table carries organization_id as a FK. Deleting an organization cascades to all child records. Super-admin users exist outside any organization via platform-scoped roles.

@@ -8,6 +8,7 @@ import (
 
 	db "github.com/4yushraman-jpg/playarena/db/sqlc"
 	"github.com/4yushraman-jpg/playarena/internal/auth"
+	"github.com/4yushraman-jpg/playarena/internal/notifications"
 	"github.com/4yushraman-jpg/playarena/internal/platform/config"
 )
 
@@ -28,10 +29,11 @@ func RegisterRoutes(
 	cfg *config.Config,
 	log *slog.Logger,
 	authz *auth.AuthorizationService,
+	notifSvc *notifications.Service,
 ) {
 	queries := db.New(pool)
 	repo := NewRepository(queries, pool)
-	svc := NewService(repo, log)
+	svc := NewService(repo, log, notifSvc)
 	h := NewHandler(svc, log)
 
 	r.Route("/api/v1/organizations/{slug}/tournaments", func(r chi.Router) {

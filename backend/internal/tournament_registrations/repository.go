@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	db "github.com/4yushraman-jpg/playarena/db/sqlc"
+	"github.com/4yushraman-jpg/playarena/internal/notifications/trigger"
 	"github.com/4yushraman-jpg/playarena/internal/platform/pgutil"
 )
 
@@ -214,9 +215,13 @@ type updateRegistrationTxParams struct {
 	actorID      pgtype.UUID
 	orgID        pgtype.UUID
 	oldData      []byte
+	// previousStatus is the status observed by the service before the transaction.
+	// Used to detect status changes for outbox entry creation.
+	previousStatus db.RegistrationStatus
 }
 
 // UpdateWithAudit atomically updates a registration and writes an update audit record.
+// Writes a registration status outbox entry when the status transitions.
 func (r *Repository) UpdateWithAudit(ctx context.Context, p updateRegistrationTxParams) (*db.TournamentRegistration, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -251,6 +256,27 @@ func (r *Repository) UpdateWithAudit(ctx context.Context, p updateRegistrationTx
 		return nil, err
 	}
 
+	// Write outbox entry when the status changed to a notifiable state.
+	if reg.Status != p.previousStatus {
+		if eventType, ok := registrationStatusToEventType(reg.Status); ok {
+			if err := trigger.WriteOutboxEntry(ctx, qtx, trigger.OutboxParams{
+				OrganizationID: p.orgID,
+				EventType:      eventType,
+				ActorID:        p.actorID,
+				EntityType:     "tournament_registrations",
+				EntityID:       reg.ID,
+				Payload: map[string]any{
+					"registration_id": pgutil.UUIDToString(reg.ID),
+					"tournament_id":   pgutil.UUIDToString(reg.TournamentID),
+					"previous_status": string(p.previousStatus),
+					"new_status":      string(reg.Status),
+				},
+			}); err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
@@ -263,10 +289,13 @@ type withdrawRegistrationTxParams struct {
 	orgID        pgtype.UUID
 	actorID      pgtype.UUID
 	oldData      []byte
+	// previousStatus is the status observed by the service before the transaction.
+	previousStatus db.RegistrationStatus
 }
 
 // WithdrawWithAudit atomically sets the registration to withdrawn and writes
 // a delete audit record. Records are never hard-deleted.
+// Writes a registration_withdrawn outbox entry for notification fan-out.
 func (r *Repository) WithdrawWithAudit(ctx context.Context, p withdrawRegistrationTxParams) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -276,7 +305,7 @@ func (r *Repository) WithdrawWithAudit(ctx context.Context, p withdrawRegistrati
 
 	qtx := r.queries.WithTx(tx)
 
-	_, err = qtx.WithdrawRegistration(ctx, db.WithdrawRegistrationParams{
+	withdrawn, err := qtx.WithdrawRegistration(ctx, db.WithdrawRegistrationParams{
 		ID:           p.id,
 		TournamentID: p.tournamentID,
 	})
@@ -298,7 +327,38 @@ func (r *Repository) WithdrawWithAudit(ctx context.Context, p withdrawRegistrati
 		return err
 	}
 
+	// Write outbox entry for notification fan-out.
+	if err := trigger.WriteOutboxEntry(ctx, qtx, trigger.OutboxParams{
+		OrganizationID: p.orgID,
+		EventType:      db.NotificationEventTypeRegistrationWithdrawn,
+		ActorID:        p.actorID,
+		EntityType:     "tournament_registrations",
+		EntityID:       p.id,
+		Payload: map[string]any{
+			"registration_id": pgutil.UUIDToString(withdrawn.ID),
+			"tournament_id":   pgutil.UUIDToString(withdrawn.TournamentID),
+			"previous_status": string(p.previousStatus),
+			"new_status":      "withdrawn",
+		},
+	}); err != nil {
+		return err
+	}
+
 	return tx.Commit(ctx)
+}
+
+// registrationStatusToEventType maps registration status values to outbox event types.
+// Returns (eventType, true) for notifiable status values.
+func registrationStatusToEventType(status db.RegistrationStatus) (db.NotificationEventType, bool) {
+	switch status {
+	case db.RegistrationStatusApproved:
+		return db.NotificationEventTypeRegistrationApproved, true
+	case db.RegistrationStatusRejected:
+		return db.NotificationEventTypeRegistrationRejected, true
+	case db.RegistrationStatusWithdrawn:
+		return db.NotificationEventTypeRegistrationWithdrawn, true
+	}
+	return "", false
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────

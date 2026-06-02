@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	db "github.com/4yushraman-jpg/playarena/db/sqlc"
+	"github.com/4yushraman-jpg/playarena/internal/notifications/trigger"
 	"github.com/4yushraman-jpg/playarena/internal/platform/pgutil"
 )
 
@@ -161,9 +162,14 @@ type updateTournamentTxParams struct {
 	updateParams db.UpdateTournamentParams
 	actorID      pgtype.UUID
 	oldData      []byte
+	// previousStatus is the status observed by the service before the transaction.
+	// Used to detect status changes and write outbox entries only when the status
+	// actually transitions.
+	previousStatus db.TournamentStatus
 }
 
 // UpdateWithAudit atomically updates the tournament and writes an update audit record.
+// Writes a tournament_status_changed outbox entry when the status transitions.
 func (r *Repository) UpdateWithAudit(ctx context.Context, p updateTournamentTxParams) (*db.Tournament, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -198,6 +204,24 @@ func (r *Repository) UpdateWithAudit(ctx context.Context, p updateTournamentTxPa
 		return nil, err
 	}
 
+	// Write outbox entry when the status changed.
+	if t.Status != p.previousStatus {
+		if err := trigger.WriteOutboxEntry(ctx, qtx, trigger.OutboxParams{
+			OrganizationID: t.OrganizationID,
+			EventType:      db.NotificationEventTypeTournamentStatusChanged,
+			ActorID:        p.actorID,
+			EntityType:     "tournaments",
+			EntityID:       t.ID,
+			Payload: map[string]any{
+				"tournament_id":   pgutil.UUIDToString(t.ID),
+				"previous_status": string(p.previousStatus),
+				"new_status":      string(t.Status),
+			},
+		}); err != nil {
+			return nil, err
+		}
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
@@ -205,14 +229,16 @@ func (r *Repository) UpdateWithAudit(ctx context.Context, p updateTournamentTxPa
 }
 
 type cancelTournamentTxParams struct {
-	id      pgtype.UUID
-	orgID   pgtype.UUID
-	actorID pgtype.UUID
-	oldData []byte
+	id             pgtype.UUID
+	orgID          pgtype.UUID
+	actorID        pgtype.UUID
+	oldData        []byte
+	previousStatus db.TournamentStatus
 }
 
 // CancelWithAudit atomically sets the tournament status to cancelled and writes
 // a delete audit record. Records are never hard-deleted.
+// Writes a tournament_status_changed outbox entry for notification fan-out.
 func (r *Repository) CancelWithAudit(ctx context.Context, p cancelTournamentTxParams) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -240,6 +266,22 @@ func (r *Repository) CancelWithAudit(ctx context.Context, p cancelTournamentTxPa
 		EntityType:     "tournaments",
 		EntityID:       p.id,
 		OldData:        p.oldData,
+	}); err != nil {
+		return err
+	}
+
+	// Write outbox entry for notification fan-out.
+	if err := trigger.WriteOutboxEntry(ctx, qtx, trigger.OutboxParams{
+		OrganizationID: p.orgID,
+		EventType:      db.NotificationEventTypeTournamentStatusChanged,
+		ActorID:        p.actorID,
+		EntityType:     "tournaments",
+		EntityID:       p.id,
+		Payload: map[string]any{
+			"tournament_id":   pgutil.UUIDToString(p.id),
+			"previous_status": string(p.previousStatus),
+			"new_status":      "cancelled",
+		},
 	}); err != nil {
 		return err
 	}

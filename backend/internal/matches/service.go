@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	db "github.com/4yushraman-jpg/playarena/db/sqlc"
+	"github.com/4yushraman-jpg/playarena/internal/notifications"
 	"github.com/4yushraman-jpg/playarena/internal/platform/pgutil"
 	"github.com/4yushraman-jpg/playarena/internal/scoring"
 )
@@ -51,13 +52,14 @@ var tournamentLockStatuses = map[db.MatchStatus]bool{
 
 // Service implements match use-cases.
 type Service struct {
-	repo *Repository
-	log  *slog.Logger
+	repo     *Repository
+	log      *slog.Logger
+	notifSvc *notifications.Service
 }
 
 // NewService constructs a Service.
-func NewService(repo *Repository, log *slog.Logger) *Service {
-	return &Service{repo: repo, log: log}
+func NewService(repo *Repository, log *slog.Logger, notifSvc *notifications.Service) *Service {
+	return &Service{repo: repo, log: log, notifSvc: notifSvc}
 }
 
 // ── public methods ────────────────────────────────────────────────────────────
@@ -157,6 +159,10 @@ func (s *Service) Create(
 	if err != nil {
 		return nil, err
 	}
+
+	// Synchronous post-commit drain: fan out outbox entries to notifications.
+	s.notifSvc.DrainOutbox(ctx, org.ID, s.log)
+
 	return matchToResponse(m), nil
 }
 
@@ -292,6 +298,7 @@ func (s *Service) Update(
 		Notes:          current.Notes,
 		HomeScore:      current.HomeScore,
 		AwayScore:      current.AwayScore,
+		Status_2:       current.Status, // CAS guard ($20 = previous_status)
 	}
 
 	if req.RoundNumber != nil {
@@ -422,10 +429,15 @@ func (s *Service) Update(
 		organizationID: current.OrganizationID,
 		isCompletion:   params.Status == db.MatchStatusCompleted,
 		isWalkover:     current.IsWalkover,
+		previousStatus: current.Status,
 	})
 	if err != nil {
 		return nil, err
 	}
+
+	// Synchronous post-commit drain.
+	s.notifSvc.DrainOutbox(ctx, org.ID, s.log)
+
 	return matchToResponse(updated), nil
 }
 
@@ -474,12 +486,20 @@ func (s *Service) Delete(
 		return err
 	}
 
-	return s.repo.CancelWithAudit(ctx, cancelMatchTxParams{
-		id:      current.ID,
-		orgID:   current.OrganizationID,
-		actorID: actorUID,
-		oldData: oldData,
-	})
+	if err := s.repo.CancelWithAudit(ctx, cancelMatchTxParams{
+		id:             current.ID,
+		orgID:          current.OrganizationID,
+		actorID:        actorUID,
+		oldData:        oldData,
+		previousStatus: current.Status,
+	}); err != nil {
+		return err
+	}
+
+	// Synchronous post-commit drain.
+	s.notifSvc.DrainOutbox(ctx, org.ID, s.log)
+
+	return nil
 }
 
 // GetScore derives the current score for a match from the effective event log.
