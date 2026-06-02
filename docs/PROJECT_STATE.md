@@ -1,11 +1,11 @@
 # PlayArena — Project State & Handoff Document
 
-**Last Updated:** 2026-06-01  
+**Last Updated:** 2026-06-02  
 **Build status:** `go build ./...` passing, `go vet ./...` clean, `sqlc generate` clean  
-**Migrations applied:** 000001 – 000018  
+**Migrations applied:** 000001 – 000021  
 **Go version:** 1.25.6  
 **Database:** PostgreSQL 17  
-**Phases complete:** 1 – 9
+**Phases complete:** 1 – 11
 
 ---
 
@@ -36,7 +36,7 @@
 backend/
 ├── cmd/api/main.go                         Entry point — config, DB pool, HTTP server, graceful shutdown
 ├── db/
-│   ├── migrations/                         golang-migrate files (000001–000018, up + down)
+│   ├── migrations/                         golang-migrate files (000001–000021, up + down)
 │   ├── queries/                            Hand-written SQL (sqlc source)
 │   └── sqlc/                              Generated type-safe Go — never edited by hand
 ├── internal/
@@ -79,12 +79,12 @@ backend/
 │   │   └── routes.go
 │   ├── tournaments/                        Tournaments domain (fully implemented)
 │   │   ├── errors.go
-│   │   ├── dto.go
+│   │   ├── dto.go                         Includes StandingsResponse, StandingsRowResponse, PointSystemResponse
 │   │   ├── model.go
-│   │   ├── repository.go
-│   │   ├── service.go
-│   │   ├── handler.go
-│   │   └── routes.go
+│   │   ├── repository.go                  Includes GetCompletedMatchesForStandings, GetRegistrationsForStandings
+│   │   ├── service.go                     Includes GetStandings, parseStandingsSettings
+│   │   ├── handler.go                     Includes GetStandings handler
+│   │   └── routes.go                      GET /{id}/standings route added
 │   ├── tournament_registrations/           Tournament registrations domain (fully implemented)
 │   │   ├── errors.go
 │   │   ├── dto.go
@@ -94,10 +94,10 @@ backend/
 │   │   ├── handler.go
 │   │   └── routes.go
 │   ├── matches/                            Matches domain (fully implemented)
-│   │   ├── errors.go
-│   │   ├── dto.go
+│   │   ├── errors.go                      Includes ErrWinnerScoreMismatch (Phase 10)
+│   │   ├── dto.go                         Response includes home_score, away_score (Phase 10)
 │   │   ├── model.go
-│   │   ├── repository.go
+│   │   ├── repository.go                  UpdateWithAudit performs score snapshot on completion (Phase 10)
 │   │   ├── service.go
 │   │   ├── handler.go
 │   │   └── routes.go
@@ -113,7 +113,25 @@ backend/
 │   │   ├── engine.go                      ScoreEngine — stateless Compute(match, events) → ScoreResult
 │   │   ├── rules.go                       Kabaddi scoring rules: participantSide, allOutScore, payloadPoints
 │   │   ├── models.go                      ScoreResult — the derived score response type
-│   │   └── validation.go                  Write-time payload validation for scoring event types
+│   │   └── validation.go                  ValidateScoreEventPayload + ValidateAllOutParticipant (Phase 9 hardening)
+│   ├── standings/                          Standings engine (fully implemented, Phase 10)
+│   │   ├── models.go                      CompletedMatch, RegistrationInfo, Settings, StandingsRow
+│   │   ├── engine.go                      Compute(matches, registrations, settings) → []StandingsRow
+│   │   └── tiebreakers.go                 makeLess, h2hCompare, seedCompare — full 7-level tiebreak chain
+│   ├── media/                              Media Management (fully implemented, Phase 11)
+│   │   ├── errors.go                      Typed domain error sentinels
+│   │   ├── model.go                       ListParams, VariantsMeta, size/pagination constants
+│   │   ├── dto.go                         UploadRequest (multipart), UpdateRequest, Response, ListResponse
+│   │   ├── repository.go                  CreateWithAudit, SwapPrimaryWithAudit, DeleteWithAudit; duplicate-detection retry
+│   │   ├── service.go                     Upload pipeline, List, GetByID, Update, Delete; BOLA + entity guards
+│   │   ├── handler.go                     HTTP handlers; MaxBytesReader enforcement; multipart parsing
+│   │   ├── routes.go                      RegisterRoutes() — mounts /api/v1/organizations/{slug}/media; dev file server
+│   │   ├── storage/
+│   │   │   ├── backend.go                 Backend interface + New() factory + GenerateKey()
+│   │   │   ├── local.go                   LocalBackend — filesystem storage for development
+│   │   │   └── s3.go                      S3Backend — S3-compatible storage with inline SigV4 signing
+│   │   └── processor/
+│   │       └── image.go                   MIME detection, image decode, bilinear resize, JPEG encode, SHA-256 hash
 │   ├── bootstrap/
 │   │   ├── app.go                         App struct (Config, DB, Log) — composition root
 │   │   ├── router.go                      Builds chi router + global middleware stack
@@ -129,7 +147,7 @@ backend/
 ```
 
 **Remaining stubs** (files exist with package declaration only, no logic):
-`users/`, `media/`, `rankings/`, `news/`
+`users/`, `rankings/`, `news/`
 
 ### Request Lifecycle
 
@@ -161,6 +179,7 @@ HTTP request
 | Password hashing | bcrypt (x/crypto) | cost 12 |
 | Config / .env | godotenv | v1.5.1 |
 | Logging | log/slog | stdlib |
+| Image decode (WebP) | golang.org/x/image | v0.41.0 |
 
 ---
 
@@ -188,6 +207,9 @@ HTTP request
 | 000016 | Email Verification Tokens | `email_verification_tokens` — single-use, SHA-256 hashed |
 | 000017 | Seed RBAC | 18 permissions, 7 system roles, full role→permission mappings |
 | 000018 | Match Delete Permission | `match.delete` permission seeded; granted to `platform_admin`, `org_owner`, `org_admin` |
+| 000019 | Match Score Snapshots | `matches.home_score INTEGER NOT NULL DEFAULT 0`, `matches.away_score INTEGER NOT NULL DEFAULT 0` — final score columns written once at `live → completed` transition; standings engine reads these instead of re-aggregating `match_events` |
+| 000020 | Media Hardening | `media_attachments.storage_key TEXT NOT NULL` — canonical S3 object path, independent of CDN; `media_attachments.content_hash CHAR(64) NOT NULL` — SHA-256 hex for duplicate detection; `uq_media_primary_per_entity` unique partial index enforcing one primary per entity; `media.update` and `media.delete` permissions seeded and granted to `platform_admin`, `org_owner`, `org_admin`, `team_manager`, `coach` |
+| 000021 | Media Content Uniqueness | `uq_media_content_per_entity` unique index on `(organization_id, entity_type, entity_id, content_hash)` — DB-level backstop preventing concurrent duplicate uploads from producing multiple rows for the same content |
 
 ### Table Summary
 
@@ -214,7 +236,7 @@ Key columns: `token_hash` (unique), `expires_at`, `revoked_at` (NULL = valid), `
 Supports `expires_at` for time-limited grants (e.g. guest scorer per tournament).  
 Unique constraints: `(user_id, organization_id, role_id)` for org grants; partial unique index `(user_id, role_id) WHERE organization_id IS NULL` for platform grants.
 
-#### Permission Matrix (complete, as of migration 000018)
+#### Permission Matrix (complete, as of migration 000020)
 
 | Permission | `platform_admin` | `org_owner` | `org_admin` | `team_manager` | `coach` | `scorer` | `viewer` |
 |-----------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
@@ -237,6 +259,8 @@ Unique constraints: `(user_id, organization_id, role_id)` for org grants; partia
 | `match.delete` | ✓ | ✓ | ✓ | — | — | — | — |
 | `match.score` | ✓ | ✓ | ✓ | — | — | ✓ | — |
 | `media.upload` | ✓ | ✓ | ✓ | ✓ | ✓ | — | — |
+| `media.update` | ✓ | ✓ | ✓ | ✓ | ✓ | — | — |
+| `media.delete` | ✓ | ✓ | ✓ | ✓ | ✓ | — | — |
 
 #### Domain Tables
 
@@ -252,17 +276,19 @@ Unique constraints: `(user_id, organization_id, role_id)` for org grants; partia
 
 **`tournament_registrations`** — Team or player entry. `organization_id` is the **registrant's** org (not the tournament host org — cross-org tournaments are supported). Trigger `trg_treg_participant_org_consistency` validates that the team/player belongs to the registrant org.
 
-**`matches`** — Fixtures within a tournament. `organization_id` denormalized from `tournaments.organization_id`, validated by trigger. Supports TBD bracket slots (all participant columns nullable). `winner_team_id` / `winner_player_id` are final-state only.
+**`matches`** — Fixtures within a tournament. `organization_id` denormalized from `tournaments.organization_id`, validated by trigger. Supports TBD bracket slots (all participant columns nullable). `winner_team_id` / `winner_player_id` are final-state only. `home_score` / `away_score` (added migration 000019) are snapshotted once at `live → completed` inside a `FOR UPDATE` locked transaction; both are `0` for all non-completed statuses and walkovers. Standings reads these columns exclusively — never `match_events`.
 
 **`match_events`** — **Append-only immutable event log.** The single source of truth for all scoring, player state, and match statistics. No UPDATE or DELETE ever. Corrections expressed as new `score_correction` events with `cancels_event_id`. `sequence_number` is monotonically increasing per match (requires row-level lock on the parent match during concurrent inserts).
 
-**`media_attachments`** — Polymorphic media store. `(entity_type, entity_id)` soft-FK to any domain entity. Referential integrity enforced at application layer.
+**`media_attachments`** — Polymorphic media store. `(entity_type, entity_id)` soft-FK to any domain entity. Referential integrity enforced at application layer. `storage_key` (added migration 000020) is the canonical object path in the storage backend — source of truth independent of CDN domain. `content_hash` (added migration 000020) is the SHA-256 hex digest of raw uploaded bytes used for duplicate detection. `uq_media_primary_per_entity` partial unique index (migration 000020) enforces at most one `is_primary = TRUE` row per entity. `uq_media_content_per_entity` unique index (migration 000021) prevents concurrent duplicate uploads.
 
 **`audit_logs`** — Immutable compliance ledger. `org_id` nullable (NULL = platform action). `user_id` nullable (NULL = system action). Constraint: login/logout rows have no `entity_id`; create/update/delete must have one.
 
 ### Key Design Decisions
 
-**Event sourcing for match scoring.** No score columns exist on the `matches` table. All statistics are derived by aggregating `match_events`. Corrections are non-destructive: a `score_correction` event references (via `cancels_event_id`) the event it supersedes; neither row is mutated.
+**Event sourcing for live scoring.** `match_events` is the single source of truth for all scoring during active matches. The live scoring engine (`internal/scoring/`) derives home and away scores on every `GET /matches/{id}/score` request from the effective event log — no score is ever stored for live matches.
+
+**Score snapshot at completion.** When a match transitions `live → completed`, `matches.home_score` and `matches.away_score` are written atomically inside the same transaction, under a `FOR UPDATE` lock on the match row. The lock prevents any concurrent event insertion between the score computation and the status write, making the snapshot permanently consistent with the event log. After completion, no further events can be recorded (`ErrMatchNotLive`), so the snapshot never drifts. Corrections are non-destructive: a `score_correction` event references (via `cancels_event_id`) the event it supersedes; neither row is mutated.
 
 **Denormalization with trigger guards.** `matches.organization_id` and `match_events.organization_id` are denormalized for query performance. Database triggers (`trg_matches_org_consistency`, `trg_match_events_org_consistency`) enforce consistency on INSERT/UPDATE.
 
@@ -455,6 +481,8 @@ Each access token carries **exactly one** `organization_id`. The token is org-co
 | **Matches** | `errors.go`, `dto.go`, `model.go`, `repository.go`, `service.go`, `handler.go`, `routes.go` | Complete |
 | **Match Events** | `errors.go`, `dto.go`, `model.go`, `repository.go`, `service.go`, `handler.go`, `routes.go` | Complete |
 | **Scoring Engine** | `engine.go`, `rules.go`, `models.go`, `validation.go` | Complete |
+| **Standings Engine** | `models.go`, `engine.go`, `tiebreakers.go` | Complete |
+| **Media Management** | `errors.go`, `model.go`, `dto.go`, `repository.go`, `service.go`, `handler.go`, `routes.go`; `storage/backend.go`, `storage/local.go`, `storage/s3.go`; `processor/image.go` | Complete |
 | **Platform / Config** | `config.go` | Complete |
 | **Platform / Database** | `postgres.go` | Complete |
 | **Platform / Logger** | `logger.go` | Complete |
@@ -467,7 +495,7 @@ Each access token carries **exactly one** `organization_id`. The token is org-co
 
 ### Empty Stubs (package declaration only, no logic)
 
-`users/`, `media/`, `rankings/`, `news/`
+`users/`, `rankings/`, `news/`
 
 ---
 
@@ -525,6 +553,7 @@ Each access token carries **exactly one** `organization_id`. The token is org-co
 | `POST` | `/tournaments` | Yes | `tournament.create` | Create tournament in draft status; BOLA-guarded |
 | `GET` | `/tournaments` | Yes | — | List non-cancelled tournaments (paginated; `?status`, `?search`) |
 | `GET` | `/tournaments/{id}` | Yes | — | Get by UUID; returns cancelled tournaments for historical access |
+| `GET` | `/tournaments/{id}/standings` | Yes | — | Derive current standings from snapshotted match scores; point system from `tournaments.settings`; 7-level tiebreak chain |
 | `PATCH` | `/tournaments/{id}` | Yes | `tournament.update` | Partial update including status transitions; BOLA-guarded |
 | `DELETE` | `/tournaments/{id}` | Yes | `tournament.delete` | Soft cancel — sets `status = cancelled`; BOLA-guarded |
 
@@ -545,7 +574,7 @@ Each access token carries **exactly one** `organization_id`. The token is org-co
 | `POST` | `/matches` | Yes | `match.create` | Schedule match; validates tournament ongoing, participant eligibility, approved registrations; BOLA-guarded |
 | `GET` | `/matches` | Yes | — | List matches (paginated; `?limit`, `?offset`, `?tournament_id`, `?status`, `?search`) |
 | `GET` | `/matches/{id}` | Yes | — | Get match by UUID; returns all statuses including cancelled/completed |
-| `GET` | `/matches/{id}/score` | Yes | — | Derive current score from effective event log; no persistence; valid for all match statuses |
+| `GET` | `/matches/{id}/score` | Yes | — | Derive current score from effective event log; no persistence; valid for all match statuses. Response now includes `home_score`/`away_score` (snapshotted on completed matches). |
 | `PATCH` | `/matches/{id}` | Yes | `match.update` | Partial update; validates status transitions, winner, participant changes; BOLA-guarded |
 | `DELETE` | `/matches/{id}` | Yes | `match.delete` | Soft-cancel — sets `status = cancelled`; terminal-state guard; BOLA-guarded |
 
@@ -558,6 +587,21 @@ Each access token carries **exactly one** `organization_id`. The token is org-co
 | `GET` | `/events/{eventId}` | Yes | — | Get event by UUID; scoped to match and org |
 
 No PATCH or DELETE endpoints exist. Match Events are append-only by design. Corrections are represented by inserting a `score_correction` event.
+
+### Media (`/api/v1/organizations/{slug}/media`)
+
+| Method | Path | Auth | Permission | Description |
+|--------|------|:----:|-----------|-------------|
+| `POST` | `/media` | Yes | `media.upload` | Upload image; multipart/form-data (file, entity_type, entity_id, alt_text, is_primary); MIME detection + image decode + JPEG normalize + thumbnail generation; BOLA-guarded |
+| `GET` | `/media` | Yes | — | List attachments (paginated; `?entity_type`, `?entity_id`, `?limit`, `?offset`); org-scoped |
+| `GET` | `/media/{id}` | Yes | — | Get attachment by UUID; org-scoped (BOLA-safe) |
+| `PATCH` | `/media/{id}` | Yes | `media.update` | Update alt_text, sort_order, is_primary; primary swap is transactional (FOR UPDATE + unique-index backstop); BOLA-guarded |
+| `DELETE` | `/media/{id}` | Yes | `media.delete` | Hard-delete DB row + audit log, then delete storage objects; double-delete safe (rows-affected check); BOLA-guarded |
+
+Supported entity types (Phase 11): `organization`, `team`, `player`, `tournament`. `match` and `user` deferred.  
+Allowed input MIME types: `image/jpeg`, `image/png`, `image/webp`, `image/gif`. SVG and documents rejected.  
+All output stored as JPEG. Thumbnails generated at 150 px (`_sm`) and 400 px (`_md`) width.  
+Storage backend: `local` (development, `./uploads/`, served at `/media/files/*`) or `s3` (production, any S3-compatible endpoint via SigV4 signing).
 
 ### Health
 
@@ -1002,6 +1046,335 @@ The engine is fault-tolerant for pre-Phase-9 events with missing payload fields 
 | All-out attribution correctness | **PASS** |
 | Live score consistency | **PASS** |
 
+### Phase 9 Hardening — all_out Payload Participant Validation
+
+**Problem identified during adversarial review:** `ValidateScoreEventPayload` validated that `all_out.team_id` was a non-empty string, but did not verify it was a UUID belonging to one of the match's participants. A scorer with `match.score` permission could submit `{"team_id": "garbage", "bonus_points": 2}`, which passed write-time validation. At score-derivation time, `sideByID("garbage", match)` returned `sideNone` and the bonus points were silently credited to neither team — producing an incorrect live score.
+
+**Fix applied:** `ValidateAllOutParticipant(payload []byte, homeTeamID, awayTeamID string) error` added to `internal/scoring/validation.go`. Called from `match_events/service.go:Create` immediately after `ValidateScoreEventPayload` when `eventType == all_out`. The function re-parses `payload.team_id` and compares it against the match's home and away participant UUIDs. Any non-matching value — including garbage strings, UUIDs from other matches, and empty strings — returns `ErrInvalidScorePayload` (HTTP 400). Walkovers in individual-format matches (where both team slots are empty) are also correctly rejected.
+
+**Review status: PASS.** An `all_out` event with a non-participant `team_id` is now rejected at write time before entering the immutable log.
+
+---
+
+### Phase 10 — Tournament Standings & Rankings (Complete)
+
+Phase 10 adds tournament standings derivation. The implementation is built on the Phase 9 scoring foundation and introduces a score snapshot that bridges the event-sourcing layer to a standings-friendly data model.
+
+#### Architecture Principles
+
+**match_events remains the source of truth for live scoring.** The Phase 9 scoring engine is unchanged. `GET /matches/{id}/score` continues to recompute from the effective event log on every request.
+
+**Standings read only snapshotted scores.** The standings engine (`internal/standings/`) accepts pre-aggregated `CompletedMatch` rows. It never reads `match_events`. This separation keeps the standings query O(completed_matches) regardless of event volume.
+
+**Score snapshot written once at completion.** The `live → completed` transition in `matches/repository.go:UpdateWithAudit` was extended to:
+1. Acquire `FOR UPDATE` on the match row (blocks concurrent event inserts).
+2. Fetch the full effective event log under the lock.
+3. Run `scoring.NewScoreEngine().Compute()`.
+4. Validate winner consistency against the computed score.
+5. Write `home_score`, `away_score`, and `status = completed` atomically in one `UPDATE`.
+6. Release the lock on commit.
+
+Because no events can be appended to a non-live match (`ErrMatchNotLive` in `CreateWithAudit`) and the snapshot is taken while the match row is locked against concurrent inserts, the snapshot is permanently consistent with the event log.
+
+**Winner consistency enforced at completion.** `validateWinnerVsScore` in `matches/repository.go` runs inside the completion transaction and enforces:
+- `homeScore > awayScore` → winner must be the home participant → `ErrWinnerScoreMismatch` (HTTP 422) otherwise.
+- `awayScore > homeScore` → winner must be the away participant.
+- Equal scores → winner must be absent (draw).
+- Walkovers are exempt: score is 0-0 by convention; winner is set administratively.
+
+#### Migration Added
+
+| Migration | Change |
+|-----------|--------|
+| `000019_match_score_snapshots` | Adds `matches.home_score INTEGER NOT NULL DEFAULT 0` and `matches.away_score INTEGER NOT NULL DEFAULT 0`. Both default to 0 and are populated exclusively during the completion transition. |
+
+#### New Package: `internal/standings/`
+
+A pure computation package with no DB access, no HTTP types, and no side effects.
+
+| File | Purpose |
+|------|---------|
+| `models.go` | `CompletedMatch`, `RegistrationInfo`, `Settings`, `StandingsRow`, `DefaultSettings()` |
+| `engine.go` | `Compute(matches, registrations, settings) []StandingsRow` — accumulates W/D/L/scores; sorts via tiebreakers; assigns positions |
+| `tiebreakers.go` | `makeLess` (sort comparator), `h2hCompare` (head-to-head), `seedCompare` |
+
+#### Standings Fields
+
+Each `StandingsRow` contains:
+
+| Field | Derivation |
+|-------|-----------|
+| `position` | Rank after full tiebreaker sort (1-indexed, always unique) |
+| `participant_id` | Team or player UUID |
+| `played` | Count of completed matches for this participant |
+| `wins` | Count where `winner_id == participant_id` |
+| `losses` | Count where the other participant won |
+| `draws` | `played - wins - losses` |
+| `points` | `wins×win_pts + draws×draw_pts + close_losses×close_loss_pts + losses×loss_pts` |
+| `score_for` | Sum of this participant's score across completed matches |
+| `score_against` | Sum of opponent's score |
+| `score_difference` | `score_for - score_against` |
+
+All approved registrants appear in standings regardless of matches played (0s across all stats for unplayed registrants).
+
+#### Point System
+
+Read from `tournaments.settings` JSONB. Absent fields use defaults:
+
+| Setting key | Default | Effect |
+|-------------|---------|--------|
+| `win_points` | 3 | Points awarded for a win |
+| `draw_points` | 1 | Points awarded for a draw |
+| `loss_points` | 0 | Points awarded for a loss |
+| `close_margin` | 0 (disabled) | When > 0, losses by ≤ this margin score `close_loss_points` instead |
+| `close_loss_points` | 0 | Points for a close loss (only when `close_margin > 0`) |
+
+Example kabaddi PKL settings: `{"win_points": 5, "draw_points": 3, "loss_points": 0, "close_margin": 5, "close_loss_points": 1}`.
+
+Walkovers always receive `loss_points` — not `close_loss_points` — because a walkover is a forfeit, not a close competitive result.
+
+#### Tiebreaker Chain
+
+Applied by `makeLess` in `internal/standings/tiebreakers.go`. Fully deterministic — no randomness, no ties possible at level 7.
+
+| Priority | Criterion | Direction |
+|----------|-----------|-----------|
+| 1 | Tournament points | DESC |
+| 2 | Head-to-head (2-way ties only) | Points → Score diff → Score for |
+| 3 | Score difference | DESC |
+| 4 | Score for | DESC |
+| 5 | Wins | DESC |
+| 6 | Seed number (`tournament_registrations.seed_number`) | ASC (lower = better); unseeded ranks last |
+| 7 | Registration timestamp (`tournament_registrations.registered_at`) | ASC (earlier = better); always unique |
+
+**N-way head-to-head note:** Head-to-head is restricted to strict 2-way ties (exactly two participants share a point total). Applying h2h to 3+ participants risks a non-transitive comparator (`A beats B, B beats C, C beats A`), which can produce an unstable or non-deterministic sort. Full N-way sub-table resolution is deferred.
+
+#### SQL Queries Added
+
+**`db/queries/matches.sql`:**
+
+| Query | Change |
+|-------|--------|
+| `UpdateMatch` | Gains `home_score` ($18) and `away_score` ($19) parameters. Non-completion transitions pass `0`; the repository fills in computed values for completions before calling this query. |
+| `ListCompletedMatchesByTournament` | Returns completed matches for a tournament scoped by `organization_id` and `tournament_id`. Used exclusively by the standings service. |
+
+**`db/queries/tournament_registrations.sql`:**
+
+| Query | Purpose |
+|-------|---------|
+| `ListApprovedRegistrationsForStandings` | Returns all approved registrations for a tournament ordered by `registered_at ASC`. Scoped by `tournament_id` only (not by org — valid for cross-org tournaments). |
+
+#### Files Modified in Phase 10
+
+| File | Change |
+|------|--------|
+| `db/migrations/000019_match_score_snapshots.{up,down}.sql` | New — adds `home_score`/`away_score` columns |
+| `db/queries/matches.sql` | `UpdateMatch` extended; `ListCompletedMatchesByTournament` added |
+| `db/queries/tournament_registrations.sql` | `ListApprovedRegistrationsForStandings` added |
+| `db/sqlc/matches.sql.go` | Regenerated — `UpdateMatchParams` gains `HomeScore`/`AwayScore`; `ListCompletedMatchesByTournamentRow` added |
+| `db/sqlc/tournament_registrations.sql.go` | Regenerated — `ListApprovedRegistrationsForStandingsRow` added |
+| `db/sqlc/models.go` | Regenerated — `db.Match` gains `HomeScore`/`AwayScore int32` |
+| `internal/matches/errors.go` | `ErrWinnerScoreMismatch` added |
+| `internal/matches/dto.go` | `Response` gains `HomeScore`/`AwayScore int32` |
+| `internal/matches/repository.go` | `updateMatchTxParams` gains `isCompletion`/`isWalkover`; `UpdateWithAudit` performs lock→compute→validate→snapshot for completions; `validateWinnerVsScore` helper added; `matchToAuditJSON` includes scores; `scoring` package imported |
+| `internal/matches/service.go` | Params include `HomeScore`/`AwayScore`; `isCompletion`/`isWalkover` passed to repo; `matchToResponse` includes scores |
+| `internal/matches/handler.go` | `ErrWinnerScoreMismatch` → HTTP 422 in error switch and `errKind` |
+| `internal/tournaments/repository.go` | `GetCompletedMatchesForStandings`/`GetRegistrationsForStandings` added |
+| `internal/tournaments/service.go` | `GetStandings`, `parseStandingsSettings`, `participantID` added; `standings` package imported |
+| `internal/tournaments/dto.go` | `StandingsResponse`, `StandingsRowResponse`, `PointSystemResponse` added |
+| `internal/tournaments/handler.go` | `GetStandings` handler added |
+| `internal/tournaments/routes.go` | `GET /{id}/standings` route registered under `RequireAuth` |
+
+#### Phase 10 Production Hardening Review (adversarial, all PASS)
+
+| Check | Result |
+|-------|--------|
+| Standings correctness (W/D/L/score/points) | **PASS** |
+| Team vs individual tournament attribution | **PASS** |
+| Completed-match-only filtering | **PASS** |
+| Score snapshot integrity | **PASS** |
+| Point system parsing and defaults | **PASS** |
+| Head-to-head correctness (2-way) | **PASS** |
+| N-way h2h non-transitivity safety | **PASS** |
+| Tiebreaker chain determinism | **PASS** |
+| Walkover handling | **PASS** |
+| Multi-tenant isolation | **PASS** |
+| BOLA protection | **PASS** |
+| Concurrency — snapshot race | **PASS** |
+| Concurrency — double completion | **PASS** |
+| Concurrency — standings during completion | **PASS** |
+| Performance (O(matches), no N+1) | **PASS** |
+
+---
+
+### Phase 11 — Media Management (Complete)
+
+Phase 11 implements the full media attachment lifecycle: upload, list, retrieve, update, and delete. Images are validated server-side, normalized to JPEG, and stored with two thumbnail variants in a provider-agnostic object storage backend. All operations are organization-scoped, RBAC-protected, and BOLA-guarded. The module was adversarially reviewed and three correctness defects were identified and resolved before marking the phase production-ready.
+
+#### Architecture
+
+**StorageBackend abstraction.** `internal/media/storage.Backend` is an interface with three methods: `Upload`, `Delete`, and `GetPublicURL`. Two implementations exist:
+
+- `LocalBackend` — writes to the local filesystem (`./uploads/` by default). Intended for development only. A static file server is mounted at `/media/files/*` when the local backend is active.
+- `S3Backend` — speaks the S3 REST API directly using AWS Signature Version 4 signing implemented via Go stdlib (`crypto/hmac`, `crypto/sha256`). No vendor SDK dependency. Compatible with AWS S3, MinIO, Cloudflare R2, and any S3-compatible endpoint via `STORAGE_S3_ENDPOINT` override.
+
+The backend is selected at startup via `STORAGE_BACKEND` env var (`local` or `s3`). The failure mode is a panic at startup — a misconfigured storage backend is a fatal configuration error, not a runtime recoverable.
+
+`storage.GenerateKey(orgID, entityType, entityID, fileUUID, suffix)` produces all storage keys. Keys are UUID-based (`crypto/rand`), org-namespaced, and never derived from user-supplied filenames. `path.Join` normalization removes any `..` components.
+
+**Config additions.** Nine new environment variables in `internal/platform/config/config.go`: `STORAGE_BACKEND`, `STORAGE_LOCAL_PATH`, `STORAGE_LOCAL_BASE_URL`, `STORAGE_S3_ENDPOINT`, `STORAGE_S3_REGION`, `STORAGE_S3_BUCKET`, `STORAGE_S3_ACCESS_KEY`, `STORAGE_S3_SECRET_KEY`, `STORAGE_CDN_BASE_URL`.
+
+#### Image Processing (`internal/media/processor/image.go`)
+
+Every upload passes through the processor before any storage write:
+
+1. `io.ReadAll(src)` — reads the bounded body into memory (capped by `MaxBytesReader` at 10 MB + 64 KB overhead applied in the handler before any read).
+2. `http.DetectContentType(raw[:512])` — magic-byte MIME detection. Never trusts the client-supplied `Content-Type` header. WebP is detected via a supplemental RIFF/WEBP magic-byte check.
+3. Allowlist enforcement — rejects anything not in `{image/jpeg, image/png, image/webp, image/gif}`. SVG is excluded unconditionally.
+4. SHA-256 content hash — computed from raw bytes before any transformation; used for duplicate detection and integrity.
+5. `image.Decode` — full decode (not header-only). `golang.org/x/image/webp` registered as a blank import to handle WebP input. A file that passes MIME detection but fails decode is rejected. Polyglot files are stripped because output is re-encoded from the decoded pixel buffer.
+6. Bilinear resize — two thumbnail variants: 150 px wide (`_sm`) and 400 px wide (`_md`), aspect-ratio-preserving, no upscaling.
+7. `jpeg.Encode(quality=85)` — all variants stored as JPEG. Input format is not preserved.
+
+Thumbnail keys are stored in `metadata.variants` JSONB: `{"full": "…", "sm": "…", "md": "…"}`.
+
+#### Security
+
+- **Organization scoping:** every query includes `AND organization_id = $N`. `GetByID` uses `WHERE id = $1 AND organization_id = $2` — media IDs from other orgs are invisible.
+- **BOLA guard:** `assertOrgOwnership(actorOrgID, orgID)` called in every mutating service method. Platform admins (empty `organizationID`) are exempt.
+- **Entity ownership verification:** before any upload, `assertEntityExists` queries the target entity with org scope. A player, team, or tournament from another org is not found and the upload is rejected. Organization-type uploads require `entity_id == orgID`.
+- **RBAC:** `media.upload` gated at the route level via `RequirePermission`. `media.update` and `media.delete` gated on PATCH and DELETE respectively. GET endpoints require `RequireAuth` only. `scorer` and `viewer` have no media write permissions.
+
+#### Concurrency
+
+**Primary-image race** — `SwapPrimaryWithAudit` (`internal/media/repository.go`):
+- `LockPrimaryMediaAttachment` acquires `SELECT … FOR UPDATE` on the current primary row before any modification. Concurrent swap requests for the same entity serialize at this lock.
+- `uq_media_primary_per_entity` (partial unique index, migration 000020) is the DB-level backstop. Any code path that bypasses the application-layer lock cannot commit two rows with `is_primary = TRUE` for the same entity.
+
+**Duplicate-upload race** — two-layer defense:
+- Application layer: `GetByContentHash` before upload; if found, return existing attachment.
+- DB layer: `uq_media_content_per_entity` (unique index, migration 000021) on `(organization_id, entity_type, entity_id, content_hash)`. If two concurrent requests both pass the application check, the second `INSERT` fails with SQLSTATE 23505. `CreateWithAudit` detects this via `pgutil.IsUniqueViolation` and re-queries to return the existing row. No duplicate record, no 500 error.
+
+#### SQL Queries Added (`db/queries/media.sql`)
+
+| Query | Purpose |
+|-------|---------|
+| `CreateMediaAttachment` | INSERT with RETURNING; unique-violation retry in repository |
+| `UpdateMediaAttachmentMeta` | UPDATE alt_text, sort_order; scoped by id + org |
+| `SetAttachmentAsPrimary` | UPDATE is_primary=TRUE; called inside swap transaction |
+| `UnsetPrimaryForEntity` | UPDATE is_primary=FALSE for all entity attachments; called inside swap transaction |
+| `DeleteMediaAttachment` | DELETE (:execrows — rows-affected returned for zero-row detection) |
+| `GetMediaAttachmentByID` | Org-scoped single row lookup |
+| `GetMediaAttachmentByContentHash` | Duplicate detection query |
+| `LockPrimaryMediaAttachment` | SELECT … FOR UPDATE on current primary |
+| `ListMediaAttachmentsByEntity` | Paginated entity-scoped listing |
+| `CountMediaAttachmentsByEntity` | Count for pagination |
+| `ListAllMediaByOrg` | Org-wide paginated listing |
+| `CountAllMediaByOrg` | Count for org-wide pagination |
+| `MediaCheckPlayerExists` | EXISTS check scoped by org |
+| `MediaCheckTeamExists` | EXISTS check scoped by org |
+| `MediaCheckTournamentExists` | EXISTS check scoped by org |
+
+#### Audit Logging
+
+| Operation | Action | old_data | new_data |
+|-----------|--------|----------|----------|
+| Upload | `create` | — | DB-returned attachment row |
+| Update (metadata) | `update` | Pre-update snapshot | DB-returned row |
+| Primary unset (swap) | `update` | Pre-swap snapshot of old primary | `{id, is_primary: false}` |
+| Primary set (swap) | `update` | Pre-swap snapshot of new attachment (is_primary=false) | DB-returned row (is_primary=true) |
+| Delete | `delete` | Pre-delete snapshot | — |
+
+All audit records are written inside the same transaction as the DB mutation. Storage operations happen outside the transaction after commit.
+
+#### Files Added
+
+| File | Purpose |
+|------|---------|
+| `db/migrations/000020_media_hardening.{up,down}.sql` | storage_key, content_hash, primary uniqueness index, media.update + media.delete permissions |
+| `db/migrations/000021_media_content_uniqueness.{up,down}.sql` | Unique index on (org, entity_type, entity_id, content_hash) |
+| `db/queries/media.sql` | 15 SQL queries |
+| `db/sqlc/media.sql.go` | Generated — 15 query functions |
+| `internal/media/storage/backend.go` | Backend interface, New() factory, GenerateKey() |
+| `internal/media/storage/local.go` | Local filesystem backend |
+| `internal/media/storage/s3.go` | S3-compatible backend (path-style URL, SigV4 inline) |
+| `internal/media/storage/sigv4.go` | AWS Signature V4 signing via stdlib |
+| `internal/media/processor/image.go` | MIME detection, decode, bilinear resize, JPEG encode, SHA-256 hash |
+| `internal/media/errors.go` | Typed domain error sentinels |
+| `internal/media/model.go` | ListParams, VariantsMeta, size constants |
+| `internal/media/dto.go` | UploadRequest, UpdateRequest, Response, ListResponse |
+| `internal/media/repository.go` | All transactional writes including SwapPrimaryWithAudit |
+| `internal/media/service.go` | Upload pipeline, List, GetByID, Update, Delete |
+| `internal/media/handler.go` | HTTP handlers + MaxBytesReader + multipart parsing |
+| `internal/media/routes.go` | RegisterRoutes() + dev static file server |
+
+#### Files Modified
+
+| File | Change |
+|------|--------|
+| `internal/platform/config/config.go` | Added 9 storage configuration fields |
+| `internal/bootstrap/modules.go` | Wired `media.RegisterRoutes`; storage backend constructed at startup |
+| `db/sqlc/models.go` | Regenerated — `MediaAttachment` gains `StorageKey string`, `ContentHash string` |
+| `go.mod` | Added `golang.org/x/image v0.41.0` for WebP decode |
+
+### Phase 11 Hardening — Adversarial Review Defects (All Resolved)
+
+An adversarial production review of the Phase 11 implementation identified three correctness defects. All were resolved before the phase was marked complete.
+
+#### Defect 1 — SwapPrimaryWithAudit Audit Constraint Violation (Critical)
+
+**Problem identified:** `SwapPrimaryWithAudit` wrote the "set new primary" `AuditActionUpdate` record with `old_data = nil`. The `audit_logs` table enforces `chk_audit_update_has_both_snapshots`: `action = 'update'` requires both `old_data IS NOT NULL` and `new_data IS NOT NULL`. Every call to `SwapPrimaryWithAudit` failed with a constraint violation and the transaction was rolled back. Setting `is_primary = true` was permanently non-functional. Both `service.Upload` and `service.Update` silently swallowed the error and returned incorrect responses to clients.
+
+**Fix applied:**
+
+Inside `SwapPrimaryWithAudit` (`internal/media/repository.go`), a new step was inserted between locking the old primary and calling `SetAttachmentAsPrimary`: `qtx.GetMediaAttachmentByID` fetches the new attachment's current state (with `is_primary = false`) within the transaction. This snapshot becomes `old_data` for the second audit record. Both audit records now satisfy the constraint.
+
+In `service.Upload` and `service.Update`, the error from `SwapPrimaryWithAudit` is no longer silently discarded — it is propagated to the caller.
+
+**Review status: PASS.** `is_primary` can now be set successfully. The audit constraint is satisfied. Both callers surface errors rather than misreporting success.
+
+#### Defect 2 — Concurrent Duplicate Upload Race (Moderate)
+
+**Problem identified:** The duplicate-detection flow (`GetByContentHash` → ErrNotFound → proceed) is non-atomic. Two concurrent uploads of the same content to the same entity both observe ErrNotFound before either commits, both proceed through image processing and S3 upload, and both insert rows. No unique constraint prevented the race.
+
+**Fix applied:**
+
+Migration 000021 adds `uq_media_content_per_entity` — a unique index on `(organization_id, entity_type, entity_id, content_hash)`. When the second concurrent INSERT hits this index, the INSERT fails with SQLSTATE 23505. `CreateWithAudit` (`internal/media/repository.go`) detects this via `pgutil.IsUniqueViolation(err, "uq_media_content_per_entity")`, rolls back the failed transaction, and re-queries `GetMediaAttachmentByContentHash` to return the existing row committed by the first request. The caller receives the existing attachment — no 500, no duplicate record.
+
+**Review status: PASS.** Concurrent duplicate uploads produce one record, not two.
+
+#### Defect 3 — Double-Delete Audit Drift (Minor)
+
+**Problem identified:** `DeleteMediaAttachment` was declared `:exec`, which discards rows affected. A second concurrent delete of the same attachment would execute a zero-row DELETE, receive no error, and proceed to write a spurious `AuditActionDelete` record for an entity that no longer existed. The caller received 204, not 404.
+
+**Fix applied:**
+
+`DeleteMediaAttachment` changed from `:exec` to `:execrows` in `db/queries/media.sql`. `sqlc generate` regenerated the function to return `(int64, error)`. `DeleteWithAudit` (`internal/media/repository.go`) now checks `rowsAffected == 0` immediately after the DELETE and returns `ErrNotFound` before the audit INSERT is reached. The transaction rolls back with no audit record written.
+
+**Review status: PASS.** A second concurrent delete returns 404. No spurious audit records are written.
+
+#### Phase 11 Production Hardening Review (adversarial, all PASS)
+
+| Check | Result |
+|-------|--------|
+| Multi-tenant isolation | **PASS** |
+| BOLA protection | **PASS** |
+| Authorization (upload/update/delete/read) | **PASS** |
+| MIME spoofing prevention | **PASS** |
+| Image processing correctness | **PASS** |
+| File size enforcement | **PASS** |
+| Duplicate detection (sequential) | **PASS** |
+| Duplicate detection (concurrent race) | **PASS** |
+| Primary image uniqueness | **PASS** |
+| Concurrent primary swap safety | **PASS** |
+| Storage consistency (S3 drift) | **PASS** |
+| Delete correctness | **PASS** |
+| Double-delete audit safety | **PASS** |
+| Storage key security (path traversal) | **PASS** |
+| Audit logging correctness | **PASS** |
+| Concurrency invariants | **PASS** |
+| Performance | **PASS** |
+
 ---
 
 ### Concurrency Hardening — Registration Capacity
@@ -1075,6 +1448,10 @@ The service-layer guard remains in place as the first line of defence for sequen
 - [x] **Audit logging** — wired into all organization, player, team, tournament, registration, match, and match event mutations
 - [x] **BOLA protection** — enforced in every write service across all implemented modules
 - [x] **Live Scoring engine** — Phase 9 (`internal/scoring/`; `GET /matches/{id}/score`; effective-log derivation; write-time payload validation; all-out inversion; super_raid zero-score protection)
+- [x] **all_out participant validation hardening** — Phase 9 post-review (`ValidateAllOutParticipant`; rejects non-participant `team_id` at write time; ErrInvalidScorePayload HTTP 400)
+- [x] **Score snapshot at completion** — Phase 10 (`matches.home_score`/`away_score` written once inside locked completion transaction; winner consistency enforced; `ErrWinnerScoreMismatch` HTTP 422)
+- [x] **Tournament Standings & Rankings** — Phase 10 (`internal/standings/`; `GET /tournaments/{id}/standings`; 7-level tiebreak chain; point system from `tournaments.settings`; fully deterministic)
+- [x] **Media Management** — Phase 11 (`internal/media/`; upload/list/get/update/delete endpoints; StorageBackend abstraction; local + S3-compatible backends; server-side MIME detection + image decode + JPEG normalize + thumbnail generation; content-hash duplicate detection; primary-image swap with FOR UPDATE lock + unique-index backstop; adversarial review: all 17 checks PASS)
 
 ### Must-have before first production deployment
 
@@ -1088,10 +1465,8 @@ The service-layer guard remains in place as the first line of defence for sequen
 ### Required for feature completeness
 
 - [ ] **Users module** — User management: list, get, update profile, change password, deactivate.
-- [ ] **Live Score snapshots at completion** — Phase 9 derives live scores on read; the architecture review approved snapshotting the final score into `matches.home_score`/`away_score` at match completion to support standings queries without per-match event aggregation. Not implemented yet — required for Phase 10 standings.
-- [ ] **Rankings module** — Computed standings; depends on match and match events modules. Phase 10.
-- [ ] **Media module** — File upload coordination, `media_attachments` CRUD, storage backend integration. Phase 11.
 - [ ] **News module** — Stub exists; no business logic.
+- [ ] **N-way head-to-head resolution** — Phase 10 standings apply head-to-head only to strict 2-way ties. Full sub-table resolution for 3+ tied participants is deferred. When exactly N>2 participants share the same points, tiebreaking falls through to score difference (criterion 3).
 
 ### Technical debt
 
@@ -1124,8 +1499,8 @@ The service-layer guard remains in place as the first line of defence for sequen
 | Phase 8A | Matches | **COMPLETE** |
 | Phase 8B | Match Events | **COMPLETE** |
 | Phase 9 | Live Scoring | **COMPLETE** |
-| Phase 10 | Rankings & Standings | NOT STARTED |
-| Phase 11 | Media | NOT STARTED |
+| Phase 10 | Rankings & Standings | **COMPLETE** |
+| Phase 11 | Media Management | **COMPLETE** |
 | Phase 12 | Notifications | NOT STARTED |
 | Phase 13 | Hardening, Observability & Tests | NOT STARTED |
 
@@ -1137,19 +1512,15 @@ Stateless scoring engine in `internal/scoring/`. Score derived on read from the 
 
 ---
 
-### Phase 10 — Rankings & Standings
+### Phase 10 — Rankings & Standings (Complete)
 
-**Goal:** org dashboards show computed team and player standings.
-
-1. **Rankings computation** — derive standings from completed match results per tournament format.
-2. **Cache strategy** — rankings are expensive to compute; cache aggressively; invalidate on match completion.
+Tournament-scoped standings derived from snapshotted match scores. Pure computation package (`internal/standings/`) with no DB access. Score snapshot written once at `live → completed` transition under `FOR UPDATE` lock (`matches.home_score`/`away_score`, migration 000019). Standings endpoint `GET /tournaments/{id}/standings` reads snapshotted scores only — never `match_events`. Full 7-level tiebreak chain including head-to-head for strict 2-way ties. Point system configurable via `tournaments.settings` JSONB; defaults to 3/1/0. All 15 adversarial review checks passed.
 
 ---
 
-### Phase 11 — Media
+### Phase 11 — Media Management (Complete)
 
-1. **`media_attachments` CRUD** — finalize polymorphic attachment management; wire to object storage backend (S3, GCS, or local).
-2. **Primary attachment swaps** — atomic swap using a single UPDATE; `is_primary` uniqueness enforced at application layer.
+Full media attachment lifecycle implemented and production-hardened. Upload pipeline: server-side MIME detection → image decode validation → bilinear resize → JPEG normalization → three-variant S3 upload (full, 150 px, 400 px) → DB row + audit log. StorageBackend abstraction supports local filesystem (development) and any S3-compatible service (production) via inline SigV4 signing. Adversarial review identified three defects; all resolved before phase marked complete. All 17 adversarial review checks PASS.
 
 ---
 
@@ -1172,17 +1543,17 @@ Stateless scoring engine in `internal/scoring/`. Score derived on read from the 
 
 ## 10. Next Recommended Phase
 
-**Phase 10 — Rankings & Standings**
+**Phase 12 — Notifications**
 
-Phase 9 (Live Scoring) is complete and production-hardened. The scoring engine can derive home and away scores for any match on demand. The next step is implementing standings — aggregating completed match results across a tournament to produce wins, losses, draws, and points tables. Phase 10 depends directly on the Phase 9 scoring engine and the Phase 8A `winner_team_id` / `winner_player_id` match completion model.
+Phase 11 (Media Management) is complete and production-hardened. The media module implements the full upload lifecycle with server-side MIME validation, JPEG normalization, thumbnail generation, and a provider-agnostic storage backend. All 17 adversarial review checks passed after three identified defects were resolved. The next step is the notifications module.
 
 **Planning goals:**
 
-- Final score snapshot at match completion — write `home_score`/`away_score` to `matches` inside the `live → completed` transition (the architecture review approved this denormalization for standings efficiency)
-- Tournament standings endpoint — compute league table from completed matches per tournament
-- Standings model — wins, losses, draws, points for/against, point difference, head-to-head tiebreakers
-- Format-specific rules — different computation for `league` vs `knockout` vs `group_knockout` formats (configured via `tournaments.settings` JSONB)
-- Player statistics — aggregate raid, tackle, and point stats per player from the event log
+- Event-driven notification delivery triggered by domain events: match status transitions, tournament registration approvals, score milestones.
+- Notification delivery channels to design: in-app (DB-persisted), email (transactional via SMTP or SendGrid), webhook (org-configurable).
+- A `notifications` table scoped by `organization_id` and `user_id` with read/unread state and a `payload` JSONB column for channel-specific metadata.
+- A notification preference model — per-user, per-org, per-event-type opt-in/out.
+- All notification writes must be transactional with the domain event that triggered them (or queued atomically if async delivery is introduced).
 
 ---
 
@@ -1206,13 +1577,26 @@ Phase 9 (Live Scoring) is complete and production-hardened. The scoring engine c
 | `backend/internal/match_events/repository.go` | `CreateWithAudit` — FOR UPDATE lock, sequence computation, all in-transaction validation |
 | `backend/internal/scoring/engine.go` | `ScoreEngine.Compute` — pure stateless score derivation; entry point for Phase 9+ scoring |
 | `backend/internal/scoring/rules.go` | Kabaddi scoring rules: `participantSide`, `allOutScore`, `payloadPoints` |
-| `backend/internal/scoring/validation.go` | `ValidateScoreEventPayload` — write-time payload guard for scoring event types |
+| `backend/internal/scoring/validation.go` | `ValidateScoreEventPayload` + `ValidateAllOutParticipant` — write-time payload guards |
+| `backend/internal/standings/engine.go` | `standings.Compute` — pure standings derivation from completed match snapshots; no DB access |
+| `backend/internal/standings/tiebreakers.go` | Full 7-level tiebreak comparator; head-to-head for strict 2-way ties |
+| `backend/internal/tournaments/service.go` | `GetStandings` — orchestrates standings derivation; `parseStandingsSettings` reads point values from JSONB |
+| `backend/db/migrations/000019_match_score_snapshots.up.sql` | Adds `home_score`/`away_score` to `matches`; immutability contract documented in comments |
 | `backend/internal/bootstrap/modules.go` | Single place to register new domain modules |
 | `backend/internal/platform/pgutil/pgutil.go` | Shared UUID and constraint helpers used by all domain repositories |
 | `backend/internal/platform/validator/validator.go` | JSON decode + struct-tag validation (no external deps) |
 | `backend/sqlc.yaml` | sqlc configuration |
 | `backend/go.mod` | Module definition and direct dependencies |
+| `backend/internal/media/repository.go` | `CreateWithAudit` (with duplicate-detection retry), `SwapPrimaryWithAudit` (FOR UPDATE + pre-swap snapshot), `DeleteWithAudit` (rows-affected guard) |
+| `backend/internal/media/service.go` | Upload pipeline orchestration; BOLA guard; entity ownership verification; storage + DB sequencing |
+| `backend/internal/media/storage/backend.go` | `Backend` interface; `New()` factory; `GenerateKey()` |
+| `backend/internal/media/storage/s3.go` | S3-compatible backend; path-style URL; SigV4 signed PUT and DELETE |
+| `backend/internal/media/storage/sigv4.go` | AWS Signature V4 implementation using stdlib only |
+| `backend/internal/media/processor/image.go` | MIME detection; image decode; bilinear resize; JPEG encode; SHA-256 content hash |
+| `backend/db/migrations/000020_media_hardening.up.sql` | storage_key, content_hash, primary uniqueness index, media.update + media.delete RBAC |
+| `backend/db/migrations/000021_media_content_uniqueness.up.sql` | Unique index preventing concurrent duplicate upload records |
+| `backend/db/queries/media.sql` | 15 media SQL queries including :execrows delete |
 
 ---
 
-*This document was last updated on 2026-06-01 (Phase 9 complete). It should be updated whenever a phase is completed or significant architectural changes are made.*
+*This document was last updated on 2026-06-02 (Phase 11 complete). It should be updated whenever a phase is completed or significant architectural changes are made.*

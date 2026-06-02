@@ -11,6 +11,8 @@ import (
 	"github.com/4yushraman-jpg/playarena/internal/health"
 	"github.com/4yushraman-jpg/playarena/internal/match_events"
 	"github.com/4yushraman-jpg/playarena/internal/matches"
+	"github.com/4yushraman-jpg/playarena/internal/media"
+	mediastorage "github.com/4yushraman-jpg/playarena/internal/media/storage"
 	"github.com/4yushraman-jpg/playarena/internal/organizations"
 	"github.com/4yushraman-jpg/playarena/internal/platform/config"
 	"github.com/4yushraman-jpg/playarena/internal/players"
@@ -36,4 +38,16 @@ func registerModules(r chi.Router, pool *pgxpool.Pool, log *slog.Logger, cfg *co
 	tournament_registrations.RegisterRoutes(r, pool, cfg, log, authz)
 	matches.RegisterRoutes(r, pool, cfg, log, authz)
 	match_events.RegisterRoutes(r, pool, cfg, log, authz)
+
+	// Media — storage backend constructed here so it is shared across requests.
+	// Construction fails fast at startup if the configuration is invalid.
+	mediaBackend, err := mediastorage.New(cfg)
+	if err != nil {
+		log.Error("bootstrap: failed to initialise media storage backend",
+			slog.String("backend", cfg.StorageBackend),
+			slog.Any("error", err),
+		)
+		panic("media storage backend initialisation failed: " + err.Error())
+	}
+	media.RegisterRoutes(r, pool, cfg, log, authz, mediaBackend)
 }

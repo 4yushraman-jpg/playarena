@@ -967,6 +967,10 @@ type MediaAttachment struct {
 	Metadata  []byte             `json:"metadata"`
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+	// Canonical object path in the storage backend (e.g. S3 key). Source of truth — independent of CDN domain. file_url is derived from storage_key + the configured CDN base URL at insert time. When the CDN changes, update file_url from this column — not the reverse.
+	StorageKey string `json:"storage_key"`
+	// SHA-256 hex digest of the raw uploaded file bytes, computed before any processing. Used for duplicate detection: if (entity_type, entity_id, content_hash) already exists, the existing attachment is returned instead of creating a duplicate. Also used for integrity verification.
+	ContentHash string `json:"content_hash"`
 }
 
 // Root multi-tenant entity. Every business-domain table carries organization_id as a FK. Deleting an organization cascades to all child records. Super-admin users exist outside any organization via platform-scoped roles.

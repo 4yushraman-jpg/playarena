@@ -21,6 +21,33 @@ type Config struct {
 	DatabaseURL string
 	// JWTSecret is the HMAC key used to sign and verify JWT tokens.
 	JWTSecret string
+
+	// ── Storage (Phase 11) ───────────────────────────────────────────────────
+
+	// StorageBackend selects the storage implementation: "local" (default for
+	// development) or "s3" (production).
+	StorageBackend string
+	// StorageLocalPath is the filesystem directory for local storage.
+	// Defaults to "./uploads" when empty.
+	StorageLocalPath string
+	// StorageLocalBaseURL is the URL prefix used to serve local files, e.g.
+	// "http://localhost:8080/media/files". Defaults to that value when empty.
+	StorageLocalBaseURL string
+	// StorageS3Endpoint is the S3-compatible API base URL, e.g.
+	// "https://s3.us-east-1.amazonaws.com" or a MinIO / Cloudflare R2 URL.
+	// When empty the AWS standard endpoint is derived from StorageS3Region.
+	StorageS3Endpoint string
+	// StorageS3Region is the AWS region or equivalent (e.g. "us-east-1").
+	StorageS3Region string
+	// StorageS3Bucket is the S3 bucket name.
+	StorageS3Bucket string
+	// StorageS3AccessKey is the access key ID for S3 authentication.
+	StorageS3AccessKey string
+	// StorageS3SecretKey is the secret access key for S3 authentication.
+	StorageS3SecretKey string
+	// StorageCDNBaseURL is the public CDN URL prefix, e.g.
+	// "https://cdn.playarena.com". file_url = StorageCDNBaseURL + "/" + key.
+	StorageCDNBaseURL string
 }
 
 // Load reads configuration from environment variables and returns a validated Config.
@@ -54,6 +81,16 @@ func Load() (*Config, error) {
 		AppPort:     port,
 		DatabaseURL: os.Getenv("DATABASE_URL"),
 		JWTSecret:   os.Getenv("JWT_SECRET"),
+
+		StorageBackend:      getEnv("STORAGE_BACKEND", "local"),
+		StorageLocalPath:    getEnv("STORAGE_LOCAL_PATH", "./uploads"),
+		StorageLocalBaseURL: getEnv("STORAGE_LOCAL_BASE_URL", ""),
+		StorageS3Endpoint:   os.Getenv("STORAGE_S3_ENDPOINT"),
+		StorageS3Region:     getEnv("STORAGE_S3_REGION", "us-east-1"),
+		StorageS3Bucket:     os.Getenv("STORAGE_S3_BUCKET"),
+		StorageS3AccessKey:  os.Getenv("STORAGE_S3_ACCESS_KEY"),
+		StorageS3SecretKey:  os.Getenv("STORAGE_S3_SECRET_KEY"),
+		StorageCDNBaseURL:   os.Getenv("STORAGE_CDN_BASE_URL"),
 	}
 
 	if err := cfg.validate(); err != nil {
