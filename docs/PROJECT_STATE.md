@@ -5,7 +5,7 @@
 **Migrations applied:** 000001 – 000024  
 **Go version:** 1.25.6  
 **Database:** PostgreSQL 17  
-**Phases complete:** 1 – 12, Auth Security Hotfix v2, Phase 13A
+**Phases complete:** 1 – 12, Auth Security Hotfix v2, Phase 13A, Phase 13B.1
 
 ---
 
@@ -36,11 +36,11 @@
 backend/
 ├── cmd/api/main.go                         Entry point — config, DB pool, HTTP server, graceful shutdown
 ├── db/
-│   ├── migrations/                         golang-migrate files (000001–000022, up + down)
+│   ├── migrations/                         golang-migrate files (000001–000024, up + down); embed.go exports FS for test runners
 │   ├── queries/                            Hand-written SQL (sqlc source)
 │   └── sqlc/                              Generated type-safe Go — never edited by hand
 ├── internal/
-│   ├── auth/                               Auth domain (fully implemented)
+│   ├── auth/                               Auth domain (fully implemented + integration-tested)
 │   │   ├── authorization.go               AuthorizationService — HasRole(), HasPermission()
 │   │   ├── errors.go                      Typed domain error sentinels
 │   │   ├── tokens.go                      JWT generation + validation + refresh token helpers
@@ -51,7 +51,10 @@ backend/
 │   │   ├── service.go                     Business logic — login, refresh, logout, register, verify, me
 │   │   ├── middleware.go                  RequireAuth(), RequireRole(), RequirePermission() chi middleware
 │   │   ├── handler.go                     HTTP handlers + error-to-status mapping + logging
-│   │   └── routes.go                      RegisterRoutes() — mounts /api/v1/auth subtree
+│   │   ├── routes.go                      RegisterRoutes() — mounts /api/v1/auth subtree
+│   │   ├── testmain_test.go               TestMain — per-package testcontainer lifecycle
+│   │   ├── repository_test.go             RevokeAndLinkSuccessor invariant test
+│   │   └── concurrency_test.go            7 auth concurrency tests (barrier synchronization)
 │   ├── health/                             Health check (fully implemented)
 │   ├── organizations/                      Organizations domain (fully implemented)
 │   │   ├── errors.go
@@ -142,6 +145,11 @@ backend/
 │   │   ├── routes.go                      RegisterRoutes() — mounts /api/v1/organizations/{slug}/notifications
 │   │   └── trigger/
 │   │       └── trigger.go                 WriteOutboxEntry — writes notification_outbox rows inside domain transactions
+│   ├── testutil/                           Shared integration-test infrastructure (Phase 13B.1)
+│   │   ├── container.go                   SetupTestDB — postgres:17-alpine container, migrations, pool; Docker-skip logic
+│   │   └── fixtures/
+│   │       └── auth.go                    CreateActiveUser, CreateRefreshToken, CreatePasswordResetToken,
+│   │                                      CreateExpiredPasswordResetToken, CleanupUser, HashToken
 │   ├── bootstrap/
 │   │   ├── app.go                         App struct (Config, DB, Log) — composition root
 │   │   ├── router.go                      Builds chi router + global middleware stack
@@ -1816,6 +1824,131 @@ Two low-severity findings documented:
 
 ---
 
+### Phase 13B.1 — Test Infrastructure & Deferred Fixes (Complete)
+
+**Status: COMPLETE. Adversarial review: PASS. Production readiness: PASS.**
+
+Phase 13B.1 delivered the testcontainers-based integration-test infrastructure for the auth package and resolved two low-severity findings deferred from Phase 13A.
+
+#### Deferred Fix 1 — Password Reset Deadlock
+
+**Problem (Phase 13A finding):** `ResetPasswordTransaction` locked one token row via `GetPasswordResetTokenByHashForUpdate`, then called `UseAllUserPasswordResetTokens` which needed to UPDATE all sibling rows for the user. Two concurrent reset attempts each holding a different token could create a lock cycle: T1 held token A waiting for B; T2 held token B waiting for A → PostgreSQL deadlock.
+
+**Fix:** Added `LockUserPasswordResetTokens :many` query:
+
+```sql
+SELECT * FROM password_reset_tokens
+WHERE  user_id = $1
+  AND  used_at IS NULL
+ORDER BY id
+FOR UPDATE;
+```
+
+`ResetPasswordTransaction` was rewritten with the following sequence:
+
+1. Non-locking pre-fetch (`GetPasswordResetTokenByHash`) to obtain `user_id` and `token.ID`.
+2. `BEGIN`.
+3. `LockUserPasswordResetTokens(userID)` — locks all outstanding tokens for the user in ascending `id` order. Both concurrent callers attempt locks in the same sequence; one blocks on the first row instead of both blocking on each other's row.
+4. Find target token by ID in the locked set. Not found → `ErrResetTokenUsed` (consumed between steps 1 and 3).
+5. Validate `expires_at > NOW()`. Expired → `ErrResetTokenExpired` (ROLLBACK; sibling tokens remain available).
+6. `UsePasswordResetToken` + `UseAllUserPasswordResetTokens` → mark all outstanding tokens used.
+7. `UpdateUserPasswordHash`, `RevokeUserRefreshTokens`, `CreateAuditLog`.
+8. `COMMIT`.
+
+**Review:** Lock ordering is deterministic on UUIDs (PostgreSQL sorts UUIDs consistently). No cycle is possible. `TestConcurrentResetDifferentTokens` is the regression test: a deadlock error is not `ErrResetTokenUsed`, so the test fails if deadlock reappears.
+
+#### Deferred Fix 2 — Forgot-Password Timing Equalization
+
+**Problem (Phase 13A finding):** The "email not found" path in `ForgotPassword` returned `genericResp` after only one failed DB read, several milliseconds faster than the "email found + success" path (which completed a `BEGIN / INSERT / INSERT / COMMIT` transaction). A persistent adversary could enumerate registered addresses by measuring response latency.
+
+**Fix:** `equalizeEnumerationTiming()` — an auth-specific private method on `Repository`:
+
+```
+BEGIN
+SELECT 1
+SELECT NOW()
+COMMIT
+```
+
+This matches the round-trip profile of `ForgotPasswordTransaction` (4 round-trips each), eliminating the measurable latency gap under normal DB operation. Two query slots are used rather than one to match the two-write profile of the real transaction. The method is called on both the email-not-found path and the `ForgotPasswordTransaction` internal-error path. Errors are intentionally swallowed (correct fail-open behavior for a timing measure).
+
+**Known low-severity residual:** The `ForgotPasswordTransaction` error path calls `equalizeEnumerationTiming` after the partial transaction has already consumed ≥ 1 round-trip, making its total response time ≥ 6 round-trips vs. the success path's 5. This timing difference is only observable when the DB is actively failing (not under attacker control) and is accepted as a low-severity residual. Does not block production readiness.
+
+#### Test Infrastructure
+
+**New package `internal/testutil/`:**
+
+- `SetupTestDB(m *testing.M)` starts a `postgres:17-alpine` container via testcontainers-go, applies all migrations using golang-migrate + `iofs` source (embedded via `db/migrations/embed.go`) + pgx/v5 driver, creates a `pgxpool.Pool`, and returns a teardown function.
+- Docker-unavailable policy: `INTEGRATION_SKIP_IF_DOCKER_UNAVAILABLE=true` → exit 0 (local dev skip). Env var absent → `log.Fatal` (CI pipeline fails loudly with zero tests run).
+
+**New package `internal/testutil/fixtures/`:**
+
+Typed helpers for UUID-scoped fixture creation with explicit `t.Cleanup` teardown. No transaction-per-test (repository code calls `pool.Begin()` internally and must observe its own writes).
+
+| Helper | Purpose |
+|--------|---------|
+| `CreateActiveUser` | Inserts user with `status=active`; random email/username; bcrypt cost 4 for speed |
+| `CreateRefreshToken` | Inserts un-revoked refresh token; returns raw value + db row |
+| `CreatePasswordResetToken` | Inserts valid (unused, 1-hour expiry) reset token; returns raw value |
+| `CreateExpiredPasswordResetToken` | Raw INSERT back-dating both `created_at` and `expires_at` to satisfy `CHECK (expires_at > created_at)` while producing an already-expired token |
+| `CleanupUser` | `DELETE FROM users WHERE id = $1`; CASCADE removes all auth rows |
+| `HashToken` | SHA-256 hex helper matching `auth.HashTokenForStorage`; avoids import cycle |
+
+**`db/migrations/embed.go`:** Exports `migrations.FS embed.FS` via `//go:embed *.sql` for the test runner. Not imported by the production binary.
+
+#### Auth Concurrency Tests (`internal/auth/`)
+
+All tests use `close(chan struct{})` barrier synchronization. No `time.Sleep`.
+
+| Test | What it verifies |
+|------|-----------------|
+| `TestConcurrentRefreshSameToken` | 8 goroutines rotate the same token; exactly 1 succeeds; rest return `ErrInvalidToken` (Case 2) |
+| `TestReplayRotatedToken` | Re-presenting a rotated token returns `ErrInvalidToken` without wiping sessions |
+| `TestReplayRevokedToken` | Re-presenting a logout-revoked token returns `ErrTokenReuse`; all sibling sessions wiped |
+| `TestConcurrentLogoutAndRefresh` | Simultaneous logout + rotation; token always ends up revoked; no panics |
+| `TestConcurrentResetSameToken` | 6 goroutines consume the same reset token; exactly 1 succeeds; rest return `ErrResetTokenUsed` |
+| `TestConcurrentResetDifferentTokens` | Two goroutines present different tokens for the same user; exactly 1 succeeds; loser gets `ErrResetTokenUsed` not a deadlock error (deadlock regression test) |
+| `TestConcurrentResetExpiredAndValidToken` | Expired + valid tokens for the same user submitted concurrently; valid always succeeds; expired always fails with `ErrResetTokenExpired` or `ErrResetTokenUsed` depending on lock order |
+| `TestRevokeAndLinkSuccessorInvariant` | After rotation: old token has `revoked_at IS NOT NULL` and `successor_id = new.ID`; new token has both NULL (active) |
+
+#### Files Changed (Phase 13B.1)
+
+| File | Change |
+|------|--------|
+| `db/queries/password_reset_tokens.sql` | Added `GetPasswordResetTokenByHash :one` (non-locking pre-fetch) and `LockUserPasswordResetTokens :many` (ORDER BY id FOR UPDATE) |
+| `db/sqlc/password_reset_tokens.sql.go` | Regenerated — two new query functions |
+| `db/migrations/embed.go` | New — exports `migrations.FS` for test runners |
+| `internal/auth/repository.go` | `ResetPasswordTransaction` rewritten (deterministic lock order); `equalizeEnumerationTiming` added |
+| `internal/auth/service.go` | `ForgotPassword` calls `equalizeEnumerationTiming` on email-not-found and `ForgotPasswordTransaction` error paths |
+| `internal/auth/testmain_test.go` | New — `TestMain` with per-package container lifecycle |
+| `internal/auth/repository_test.go` | New — `TestRevokeAndLinkSuccessorInvariant` |
+| `internal/auth/concurrency_test.go` | New — 7 concurrency tests |
+| `internal/testutil/container.go` | New — `SetupTestDB` |
+| `internal/testutil/fixtures/auth.go` | New — typed fixture helpers |
+| `go.mod` / `go.sum` | Added `testcontainers-go v0.42.0`, `testcontainers-go/modules/postgres`, `golang-migrate/migrate/v4 v4.19.1` |
+
+#### Phase 13B.1 Adversarial Review Results
+
+| Check | Result |
+|-------|--------|
+| Password-reset deadlock fix | **PASS** |
+| Lock ordering correctness (UUID ORDER BY determinism) | **PASS** |
+| Concurrent reset requests (same token, different tokens) | **PASS** |
+| Concurrent reset-token consumption | **PASS** |
+| Refresh-token invariant test coverage | **PASS** |
+| Timing equalization (not-found and success paths) | **PASS** |
+| Timing equalization (transaction-error path) | **PASS with note** — path is equalized but over-compensated; see known residual below |
+| Testcontainers lifecycle | **PASS** |
+| Migration runner correctness | **PASS** |
+| Fixture cleanup isolation | **PASS** |
+| Concurrency test validity | **PASS** |
+
+**Known low-severity residual (does not block production readiness):**
+
+The `ForgotPasswordTransaction` internal-error path calls `equalizeEnumerationTiming` after the partial transaction has already consumed at least one DB round-trip, making its response consistently longer than the success path. This timing difference is only observable when the database is actively failing — a condition that is not adversarially controllable and that elevates latency globally. Future hardening candidate.
+
+---
+
 ### Concurrency Hardening — Registration Capacity
 
 A code review identified a TOCTOU (Time of Check to Time of Use) race condition in the original capacity enforcement:
@@ -1900,6 +2033,7 @@ The CAS is strictly stronger than the NOT IN guard: it rejects any concurrent tr
 - [x] **Notifications module** — Phase 12 (Transactional Outbox Pattern; `notification_outbox`/`notifications`/`notification_preferences` tables; 7 API endpoints; in-app delivery via synchronous post-commit DrainOutbox with FOR UPDATE SKIP LOCKED; drain idempotency via UNIQUE(outbox_id,user_id,channel); match CAS upgrade; batch preference loading — O(event types) queries not O(members); adversarial review: 2 defects identified and resolved; all 13 checks PASS)
 - [x] **Auth Security Hotfix v2** — Replaced time-window refresh-token replay detection with deterministic structural state machine; `successor_id UUID NULL` column on `refresh_tokens` (migration 000023); `RevokeAndLinkSuccessor :execrows` query; removed `rotationWindow` constant and all `time.Since(...)` logic; `RotateRefreshToken` rewritten with 3-case state machine; rows-affected invariant enforced; adversarial review: all 10 checks PASS; no defects introduced
 - [x] **Phase 13A — Security & Production Blockers** — Password reset flow (`POST /forgot-password` / `POST /reset-password`; migration 000024; single-use `FOR UPDATE` transaction; atomic sibling-token invalidation; full session revocation; audit logging); per-IP rate limiting (`golang.org/x/time/rate`; configurable RPS + burst; background cleanup; 429 on exhaustion); CORS wired (`Access-Control-Allow-Credentials`, `Vary: Origin`; wildcard-only mode disables credentials); cleanup scheduler (`internal/cleanup/`; hourly by default; graceful shutdown via done channel); logout race fixed (`LogoutTransaction` with FOR UPDATE); suspension race fixed (user status re-checked inside `RotateRefreshToken` transaction); adversarial review: all 12 checks PASS; two low-severity findings documented
+- [x] **Phase 13B.1 — Test Infrastructure & Deferred Fixes** — testcontainers-go integration-test infrastructure (`internal/testutil/`); per-package `postgres:17-alpine` container; golang-migrate + embedded migrations; UUID-scoped fixtures with `t.Cleanup` isolation (`internal/testutil/fixtures/`); password-reset deadlock fixed via `LockUserPasswordResetTokens ORDER BY id FOR UPDATE` (deterministic lock order eliminates concurrent same-user reset cycle); forgot-password timing equalization strengthened (`equalizeEnumerationTiming` — 4-round-trip profile matching `ForgotPasswordTransaction`, called on email-not-found and transaction-error paths); 8 auth concurrency tests covering refresh replay, logout race, reset deadlock regression, and `RevokeAndLinkSuccessor` invariant; adversarial review: all 11 checks PASS; one low-severity residual documented (transaction-error path over-compensated, does not block production readiness)
 
 ### Previously tracked auth hardening items (resolved in Phase 13A)
 
@@ -1924,7 +2058,8 @@ The CAS is strictly stronger than the NOT IN guard: it rejects any concurrent tr
 ### Technical debt
 
 - [ ] **`golang-jwt/jwt/v5` declared `indirect` in `go.mod`.** Running `go mod tidy` will correct this.
-- [ ] **No test files exist anywhere.** Zero tests across the entire project. Integration tests against a real PostgreSQL instance (testcontainers or Docker Compose) and unit tests for the auth service, validator, and tenant-isolation rules are the minimum needed before production.
+- [x] **Auth integration test infrastructure** — `internal/testutil/` (testcontainers-go + golang-migrate + pgxpool); `internal/testutil/fixtures/` (typed auth fixtures); 8 concurrency tests in `internal/auth/`. Phase 13B.1.
+- [ ] **Integration tests for non-auth domains** — multi-tenant isolation, tournament registration rules, match lifecycle and concurrency invariants, match event sequence integrity, notification drain correctness. Deferred to Phase 13B.2+.
 - [ ] **`internal/platform/middleware/auth.go`** contains only a placeholder comment. Can be removed or used to re-export `auth.RequireAuth`.
 - [ ] **`internal/bootstrap/database.go`** is a stub. Can be removed or used for DB-level bootstrap helpers.
 - [ ] **`internal/platform/cache/redis.go`** is a stub. No Redis dependency in `go.mod`. Delete if Redis is not planned.
@@ -1957,7 +2092,8 @@ The CAS is strictly stronger than the NOT IN guard: it rejects any concurrent tr
 | Phase 12 | Notifications | **COMPLETE** |
 | Auth Security Hotfix v2 | Refresh token replay redesign — structural state machine | **COMPLETE** |
 | Phase 13A | Security & Production Blockers | **COMPLETE** |
-| Phase 13B | Observability & Tests | NOT STARTED |
+| Phase 13B.1 | Test Infrastructure & Deferred Fixes | **COMPLETE** |
+| Phase 13B.2 | Auth Integration Tests (lifecycle, rate limiting, replay) | NOT STARTED |
 
 ---
 
@@ -2002,33 +2138,45 @@ New config fields: `CORS_ALLOWED_ORIGINS`, `RATE_LIMIT_ENABLED`, `RATE_LIMIT_AUT
 
 ---
 
-### Phase 13B — Observability & Tests
+### Phase 13B.1 — Test Infrastructure & Deferred Fixes (Complete)
 
-1. **Test suite** — integration tests using `testcontainers-go` against a real PostgreSQL 17 instance. Priority: auth service (replay state machine, concurrent refresh, logout race), multi-tenant isolation, tournament registration rules, match lifecycle and concurrency invariants, match event sequence integrity, notification drain correctness.
-2. **OpenTelemetry tracing** — instrument repository and service layers.
-3. **Prometheus metrics** — request latency histograms, DB pool stats, active sessions counter.
-4. **`go mod tidy`** — move `golang-jwt/jwt/v5` from `indirect` to direct.
+testcontainers-go integration infrastructure for the auth package; password-reset deadlock fix; forgot-password timing equalization strengthened to 4-round-trip profile; 8 auth concurrency tests. All deferred Phase 13A low-severity findings resolved. Adversarial review: all 11 checks PASS.
+
+New dependencies: `testcontainers-go v0.42.0`, `testcontainers-go/modules/postgres v0.42.0`, `golang-migrate/migrate/v4 v4.19.1`.  
+New packages: `internal/testutil/`, `internal/testutil/fixtures/`.  
+New file: `db/migrations/embed.go`.
+
+---
+
+### Phase 13B.2 — Auth Integration Tests
+
+Planned scope:
+
+1. **Refresh-token lifecycle tests** — issue, rotate, expire, replay (all three state-machine cases).
+2. **Password-reset lifecycle tests** — request, consume, expire, replay, concurrent consume.
+3. **Email-verification lifecycle tests** — register, verify, double-verify.
+4. **Logout / logout-all tests** — single session revocation; full session wipe.
+5. **Suspension tests** — blocked login, blocked refresh mid-flight.
+6. **Rate-limiter tests** — 429 on exhaustion; recovery after window.
+7. **Replay-detection tests** — Case 2 (rotated token) and Case 3 (explicitly revoked) at the service layer.
 
 ---
 
 ## 10. Next Recommended Phase
 
-**Phase 13B — Observability & Tests**
+**Phase 13B.2 — Auth Integration Tests**
 
-Phase 13A (Security & Production Blockers) is complete. All pre-production deployment blockers have been resolved. The auth module now has: structural replay detection (Hotfix v2), password reset, per-IP rate limiting, CORS with credentials support, a background cleanup scheduler, and both auth race conditions closed. Adversarial review of Phase 13A produced all 12 PASS verdicts.
+Phase 13B.1 (Test Infrastructure & Deferred Fixes) is complete. The testcontainers-go infrastructure is in place, both Phase 13A deferred findings are resolved, and 8 auth concurrency tests are passing against a real PostgreSQL 17 instance. The test infrastructure is reusable by any future domain package.
 
-**The system is now functionally production-deployable.** Phase 13B adds observability and a test safety net before handling real user traffic at scale.
+**Phase 13B.2 goals:**
 
-**Phase 13B goals:**
-
-1. **Integration test suite** — `testcontainers-go` against real PostgreSQL 17. Priority: auth service (replay state machine, concurrent refresh, logout race, password reset concurrency), multi-tenant isolation, tournament registration rules, match lifecycle and concurrency invariants, match event sequence integrity, notification drain correctness.
-2. **OpenTelemetry tracing** — instrument repository and service layers; trace spans per DB transaction.
-3. **Prometheus metrics** — request latency histograms, DB pool stats, active sessions counter, rate-limit reject counter.
-4. **`go mod tidy`** — promote `golang-jwt/jwt/v5` and `golang.org/x/time` from `indirect` to direct.
-
-**Two low-severity findings from Phase 13A deferred to Phase 13B:**
-- Concurrent same-user reset token deadlock — acquire locks in deterministic order inside `ResetPasswordTransaction`.
-- Timing side-channel in `ForgotPassword` — equalise response time with a dummy transaction when the email is not found.
+1. **Refresh-token lifecycle tests** — issue, rotate, expire, replay against all three state-machine cases (active / rotated / explicitly revoked).
+2. **Password-reset lifecycle tests** — request, consume, expire, replay, concurrent consume.
+3. **Email-verification lifecycle tests** — register, verify, double-verify.
+4. **Logout / logout-all tests** — single session revocation; full session wipe via `RevokeUserRefreshTokens`.
+5. **Suspension tests** — blocked login; in-flight refresh blocked by status re-check inside `RotateRefreshToken`.
+6. **Rate-limiter tests** — 429 on exhaustion at the HTTP layer; recovery after token-bucket refill.
+7. **Replay-detection tests** — Case 2 (`ErrInvalidToken`, no wipe) and Case 3 (`ErrTokenReuse`, full wipe) exercised at the service layer end-to-end.
 
 ---
 
@@ -2076,8 +2224,14 @@ Phase 13A (Security & Production Blockers) is complete. All pre-production deplo
 | `backend/db/migrations/000023_refresh_token_successor_tracking.up.sql` | Adds `successor_id UUID NULL` and `chk_refresh_tokens_successor` CHECK to `refresh_tokens`; enables structural replay detection |
 | `backend/db/migrations/000024_password_reset_tokens.up.sql` | `password_reset_tokens` table; single-use, SHA-256-hashed, 1-hour expiry; user FK CASCADE; two indexes |
 | `backend/db/queries/auth.sql` | Refresh token lifecycle queries; `RevokeAndLinkSuccessor :execrows` (Auth Security Hotfix v2) |
-| `backend/db/queries/password_reset_tokens.sql` | 5 queries: Create, GetForUpdate, UseOne, UseAll, DeleteExpired |
-| `backend/internal/auth/repository.go` | `RotateRefreshToken` (replay state machine + user status re-check); `LogoutTransaction` (FOR UPDATE); `ForgotPasswordTransaction`; `ResetPasswordTransaction` (7-step atomic reset) |
+| `backend/db/queries/password_reset_tokens.sql` | 7 queries: Create, GetByHash (non-locking), GetForUpdate, LockUserPasswordResetTokens (ORDER BY id FOR UPDATE), UseOne, UseAll, DeleteExpired |
+| `backend/db/migrations/embed.go` | Exports `migrations.FS embed.FS` via `//go:embed *.sql`; used by `internal/testutil` to run migrations without filesystem access |
+| `backend/internal/auth/repository.go` | `RotateRefreshToken` (replay state machine + user status re-check); `LogoutTransaction` (FOR UPDATE); `ForgotPasswordTransaction`; `ResetPasswordTransaction` (deterministic lock-order deadlock fix, Phase 13B.1); `equalizeEnumerationTiming` (4-round-trip no-op, Phase 13B.1) |
+| `backend/internal/auth/concurrency_test.go` | 7 barrier-synchronized concurrency tests: refresh replay (Cases 2 & 3), concurrent refresh, logout+refresh race, reset same-token, reset different-tokens (deadlock regression), reset expired+valid |
+| `backend/internal/auth/repository_test.go` | `TestRevokeAndLinkSuccessorInvariant` — asserts `revoked_at`, `successor_id`, and new-token active state after rotation |
+| `backend/internal/auth/testmain_test.go` | `TestMain` wiring `testutil.SetupTestDB` into the auth test package |
+| `backend/internal/testutil/container.go` | `SetupTestDB` — starts `postgres:17-alpine`, applies migrations via golang-migrate + pgx/v5, returns `*pgxpool.Pool` and teardown; Docker-unavailable skip/fail policy |
+| `backend/internal/testutil/fixtures/auth.go` | Typed auth fixtures: `CreateActiveUser`, `CreateRefreshToken`, `CreatePasswordResetToken`, `CreateExpiredPasswordResetToken`, `CleanupUser`, `HashToken` |
 | `backend/internal/platform/middleware/ratelimit.go` | `IPRateLimiter` — per-IP token bucket; sync.Mutex-protected map; background cleanup goroutine; Stop() via done channel |
 | `backend/internal/platform/middleware/cors.go` | `CORS()` middleware — origin reflection; `Allow-Credentials` (specific origins only); `Vary: Origin`; preflight 204 |
 | `backend/internal/cleanup/scheduler.go` | `Scheduler` — background token expiry cleanup; configurable interval; graceful shutdown via done channel |
@@ -2089,4 +2243,4 @@ Phase 13A (Security & Production Blockers) is complete. All pre-production deplo
 
 ---
 
-*This document was last updated on 2026-06-03 (Phase 13A complete). It should be updated whenever a phase is completed or significant architectural changes are made.*
+*This document was last updated on 2026-06-03 (Phase 13B.1 complete). It should be updated whenever a phase is completed or significant architectural changes are made.*

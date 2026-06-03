@@ -391,20 +391,43 @@ func (r *Repository) ForgotPasswordTransaction(ctx context.Context, p ForgotPass
 	return &token, nil
 }
 
-// ResetPasswordTransaction atomically:
+// ResetPasswordTransaction atomically resets a user's password.
 //
-//  1. Locks the reset token row (FOR UPDATE) — prevents concurrent double-use.
-//  2. Validates the token (not used, not expired).
-//  3. Marks this token and all other outstanding tokens for the user as used.
-//  4. Updates the user's password hash.
-//  5. Revokes all active refresh tokens (successor_id stays NULL — Case 3
-//     semantics: any future presentation triggers ErrTokenReuse).
-//  6. Writes an audit record.
-//  7. Commits.
+// Deadlock-safe lock ordering (Fix #1):
 //
-// On any failure the transaction rolls back; the caller may present a new reset
-// link without losing their account.
+// The previous design locked only the presented token row, then called
+// UseAllUserPasswordResetTokens which had to UPDATE all sibling rows. Two
+// concurrent resets each holding a different token would each wait for the
+// other's locked row → cycle deadlock.
+//
+// The new design:
+//  1. Non-locking pre-fetch to obtain the user_id for the lock-all step.
+//  2. Begin transaction.
+//  3. Lock ALL outstanding tokens for the user in ascending id order — the
+//     same deterministic sequence for every concurrent caller. One transaction
+//     blocks instead of both locking disjoint rows and waiting on each other.
+//  4. Find the target token inside the locked set.
+//  5. Validate expiry.
+//  6. Mark token and all siblings used.
+//  7. Update password, revoke sessions, write audit record.
+//  8. Commit.
+//
+// On any failure the transaction rolls back; the caller may present a new
+// reset link without losing their account.
 func (r *Repository) ResetPasswordTransaction(ctx context.Context, tokenHash, newPasswordHash string) error {
+	// Step 1: Non-locking fetch — retrieves user_id and token.ID before the
+	// transaction starts. This is safe: validation happens again inside the
+	// transaction under locks. The only purpose here is to obtain the user_id
+	// needed for the deterministic lock-all query in Step 3.
+	preview, err := r.queries.GetPasswordResetTokenByHash(ctx, tokenHash)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return ErrResetTokenInvalid
+		}
+		return err
+	}
+
+	// Step 2: Begin transaction.
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -413,35 +436,49 @@ func (r *Repository) ResetPasswordTransaction(ctx context.Context, tokenHash, ne
 
 	qtx := r.queries.WithTx(tx)
 
-	// Step 1: Acquire exclusive lock to serialize concurrent reset attempts.
-	token, err := qtx.GetPasswordResetTokenByHashForUpdate(ctx, tokenHash)
+	// Step 3: Lock all outstanding tokens for this user in deterministic
+	// ascending-id order. Both concurrent callers lock the same set in the
+	// same order → the second blocks instead of deadlocking.
+	locked, err := qtx.LockUserPasswordResetTokens(ctx, preview.UserID)
 	if err != nil {
-		if err == pgx.ErrNoRows {
-			return ErrResetTokenInvalid
-		}
 		return err
 	}
 
-	// Step 2: Validate token state.
-	if token.UsedAt.Valid {
+	// Step 4: Find the target token inside the locked set.
+	// If not present, it was consumed by a concurrent reset between Step 1
+	// and Step 3 (UseAllUserPasswordResetTokens set used_at, removing it
+	// from the WHERE used_at IS NULL filter).
+	var token db.PasswordResetToken
+	found := false
+	for _, t := range locked {
+		if t.ID == preview.ID {
+			token = t
+			found = true
+			break
+		}
+	}
+	if !found {
 		return ErrResetTokenUsed
 	}
+
+	// Step 5: Validate expiry. used_at IS NULL is guaranteed by the
+	// LockUserPasswordResetTokens WHERE clause.
 	if token.ExpiresAt.Time.Before(time.Now()) {
 		return ErrResetTokenExpired
 	}
 
-	// Step 3a: Mark this specific token as used.
+	// Step 6a: Mark this specific token as used.
 	if err := qtx.UsePasswordResetToken(ctx, token.ID); err != nil {
 		return err
 	}
 
-	// Step 3b: Invalidate all other outstanding reset tokens for the user.
-	// Prevents a stale token from being used after the password has changed.
+	// Step 6b: Invalidate all other outstanding reset tokens for the user.
+	// Safe: we hold locks on all of them in deterministic order (Step 3).
 	if err := qtx.UseAllUserPasswordResetTokens(ctx, token.UserID); err != nil {
 		return err
 	}
 
-	// Step 4: Replace the password hash.
+	// Step 7: Replace the password hash.
 	if err := qtx.UpdateUserPasswordHash(ctx, db.UpdateUserPasswordHashParams{
 		PasswordHash: newPasswordHash,
 		ID:           token.UserID,
@@ -449,14 +486,14 @@ func (r *Repository) ResetPasswordTransaction(ctx context.Context, tokenHash, ne
 		return err
 	}
 
-	// Step 5: Revoke all active refresh tokens. successor_id is not set —
+	// Step 8: Revoke all active refresh tokens. successor_id is not set —
 	// these tokens are explicitly revoked (Case 3). Any subsequent refresh
 	// attempt with them triggers a full session wipe.
 	if err := qtx.RevokeUserRefreshTokens(ctx, token.UserID); err != nil {
 		return err
 	}
 
-	// Step 6: Audit record. Both old_data and new_data required for update action.
+	// Step 9: Audit record. Both old_data and new_data required for update action.
 	if err := qtx.CreateAuditLog(ctx, db.CreateAuditLogParams{
 		UserID:     token.UserID,
 		Action:     db.AuditActionUpdate,
@@ -475,6 +512,44 @@ func (r *Repository) ResetPasswordTransaction(ctx context.Context, tokenHash, ne
 // the background cleanup scheduler.
 func (r *Repository) DeleteExpiredPasswordResetTokens(ctx context.Context, before pgtype.Timestamptz) error {
 	return r.queries.DeleteExpiredPasswordResetTokens(ctx, before)
+}
+
+// equalizeEnumerationTiming opens a no-op transaction whose query profile
+// matches the successful ForgotPasswordTransaction path, preventing timing-based
+// email enumeration.
+//
+// Without equalization an attacker can distinguish registered from unregistered
+// addresses by measuring response latency: the "not found" path avoids all DB
+// writes and completes several milliseconds faster. Even though the response
+// body and HTTP status are identical, a persistent adversary can achieve
+// statistically significant enumeration from response-time distributions alone.
+//
+// Query profile alignment:
+//
+//	ForgotPasswordTransaction: BEGIN  INSERT(token)  INSERT(audit)  COMMIT  = 4 round-trips
+//	equalizeEnumerationTiming: BEGIN  SELECT 1       SELECT NOW()   COMMIT  = 4 round-trips
+//
+// Two read-only queries replace the two writes to match the round-trip count.
+// They carry no side effects and cannot fail in ways that would alter timing.
+// The previous single-SELECT version produced only 3 round-trips, leaving a
+// ~1–2 ms gap measurable at sufficient request volume.
+//
+// Failure handling: all errors are intentionally swallowed. If the pool is
+// exhausted or the DB is temporarily unreachable, the forgot-password response
+// is still delivered promptly — the correct fail-open behaviour for a
+// timing-equalization measure.
+func (r *Repository) equalizeEnumerationTiming(ctx context.Context) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	var dummy int
+	_ = tx.QueryRow(ctx, "SELECT 1").Scan(&dummy)
+	_ = tx.QueryRow(ctx, "SELECT NOW()").Scan(new(interface{}))
+
+	_ = tx.Commit(ctx)
 }
 
 // ---- RBAC operations --------------------------------------------------------

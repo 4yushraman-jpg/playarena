@@ -269,7 +269,9 @@ func (s *Service) ForgotPassword(ctx context.Context, req ForgotPasswordRequest)
 
 	user, err := s.repo.GetUserByEmail(ctx, req.Email)
 	if err != nil {
-		// Email not found — return the same response as success to prevent enumeration.
+		// Email not found. Equalise response time so the caller cannot infer
+		// account existence from timing. See Repository.equalizeEnumerationTiming.
+		s.repo.equalizeEnumerationTiming(ctx)
 		return genericResp, nil
 	}
 
@@ -285,6 +287,10 @@ func (s *Service) ForgotPassword(ctx context.Context, req ForgotPasswordRequest)
 	})
 	if err != nil {
 		// Internal failure — don't leak it. Callers see the generic message.
+		// Equalise timing: this path returns genericResp without completing the
+		// full token-creation round-trips, making it faster than the success path
+		// and potentially distinguishable from it by a timing adversary.
+		s.repo.equalizeEnumerationTiming(ctx)
 		return genericResp, nil
 	}
 

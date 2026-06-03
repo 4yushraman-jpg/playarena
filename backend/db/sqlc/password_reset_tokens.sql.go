@@ -51,6 +51,30 @@ func (q *Queries) DeleteExpiredPasswordResetTokens(ctx context.Context, expiresA
 	return err
 }
 
+const getPasswordResetTokenByHash = `-- name: GetPasswordResetTokenByHash :one
+SELECT id, user_id, token_hash, expires_at, used_at, created_at
+FROM   password_reset_tokens
+WHERE  token_hash = $1
+LIMIT  1
+`
+
+// Non-locking fetch used as a pre-flight read in ResetPasswordTransaction.
+// Returns the row regardless of used/expired state so the caller can obtain
+// the user_id before acquiring the deterministic per-user lock set.
+func (q *Queries) GetPasswordResetTokenByHash(ctx context.Context, tokenHash string) (PasswordResetToken, error) {
+	row := q.db.QueryRow(ctx, getPasswordResetTokenByHash, tokenHash)
+	var i PasswordResetToken
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.TokenHash,
+		&i.ExpiresAt,
+		&i.UsedAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const getPasswordResetTokenByHashForUpdate = `-- name: GetPasswordResetTokenByHashForUpdate :one
 SELECT id, user_id, token_hash, expires_at, used_at, created_at
 FROM   password_reset_tokens
@@ -74,6 +98,48 @@ func (q *Queries) GetPasswordResetTokenByHashForUpdate(ctx context.Context, toke
 		&i.CreatedAt,
 	)
 	return i, err
+}
+
+const lockUserPasswordResetTokens = `-- name: LockUserPasswordResetTokens :many
+SELECT id, user_id, token_hash, expires_at, used_at, created_at
+FROM   password_reset_tokens
+WHERE  user_id  = $1
+  AND  used_at  IS NULL
+ORDER BY id
+FOR UPDATE
+`
+
+// Acquires exclusive row locks on all outstanding (unused) reset tokens for
+// a user in deterministic ascending-id order. Called inside
+// ResetPasswordTransaction before any UPDATE, ensuring that two concurrent
+// reset attempts each presenting a different token for the same user always
+// compete for the same lock set in the same order and therefore cannot
+// deadlock.
+func (q *Queries) LockUserPasswordResetTokens(ctx context.Context, userID pgtype.UUID) ([]PasswordResetToken, error) {
+	rows, err := q.db.Query(ctx, lockUserPasswordResetTokens, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []PasswordResetToken{}
+	for rows.Next() {
+		var i PasswordResetToken
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.TokenHash,
+			&i.ExpiresAt,
+			&i.UsedAt,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const useAllUserPasswordResetTokens = `-- name: UseAllUserPasswordResetTokens :exec
