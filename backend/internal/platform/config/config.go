@@ -22,6 +22,31 @@ type Config struct {
 	// JWTSecret is the HMAC key used to sign and verify JWT tokens.
 	JWTSecret string
 
+	// ── CORS ────────────────────────────────────────────────────────────────
+
+	// CORSAllowedOrigins is the list of allowed request origins.
+	// Parsed from CORS_ALLOWED_ORIGINS (comma-separated). Production must set
+	// explicit domain names — never use "*" in production.
+	// Defaults to common localhost addresses for development.
+	CORSAllowedOrigins []string
+
+	// ── Rate limiting ────────────────────────────────────────────────────────
+
+	// RateLimitEnabled toggles per-IP rate limiting on auth endpoints.
+	// Set RATE_LIMIT_ENABLED=false to disable (e.g., in integration tests).
+	RateLimitEnabled bool
+	// RateLimitAuthRPS is the sustained request rate allowed per IP on auth
+	// endpoints (requests per second). Default: 10.
+	RateLimitAuthRPS float64
+	// RateLimitAuthBurst is the maximum burst size per IP. Default: 20.
+	RateLimitAuthBurst int
+
+	// ── Cleanup scheduler ────────────────────────────────────────────────────
+
+	// CleanupIntervalMinutes is how often the background job removes expired
+	// tokens (refresh, email verification, password reset). Default: 60.
+	CleanupIntervalMinutes int
+
 	// ── Storage (Phase 11) ───────────────────────────────────────────────────
 
 	// StorageBackend selects the storage implementation: "local" (default for
@@ -62,11 +87,7 @@ type Config struct {
 // deployment platform (Kubernetes secrets, ECS task definitions, etc.).
 func Load() (*Config, error) {
 	// Read APP_ENV directly from the process environment before loading .env.
-	// Using os.Getenv (not getEnv with a default) means an unset APP_ENV is
-	// treated as non-production, so local development works out of the box.
 	if !strings.EqualFold(os.Getenv("APP_ENV"), "production") {
-		// Silently ignore a missing .env file — expected in CI/CD pipelines
-		// and container environments where variables come from the platform.
 		_ = godotenv.Load()
 	}
 
@@ -81,6 +102,17 @@ func Load() (*Config, error) {
 		AppPort:     port,
 		DatabaseURL: os.Getenv("DATABASE_URL"),
 		JWTSecret:   os.Getenv("JWT_SECRET"),
+
+		CORSAllowedOrigins: getEnvStringSlice(
+			"CORS_ALLOWED_ORIGINS",
+			[]string{"http://localhost:3000", "http://localhost:5173"},
+		),
+
+		RateLimitEnabled:   getEnvBool("RATE_LIMIT_ENABLED", true),
+		RateLimitAuthRPS:   getEnvFloat("RATE_LIMIT_AUTH_RPS", 10.0),
+		RateLimitAuthBurst: getEnvInt("RATE_LIMIT_AUTH_BURST", 20),
+
+		CleanupIntervalMinutes: getEnvInt("CLEANUP_INTERVAL_MINUTES", 60),
 
 		StorageBackend:      getEnv("STORAGE_BACKEND", "local"),
 		StorageLocalPath:    getEnv("STORAGE_LOCAL_PATH", "./uploads"),
@@ -106,6 +138,11 @@ func (c *Config) IsDevelopment() bool { return c.AppEnv == "development" }
 // IsProduction reports whether the application is running in production mode.
 func (c *Config) IsProduction() bool { return c.AppEnv == "production" }
 
+// minJWTSecretLength is the minimum acceptable byte length for JWT_SECRET in
+// production. NIST SP 800-107 recommends HMAC keys of at least 256 bits (32
+// bytes) for HMAC-SHA256.
+const minJWTSecretLength = 32
+
 func (c *Config) validate() error {
 	var errs []string
 
@@ -118,12 +155,29 @@ func (c *Config) validate() error {
 	if c.IsProduction() && c.JWTSecret == "change-me" {
 		errs = append(errs, "JWT_SECRET must not be the default value in production")
 	}
+	if c.IsProduction() && len(c.JWTSecret) < minJWTSecretLength {
+		errs = append(errs, fmt.Sprintf(
+			"JWT_SECRET must be at least %d characters in production (current length: %d)",
+			minJWTSecretLength, len(c.JWTSecret),
+		))
+	}
+	if c.RateLimitAuthRPS <= 0 {
+		errs = append(errs, "RATE_LIMIT_AUTH_RPS must be positive")
+	}
+	if c.RateLimitAuthBurst <= 0 {
+		errs = append(errs, "RATE_LIMIT_AUTH_BURST must be positive")
+	}
+	if c.CleanupIntervalMinutes <= 0 {
+		errs = append(errs, "CLEANUP_INTERVAL_MINUTES must be positive")
+	}
 
 	if len(errs) > 0 {
 		return errors.New("config validation failed: " + strings.Join(errs, "; "))
 	}
 	return nil
 }
+
+// ---- environment helpers ----------------------------------------------------
 
 // getEnv returns the value of the named environment variable, or defaultValue
 // if the variable is not set or is empty.
@@ -132,4 +186,60 @@ func getEnv(key, defaultValue string) string {
 		return v
 	}
 	return defaultValue
+}
+
+func getEnvBool(key string, defaultValue bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return defaultValue
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return defaultValue
+	}
+	return b
+}
+
+func getEnvInt(key string, defaultValue int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return defaultValue
+	}
+	i, err := strconv.Atoi(v)
+	if err != nil {
+		return defaultValue
+	}
+	return i
+}
+
+func getEnvFloat(key string, defaultValue float64) float64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return defaultValue
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return defaultValue
+	}
+	return f
+}
+
+// getEnvStringSlice parses a comma-separated environment variable into a slice.
+// Whitespace is trimmed from each element. Empty elements are dropped.
+func getEnvStringSlice(key string, defaultValue []string) []string {
+	v := os.Getenv(key)
+	if v == "" {
+		return defaultValue
+	}
+	parts := strings.Split(v, ",")
+	result := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			result = append(result, t)
+		}
+	}
+	if len(result) == 0 {
+		return defaultValue
+	}
+	return result
 }

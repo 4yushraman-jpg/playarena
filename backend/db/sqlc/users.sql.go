@@ -197,6 +197,26 @@ func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
 	return items, nil
 }
 
+const updateUserPasswordHash = `-- name: UpdateUserPasswordHash :exec
+UPDATE users
+SET    password_hash = $1,
+       updated_at    = NOW()
+WHERE  id = $2
+`
+
+type UpdateUserPasswordHashParams struct {
+	PasswordHash string      `json:"password_hash"`
+	ID           pgtype.UUID `json:"id"`
+}
+
+// Replaces the stored bcrypt hash. Called exclusively by ResetPasswordTransaction
+// inside a FOR UPDATE token-locked transaction so the password update is atomic
+// with token consumption and session revocation.
+func (q *Queries) UpdateUserPasswordHash(ctx context.Context, arg UpdateUserPasswordHashParams) error {
+	_, err := q.db.Exec(ctx, updateUserPasswordHash, arg.PasswordHash, arg.ID)
+	return err
+}
+
 const verifyUserEmail = `-- name: VerifyUserEmail :exec
 UPDATE users
 SET    email_verified_at = NOW(),

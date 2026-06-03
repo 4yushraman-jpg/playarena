@@ -32,6 +32,20 @@ var (
 	ErrVerificationTokenExpired = errors.New("verification token has expired")
 	ErrVerificationTokenUsed    = errors.New("verification token has already been used")
 
+	// Password reset token errors
+	ErrResetTokenInvalid = errors.New("invalid password reset token")
+	ErrResetTokenExpired = errors.New("password reset token has expired")
+	ErrResetTokenUsed    = errors.New("password reset token has already been used")
+
+	// Password errors
+	//
+	// ErrPasswordTooLong is returned by HashPassword when the UTF-8 byte length
+	// of the supplied password exceeds bcrypt's 72-byte hard limit. bcrypt
+	// silently truncates longer inputs, which means two passwords sharing the
+	// same first 72 bytes would be indistinguishable after hashing.
+	// Enforcing the limit before hashing preserves the full uniqueness guarantee.
+	ErrPasswordTooLong = errors.New("password must not exceed 72 bytes")
+
 	// Organization errors
 	ErrOrganizationNotFound = errors.New("organization not found or access denied")
 )

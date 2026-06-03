@@ -16,7 +16,7 @@ const createRefreshToken = `-- name: CreateRefreshToken :one
 
 INSERT INTO refresh_tokens (user_id, token_hash, expires_at, ip_address, user_agent)
 VALUES ($1, $2, $3, $4, $5)
-RETURNING id, user_id, token_hash, expires_at, revoked_at, ip_address, user_agent, created_at
+RETURNING id, user_id, token_hash, expires_at, revoked_at, ip_address, user_agent, created_at, successor_id
 `
 
 type CreateRefreshTokenParams struct {
@@ -47,6 +47,7 @@ func (q *Queries) CreateRefreshToken(ctx context.Context, arg CreateRefreshToken
 		&i.IpAddress,
 		&i.UserAgent,
 		&i.CreatedAt,
+		&i.SuccessorID,
 	)
 	return i, err
 }
@@ -62,7 +63,7 @@ func (q *Queries) DeleteExpiredRefreshTokens(ctx context.Context, expiresAt pgty
 }
 
 const getRefreshTokenByHash = `-- name: GetRefreshTokenByHash :one
-SELECT id, user_id, token_hash, expires_at, revoked_at, ip_address, user_agent, created_at
+SELECT id, user_id, token_hash, expires_at, revoked_at, ip_address, user_agent, created_at, successor_id
 FROM   refresh_tokens
 WHERE  token_hash = $1
 LIMIT  1
@@ -80,12 +81,13 @@ func (q *Queries) GetRefreshTokenByHash(ctx context.Context, tokenHash string) (
 		&i.IpAddress,
 		&i.UserAgent,
 		&i.CreatedAt,
+		&i.SuccessorID,
 	)
 	return i, err
 }
 
 const getRefreshTokenByHashForUpdate = `-- name: GetRefreshTokenByHashForUpdate :one
-SELECT id, user_id, token_hash, expires_at, revoked_at, ip_address, user_agent, created_at
+SELECT id, user_id, token_hash, expires_at, revoked_at, ip_address, user_agent, created_at, successor_id
 FROM   refresh_tokens
 WHERE  token_hash = $1
 FOR UPDATE
@@ -103,8 +105,34 @@ func (q *Queries) GetRefreshTokenByHashForUpdate(ctx context.Context, tokenHash 
 		&i.IpAddress,
 		&i.UserAgent,
 		&i.CreatedAt,
+		&i.SuccessorID,
 	)
 	return i, err
+}
+
+const revokeAndLinkSuccessor = `-- name: RevokeAndLinkSuccessor :execrows
+UPDATE refresh_tokens
+SET    revoked_at   = NOW(),
+       successor_id = $2
+WHERE  id           = $1
+  AND  revoked_at   IS NULL
+`
+
+type RevokeAndLinkSuccessorParams struct {
+	ID          pgtype.UUID `json:"id"`
+	SuccessorID pgtype.UUID `json:"successor_id"`
+}
+
+// Atomically revokes a token and records the ID of its successor.
+// Used exclusively during token rotation: the new token must be inserted first
+// so its ID is available as $2. Returns the number of rows affected; the caller
+// must assert exactly 1 (enforced by the FOR UPDATE lock held on the old token).
+func (q *Queries) RevokeAndLinkSuccessor(ctx context.Context, arg RevokeAndLinkSuccessorParams) (int64, error) {
+	result, err := q.db.Exec(ctx, revokeAndLinkSuccessor, arg.ID, arg.SuccessorID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const revokeRefreshToken = `-- name: RevokeRefreshToken :exec

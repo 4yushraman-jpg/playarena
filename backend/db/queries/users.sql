@@ -43,3 +43,12 @@ SET    email_verified_at = NOW(),
        updated_at        = NOW()
 WHERE  id     = $1
   AND  status = 'pending_verification';
+
+-- name: UpdateUserPasswordHash :exec
+-- Replaces the stored bcrypt hash. Called exclusively by ResetPasswordTransaction
+-- inside a FOR UPDATE token-locked transaction so the password update is atomic
+-- with token consumption and session revocation.
+UPDATE users
+SET    password_hash = $1,
+       updated_at    = NOW()
+WHERE  id = $2;

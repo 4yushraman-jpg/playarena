@@ -83,6 +83,10 @@ func run() int {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
+	// Stop background services (rate-limiter cleanup goroutine, token cleanup
+	// scheduler) before draining in-flight HTTP requests.
+	app.Shutdown(shutdownCtx)
+
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error("graceful shutdown failed", slog.Any("error", err))
 		return 1

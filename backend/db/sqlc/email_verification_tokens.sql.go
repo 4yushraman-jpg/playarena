@@ -73,6 +73,32 @@ func (q *Queries) GetEmailVerificationTokenByHash(ctx context.Context, tokenHash
 	return i, err
 }
 
+const getEmailVerificationTokenByHashForUpdate = `-- name: GetEmailVerificationTokenByHashForUpdate :one
+SELECT id, user_id, token_hash, expires_at, used_at, created_at
+FROM   email_verification_tokens
+WHERE  token_hash = $1
+FOR UPDATE
+`
+
+// Acquires a row-level exclusive lock on the token row.
+// Used by VerifyEmailTransaction to serialize concurrent consumption attempts:
+// the second concurrent call blocks here until the first transaction commits,
+// then reads used_at IS NOT NULL and returns ErrVerificationTokenUsed.
+// This enforces the single-use guarantee transactionally.
+func (q *Queries) GetEmailVerificationTokenByHashForUpdate(ctx context.Context, tokenHash string) (EmailVerificationToken, error) {
+	row := q.db.QueryRow(ctx, getEmailVerificationTokenByHashForUpdate, tokenHash)
+	var i EmailVerificationToken
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.TokenHash,
+		&i.ExpiresAt,
+		&i.UsedAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const useEmailVerificationToken = `-- name: UseEmailVerificationToken :exec
 UPDATE email_verification_tokens
 SET    used_at = NOW()

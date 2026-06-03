@@ -12,9 +12,10 @@ import (
 )
 
 const (
-	accessTokenDuration       = 15 * time.Minute
-	refreshTokenDuration      = 7 * 24 * time.Hour
-	verificationTokenDuration = 24 * time.Hour
+	accessTokenDuration        = 15 * time.Minute
+	refreshTokenDuration       = 7 * 24 * time.Hour
+	verificationTokenDuration  = 24 * time.Hour
+	passwordResetTokenDuration = 1 * time.Hour
 
 	// randomTokenLength is the number of raw bytes used for both refresh tokens
 	// and email verification tokens (base64url-encoded to ~43 chars).
@@ -131,6 +132,15 @@ func GetRefreshTokenExpiryTime() pgtype.Timestamptz {
 func GetVerificationTokenExpiryTime() pgtype.Timestamptz {
 	return pgtype.Timestamptz{
 		Time:  time.Now().Add(verificationTokenDuration),
+		Valid: true,
+	}
+}
+
+// GetPasswordResetTokenExpiryTime returns a timestamptz set to now + 1 hour.
+// Password reset windows are intentionally short to limit replay exposure.
+func GetPasswordResetTokenExpiryTime() pgtype.Timestamptz {
+	return pgtype.Timestamptz{
+		Time:  time.Now().Add(passwordResetTokenDuration),
 		Valid: true,
 	}
 }

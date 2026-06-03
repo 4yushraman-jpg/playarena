@@ -11,6 +11,17 @@ FROM   email_verification_tokens
 WHERE  token_hash = $1
 LIMIT  1;
 
+-- name: GetEmailVerificationTokenByHashForUpdate :one
+-- Acquires a row-level exclusive lock on the token row.
+-- Used by VerifyEmailTransaction to serialize concurrent consumption attempts:
+-- the second concurrent call blocks here until the first transaction commits,
+-- then reads used_at IS NOT NULL and returns ErrVerificationTokenUsed.
+-- This enforces the single-use guarantee transactionally.
+SELECT *
+FROM   email_verification_tokens
+WHERE  token_hash = $1
+FOR UPDATE;
+
 -- name: UseEmailVerificationToken :exec
 -- Marks a token as consumed. The AND used_at IS NULL guard prevents a
 -- double-use race condition from silently succeeding.

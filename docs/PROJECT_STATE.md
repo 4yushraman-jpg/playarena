@@ -1,11 +1,11 @@
 # PlayArena — Project State & Handoff Document
 
-**Last Updated:** 2026-06-02  
+**Last Updated:** 2026-06-03  
 **Build status:** `go build ./...` passing, `go vet ./...` clean, `sqlc generate` clean  
-**Migrations applied:** 000001 – 000021  
+**Migrations applied:** 000001 – 000024  
 **Go version:** 1.25.6  
 **Database:** PostgreSQL 17  
-**Phases complete:** 1 – 11
+**Phases complete:** 1 – 12, Auth Security Hotfix v2, Phase 13A
 
 ---
 
@@ -36,7 +36,7 @@
 backend/
 ├── cmd/api/main.go                         Entry point — config, DB pool, HTTP server, graceful shutdown
 ├── db/
-│   ├── migrations/                         golang-migrate files (000001–000021, up + down)
+│   ├── migrations/                         golang-migrate files (000001–000022, up + down)
 │   ├── queries/                            Hand-written SQL (sqlc source)
 │   └── sqlc/                              Generated type-safe Go — never edited by hand
 ├── internal/
@@ -132,6 +132,16 @@ backend/
 │   │   │   └── s3.go                      S3Backend — S3-compatible storage with inline SigV4 signing
 │   │   └── processor/
 │   │       └── image.go                   MIME detection, image decode, bilinear resize, JPEG encode, SHA-256 hash
+│   ├── notifications/                      Notifications domain (fully implemented, Phase 12)
+│   │   ├── errors.go                      Typed domain error sentinels
+│   │   ├── model.go                       ListParams, prefKey, pagination constants
+│   │   ├── dto.go                         Response, ListResponse, PreferenceResponse, UpdatePreferenceRequest
+│   │   ├── repository.go                  UpsertPreference (dynamic audit action); DrainOutbox (batch preference load, FOR UPDATE SKIP LOCKED)
+│   │   ├── service.go                     List, GetByID, MarkRead, MarkAllRead, Delete, GetPreferences, UpdatePreference, DrainOutbox
+│   │   ├── handler.go                     HTTP handlers + error mapping
+│   │   ├── routes.go                      RegisterRoutes() — mounts /api/v1/organizations/{slug}/notifications
+│   │   └── trigger/
+│   │       └── trigger.go                 WriteOutboxEntry — writes notification_outbox rows inside domain transactions
 │   ├── bootstrap/
 │   │   ├── app.go                         App struct (Config, DB, Log) — composition root
 │   │   ├── router.go                      Builds chi router + global middleware stack
@@ -210,6 +220,9 @@ HTTP request
 | 000019 | Match Score Snapshots | `matches.home_score INTEGER NOT NULL DEFAULT 0`, `matches.away_score INTEGER NOT NULL DEFAULT 0` — final score columns written once at `live → completed` transition; standings engine reads these instead of re-aggregating `match_events` |
 | 000020 | Media Hardening | `media_attachments.storage_key TEXT NOT NULL` — canonical S3 object path, independent of CDN; `media_attachments.content_hash CHAR(64) NOT NULL` — SHA-256 hex for duplicate detection; `uq_media_primary_per_entity` unique partial index enforcing one primary per entity; `media.update` and `media.delete` permissions seeded and granted to `platform_admin`, `org_owner`, `org_admin`, `team_manager`, `coach` |
 | 000021 | Media Content Uniqueness | `uq_media_content_per_entity` unique index on `(organization_id, entity_type, entity_id, content_hash)` — DB-level backstop preventing concurrent duplicate uploads from producing multiple rows for the same content |
+| 000022 | Notifications | `notification_event_type` ENUM (9 values), `notification_channel` ENUM (in_app/email/webhook); `notification_outbox` (transactional outbox, written inside domain transactions); `notifications` (personal inbox, written only by DrainOutbox; `UNIQUE (outbox_id, user_id, channel)` — drain idempotency safeguard); `notification_preferences` (per-user opt-out); delivery indexes; `notification.manage` permission granted to `platform_admin`, `org_owner`, `org_admin` |
+| 000023 | Refresh Token Successor Tracking | `refresh_tokens.successor_id UUID NULL` — structural replay detection marker; `chk_refresh_tokens_successor CHECK (successor_id IS NULL OR revoked_at IS NOT NULL)` — DB-level state invariant; no FK, no index; replaces time-window replay detection with deterministic state machine |
+| 000024 | Password Reset Tokens | `password_reset_tokens` — single-use, SHA-256-hashed, 1-hour expiry; `fk_password_reset_tokens_user` CASCADE; `uq_password_reset_tokens_hash` unique; `idx_password_reset_tokens_user_id` for bulk invalidation; `idx_password_reset_tokens_expires WHERE used_at IS NULL` for cleanup |
 
 ### Table Summary
 
@@ -219,9 +232,12 @@ HTTP request
 Key columns: `id`, `email` (unique), `username` (unique), `password_hash` (bcrypt), `status` (`user_status` ENUM), `email_verified_at`, `last_login_at`, `last_login_ip`.
 
 **`refresh_tokens`** — Revocation store for refresh tokens. Stores SHA-256 hash only, never the raw token.  
-Key columns: `token_hash` (unique), `expires_at`, `revoked_at` (NULL = valid), `user_id` (CASCADE), `ip_address`, `user_agent`.
+Key columns: `token_hash` (unique), `expires_at`, `revoked_at` (NULL = active), `successor_id` (UUID NULL — set at rotation to the new token's ID; used as a state marker for replay detection), `user_id` (CASCADE), `ip_address`, `user_agent`.  
+`successor_id` is **not a foreign key** by design. It is a historical classification signal: `IS NULL` means the token was explicitly revoked (logout); `IS NOT NULL` means it was rotated. The application never follows the reference — it only tests nullness. Added by migration 000023.
 
 **`email_verification_tokens`** — Single-use email verification tokens. Stores SHA-256 hash only. Valid when `used_at IS NULL AND expires_at > NOW()`.
+
+**`password_reset_tokens`** — Single-use password reset tokens (Phase 13A). Stores SHA-256 hash only. Valid when `used_at IS NULL AND expires_at > NOW()`. Expires after 1 hour. Consumption atomically marks the presented token **and all sibling tokens for the same user** as used (`UseAllUserPasswordResetTokens`) inside the same `FOR UPDATE` transaction, preventing stale tokens from being replayed after a successful reset.
 
 #### RBAC
 
@@ -236,7 +252,7 @@ Key columns: `token_hash` (unique), `expires_at`, `revoked_at` (NULL = valid), `
 Supports `expires_at` for time-limited grants (e.g. guest scorer per tournament).  
 Unique constraints: `(user_id, organization_id, role_id)` for org grants; partial unique index `(user_id, role_id) WHERE organization_id IS NULL` for platform grants.
 
-#### Permission Matrix (complete, as of migration 000020)
+#### Permission Matrix (complete, as of migration 000022)
 
 | Permission | `platform_admin` | `org_owner` | `org_admin` | `team_manager` | `coach` | `scorer` | `viewer` |
 |-----------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
@@ -261,6 +277,7 @@ Unique constraints: `(user_id, organization_id, role_id)` for org grants; partia
 | `media.upload` | ✓ | ✓ | ✓ | ✓ | ✓ | — | — |
 | `media.update` | ✓ | ✓ | ✓ | ✓ | ✓ | — | — |
 | `media.delete` | ✓ | ✓ | ✓ | ✓ | ✓ | — | — |
+| `notification.manage` | ✓ | ✓ | ✓ | — | — | — | — |
 
 #### Domain Tables
 
@@ -284,6 +301,14 @@ Unique constraints: `(user_id, organization_id, role_id)` for org grants; partia
 
 **`audit_logs`** — Immutable compliance ledger. `org_id` nullable (NULL = platform action). `user_id` nullable (NULL = system action). Constraint: login/logout rows have no `entity_id`; create/update/delete must have one.
 
+#### Notification Tables (added migration 000022)
+
+**`notification_outbox`** — Transactional outbox. Written atomically inside domain transactions (matches, tournaments, registrations). Never written by the notifications service. Read exclusively by `DrainOutbox` using `FOR UPDATE SKIP LOCKED`. `processed_at` is NULL for pending entries; set to `NOW()` once fully fanned out. Partial index `idx_notif_outbox_pending` covers only pending rows.
+
+**`notifications`** — Personal notification inbox. Written **only** by `DrainOutbox` after domain transactions commit. Every row is scoped to one user within one organization. `UNIQUE (outbox_id, user_id, channel)` — drain retry idempotency safeguard. Soft-deleted via `deleted_at`; all queries exclude `deleted_at IS NOT NULL`. `sent_at` contract: `in_app` → set to `NOW()` on drain insert; `email`/`webhook` → NULL until future delivery workers confirm send.
+
+**`notification_preferences`** — Per-user, per-org, per-event-type, per-channel opt-in/out. Missing row = enabled (opt-out model). UPSERT semantics (last-writer-wins) on `(organization_id, user_id, event_type, channel)`.
+
 ### Key Design Decisions
 
 **Event sourcing for live scoring.** `match_events` is the single source of truth for all scoring during active matches. The live scoring engine (`internal/scoring/`) derives home and away scores on every `GET /matches/{id}/score` request from the effective event log — no score is ever stored for live matches.
@@ -295,6 +320,8 @@ Unique constraints: `(user_id, organization_id, role_id)` for org grants; partia
 **Cross-org tournament registrations.** `tournament_registrations.organization_id` is the registrant's org, not the tournament host org. A federation tournament can accept teams from multiple clubs. The registrant's team/player must still belong to the registrant's org (validated by trigger).
 
 **Soft foreign keys in media.** `media_attachments` uses a polymorphic `(entity_type, entity_id)` reference. No DB-level FK is possible. The application service layer is responsible for orphan cleanup when parent entities are deleted.
+
+**Transactional outbox for notifications.** Domain writes (matches, tournaments, registrations) write a row to `notification_outbox` inside the same transaction as the domain mutation. After the transaction commits, the domain service calls `DrainOutbox` synchronously. The drain opens a fresh transaction, claims pending rows with `FOR UPDATE SKIP LOCKED`, fans out in-app notifications to all org members (filtered by preferences loaded in one batch query per event type), and marks entries processed. This decouples notification delivery from domain transactions: a drain failure never rolls back a committed domain operation, and the outbox entries remain durable for the next drain cycle. Drain idempotency is enforced at the database level by `UNIQUE (outbox_id, user_id, channel)` on `notifications` — a retry can never produce duplicate rows.
 
 ---
 
@@ -352,22 +379,41 @@ POST /api/v1/auth/refresh
   { refresh_token, organization_id? }
 
 1. SHA-256 hash the incoming token
-2. GetRefreshTokenByHash() (read-only peek for user_id)
+2. GetRefreshTokenByHash() (read-only peek for user_id — unlocked pre-fetch)
 3. GetUserByID() → re-validate user status
 4. resolveOrgContext() (client may request different org context on refresh)
 5. Generate new refresh token raw value
-6. RotateRefreshToken() — serializable transaction:
-     a. SELECT ... FOR UPDATE on the token row (prevents concurrent rotation)
-     b. If revoked_at IS NOT NULL → replay detected:
-          RevokeUserRefreshTokens() (wipe all active sessions)
-          COMMIT; return ErrTokenReuse
+6. RotateRefreshToken() — transaction with FOR UPDATE row lock:
+     a. SELECT ... FOR UPDATE on the token row (serialises concurrent rotation)
+     b. Replay state machine (see below):
+          revoked_at IS NULL                              → Case 1: proceed
+          revoked_at IS NOT NULL, successor_id IS NOT NULL → Case 2: ErrInvalidToken (no wipe)
+          revoked_at IS NOT NULL, successor_id IS NULL    → Case 3: wipe all sessions, ErrTokenReuse
      c. If expires_at < NOW() → return ErrExpiredToken
-     d. RevokeRefreshToken() (old token)
-     e. CreateRefreshToken() (new token)
-     f. COMMIT
+     d. CreateRefreshToken() (new token — inserted first to obtain its ID)
+     e. RevokeAndLinkSuccessor(old.ID, new.ID) — atomic UPDATE:
+          SET revoked_at = NOW(), successor_id = new.ID WHERE id = old.ID AND revoked_at IS NULL
+     f. Assert rows affected == 1 (defensive invariant enforced by the FOR UPDATE lock)
+     g. COMMIT
 7. GenerateAccessToken() with new org + role context
 8. Return { access_token, refresh_token, expires_in: 900, token_type: "Bearer" }
 ```
+
+### Replay Detection State Machine (Auth Security Hotfix v2)
+
+Replay detection is deterministic and structural — no wall-clock comparisons, no grace windows.  
+The `successor_id` column on a revoked token encodes its history:
+
+| `revoked_at` | `successor_id` | Token state | Action |
+|:---:|:---:|---|---|
+| `IS NULL` | `IS NULL` | **Active** — not yet used or revoked | Allow rotation (Case 1) |
+| `IS NOT NULL` | `IS NOT NULL` | **Rotated** — this token was superseded by a rotation; the holder of the successor token is legitimate | `ErrInvalidToken` — no session revocation (Case 2) |
+| `IS NOT NULL` | `IS NULL` | **Explicitly revoked** — logout, logout-all, password reset, admin action; any presentation is anomalous | `ErrTokenReuse` — revoke all active sessions (Case 3) |
+
+**Case 2 vs Case 3 distinction eliminates both failure modes of the previous design:**
+
+- *Old design (time-window):* relied on `time.Since(revoked_at) <= 30s`. Within the window, genuine replay attacks were silently accepted. Outside the window, concurrent legitimate duplicate requests (e.g., two browser tabs refreshing simultaneously) triggered false session wipes.
+- *New design (structural):* concurrent duplicate requests both see `successor_id IS NOT NULL` → Case 2 → `ErrInvalidToken` (no wipe). Genuine replay of an explicitly revoked token → Case 3 → full wipe. No timing dependency of any kind.
 
 ### JWT Validation (`RequireAuth` middleware)
 
@@ -442,6 +488,9 @@ organizations          (tenant root — every domain entity carries organization
       └── matches
           └── match_events           (append-only, immutable)
   └── media_attachments
+  └── notification_outbox            (written inside domain transactions; drained post-commit)
+      └── notifications              (personal inbox; written only by DrainOutbox; scoped by user_id)
+  └── notification_preferences       (per-user opt-out; scoped by user_id)
 ```
 
 `users` and `refresh_tokens` are **platform-level** — they have no `organization_id`. A user's org membership is entirely expressed through `user_organization_roles`.
@@ -483,6 +532,7 @@ Each access token carries **exactly one** `organization_id`. The token is org-co
 | **Scoring Engine** | `engine.go`, `rules.go`, `models.go`, `validation.go` | Complete |
 | **Standings Engine** | `models.go`, `engine.go`, `tiebreakers.go` | Complete |
 | **Media Management** | `errors.go`, `model.go`, `dto.go`, `repository.go`, `service.go`, `handler.go`, `routes.go`; `storage/backend.go`, `storage/local.go`, `storage/s3.go`; `processor/image.go` | Complete |
+| **Notifications** | `errors.go`, `model.go`, `dto.go`, `repository.go`, `service.go`, `handler.go`, `routes.go`; `trigger/trigger.go` | Complete |
 | **Platform / Config** | `config.go` | Complete |
 | **Platform / Database** | `postgres.go` | Complete |
 | **Platform / Logger** | `logger.go` | Complete |
@@ -509,7 +559,9 @@ Each access token carries **exactly one** `organization_id`. The token is org-co
 | `GET` | `/api/v1/auth/verify-email` | No | Consume single-use token; transition status → active |
 | `POST` | `/api/v1/auth/login` | No | Authenticate; supports multi-org selection |
 | `POST` | `/api/v1/auth/refresh` | No | Rotate refresh token; issue new access + refresh tokens |
-| `POST` | `/api/v1/auth/logout` | No | Revoke refresh token by value |
+| `POST` | `/api/v1/auth/logout` | No | Revoke refresh token by value; transactional (FOR UPDATE) to prevent concurrent-rotation race |
+| `POST` | `/api/v1/auth/forgot-password` | No | Create 1-hour reset token; always returns 200 (enumeration-resistant); token in response body in development only |
+| `POST` | `/api/v1/auth/reset-password` | No | Consume reset token; update password; revoke all sessions — single atomic transaction |
 | `GET` | `/api/v1/auth/me` | Yes | Return profile + role + org context for authenticated user |
 | `GET` | `/api/v1/auth/admin-only` | Yes | RBAC demonstration endpoint; requires `role.assign` permission; returns caller's principal (user_id, email, role, org_id) |
 
@@ -602,6 +654,23 @@ Supported entity types (Phase 11): `organization`, `team`, `player`, `tournament
 Allowed input MIME types: `image/jpeg`, `image/png`, `image/webp`, `image/gif`. SVG and documents rejected.  
 All output stored as JPEG. Thumbnails generated at 150 px (`_sm`) and 400 px (`_md`) width.  
 Storage backend: `local` (development, `./uploads/`, served at `/media/files/*`) or `s3` (production, any S3-compatible endpoint via SigV4 signing).
+
+### Notifications (`/api/v1/organizations/{slug}/notifications`)
+
+All notification endpoints require `RequireAuth` only — no RBAC permission checks. Every query is scoped by **both** `organization_id` (resolved from URL slug) **and** `user_id` (from JWT principal). A user can only read, mark, and delete their own notifications.
+
+| Method | Path | Auth | Description |
+|--------|------|:----:|-------------|
+| `GET` | `/api/v1/organizations/{slug}/notifications` | Yes | List caller's undeleted notifications, newest first (paginated; `?limit`, `?offset`) |
+| `GET` | `/api/v1/organizations/{slug}/notifications/{id}` | Yes | Get single notification scoped to caller and org |
+| `PATCH` | `/api/v1/organizations/{slug}/notifications/{id}/read` | Yes | Mark a single notification as read; returns the updated resource |
+| `POST` | `/api/v1/organizations/{slug}/notifications/read-all` | Yes | Mark all unread notifications as read; idempotent |
+| `DELETE` | `/api/v1/organizations/{slug}/notifications/{id}` | Yes | Soft-delete a notification (sets `deleted_at`); double-delete returns 404 |
+| `GET` | `/api/v1/organizations/{slug}/notifications/preferences` | Yes | List all stored preferences for the caller in this org (missing row = enabled by default) |
+| `PUT` | `/api/v1/organizations/{slug}/notifications/preferences/{event_type}` | Yes | Upsert a preference for `event_type` + `channel`; UPSERT semantics (last-writer-wins); audited |
+
+Valid `event_type` values: `match_created`, `match_started`, `match_completed`, `match_cancelled`, `match_abandoned`, `tournament_status_changed`, `registration_approved`, `registration_rejected`, `registration_withdrawn`.  
+Valid `channel` values: `in_app`, `email`, `webhook`. Phase 12 delivers in_app only; email and webhook are reserved for future workers.
 
 ### Health
 
@@ -1377,6 +1446,376 @@ Migration 000021 adds `uq_media_content_per_entity` — a unique index on `(orga
 
 ---
 
+### Phase 12 — Notifications (Complete)
+
+Phase 12 implements the Transactional Outbox notification system. In-app notifications are delivered synchronously after domain transactions commit. The architecture preserves compatibility with future email, webhook, and push channels, and with a future outbox worker for crash-recovery delivery.
+
+#### Architecture — Transactional Outbox Pattern
+
+Inline fan-out (writing notifications inside the domain transaction) was rejected because a notification failure would roll back the domain mutation. The transactional outbox separates the two concerns:
+
+```
+Domain Transaction
+  ├── Domain write (match INSERT / UPDATE, tournament UPDATE, registration UPDATE)
+  ├── Audit log INSERT
+  └── notification_outbox INSERT       ← atomic with domain; outbox entry never lost
+
+COMMIT
+
+DrainOutbox (synchronous, post-commit, separate transaction)
+  ├── SELECT … FOR UPDATE SKIP LOCKED  ← claim pending entries; concurrent drains skip
+  ├── GetOrgMembersForNotification     ← one query; all members
+  ├── GetNotificationPreferencesForEvent (per unique event type) ← batch; O(event types)
+  ├── CreateNotification × N members   ← one insert per notified user per entry
+  └── MarkOutboxEntryProcessed × N entries
+COMMIT
+```
+
+A drain failure logs the error and returns; the domain operation is already committed. Outbox entries remain pending (`processed_at IS NULL`) and are retried on the next drain cycle (the next domain operation in the same org). `UNIQUE (outbox_id, user_id, channel)` on `notifications` guarantees that a retry never creates duplicate rows — the second insert is silently ignored.
+
+#### Delivery Channels
+
+| Channel | Phase 12 | Future |
+|---------|----------|--------|
+| `in_app` | ✓ Delivered by DrainOutbox; `sent_at = NOW()` on insert | — |
+| `email` | Schema reserved | Worker sets `sent_at` on confirmed send |
+| `webhook` | Schema reserved | Worker sets `sent_at` on confirmed delivery |
+
+#### Compare-And-Swap on Match Transitions (Phase 12B)
+
+`UpdateMatch` and `CancelMatch` were upgraded from a terminal-state NOT IN guard to a strict compare-and-swap (CAS):
+
+```sql
+-- UpdateMatch (previously: AND status NOT IN ('completed','cancelled','abandoned'))
+WHERE id = $1 AND organization_id = $2 AND status = $20   -- $20 = previous_status
+
+-- CancelMatch
+WHERE id = $1 AND organization_id = $2 AND status = $3    -- $3 = previous_status
+```
+
+The service reads `current.Status` before the transaction and passes it as the CAS guard (`Status_2` in the sqlc-generated `UpdateMatchParams`). A concurrent transition that changes the status between the service read and the UPDATE results in 0 rows matched → `ErrMatchNotUpdatable` (HTTP 422). The CAS is required to guarantee that outbox entries carry the correct previous and new status values.
+
+#### Domain Integration
+
+| Domain | Write trigger | Event type(s) |
+|--------|--------------|---------------|
+| Matches — Create | Match INSERT | `match_created` |
+| Matches — Update | Status transition | `match_started`, `match_completed`, `match_cancelled`, `match_abandoned` |
+| Matches — Cancel | `DELETE` | `match_cancelled` |
+| Tournaments — Update | Status transition | `tournament_status_changed` |
+| Tournaments — Cancel | `DELETE` | `tournament_status_changed` |
+| Registrations — Update | Status transition | `registration_approved`, `registration_rejected` |
+| Registrations — Withdraw | `DELETE` | `registration_withdrawn` |
+
+All outbox writes use `trigger.WriteOutboxEntry(ctx, qtx, ...)` where `qtx` is the transaction-scoped queries handle — the outbox entry is always atomic with the triggering domain write.
+
+#### Preference System
+
+Missing preference row = enabled (opt-out model). `notification_preferences` is the stored exception table. Preferences are resolved during drain from an in-memory map built by a single batch query per unique `(event_type, channel)` pair — no per-user SQL in the fan-out loop.
+
+#### Files Created
+
+| File | Purpose |
+|------|---------|
+| `db/migrations/000022_notifications.{up,down}.sql` | ENUMs, tables, indexes, `notification.manage` permission, role grants |
+| `db/queries/notifications.sql` | 16 SQL queries (outbox, notifications, preferences) |
+| `db/sqlc/notifications.sql.go` | Generated — all query functions including `GetNotificationPreferencesForEvent` |
+| `internal/notifications/errors.go` | Typed domain error sentinels |
+| `internal/notifications/model.go` | `ListParams`, `prefKey`, pagination constants |
+| `internal/notifications/dto.go` | `Response`, `ListResponse`, `PreferenceResponse`, `UpdatePreferenceRequest` |
+| `internal/notifications/repository.go` | DB access; `DrainOutbox` (batch preference load); `UpsertPreference` (dynamic audit action) |
+| `internal/notifications/service.go` | All use-cases; `DrainOutbox` entry point (errors logged, not propagated) |
+| `internal/notifications/handler.go` | HTTP handlers + error mapping |
+| `internal/notifications/routes.go` | 7 routes, all `RequireAuth` only |
+| `internal/notifications/trigger/trigger.go` | `WriteOutboxEntry` — called inside domain transactions |
+
+#### Files Modified
+
+| File | Change |
+|------|--------|
+| `db/queries/matches.sql` | `UpdateMatch`: `AND status = $20` CAS guard; `CancelMatch`: `AND status = $3` CAS guard |
+| `db/sqlc/matches.sql.go` | Regenerated — `UpdateMatchParams.Status_2` (CAS), `CancelMatchParams.Status` (CAS) |
+| `internal/matches/repository.go` | Outbox write in Create/Update/Cancel; `Status_2` CAS wiring |
+| `internal/matches/service.go` | `Status_2: current.Status`; DrainOutbox call post-commit; accepts `*notifications.Service` |
+| `internal/matches/routes.go` | Accepts and passes `*notifications.Service` |
+| `internal/tournaments/repository.go` | Outbox write in Update/Cancel when status changes |
+| `internal/tournaments/service.go` | `previousStatus` param; DrainOutbox call post-commit; accepts `*notifications.Service` |
+| `internal/tournaments/routes.go` | Accepts and passes `*notifications.Service` |
+| `internal/tournament_registrations/repository.go` | Outbox write in Update/Withdraw when status changes |
+| `internal/tournament_registrations/service.go` | `previousStatus` param; DrainOutbox call post-commit; accepts `*notifications.Service` |
+| `internal/tournament_registrations/routes.go` | Accepts and passes `*notifications.Service` |
+| `internal/bootstrap/modules.go` | Constructs shared `*notifications.Service` singleton; wires it to matches, tournaments, registrations, and notifications routes |
+
+#### SQL Queries Added (`db/queries/notifications.sql`)
+
+| Query | Purpose |
+|-------|---------|
+| `CreateNotificationOutboxEntry` | INSERT into outbox inside domain transaction; `:one` RETURNING |
+| `DrainOutboxEntries` | `SELECT … FOR UPDATE SKIP LOCKED LIMIT 100` — claim pending entries |
+| `MarkOutboxEntryProcessed` | `UPDATE … SET processed_at = NOW()` |
+| `GetOrgMembersForNotification` | `SELECT DISTINCT uor.user_id` — all non-expired org members |
+| `CreateNotification` | INSERT into notifications; unique violation handled at application layer |
+| `GetNotificationByID` | Single notification scoped by `(id, org_id, user_id, deleted_at IS NULL)` |
+| `ListNotificationsByUser` | Paginated listing scoped by `(org_id, user_id, deleted_at IS NULL)` |
+| `CountNotificationsByUser` | Count for pagination metadata |
+| `MarkNotificationRead` | `UPDATE … SET read_at = NOW() WHERE read_at IS NULL` RETURNING |
+| `MarkAllNotificationsRead` | Bulk read; `WHERE read_at IS NULL AND deleted_at IS NULL` |
+| `SoftDeleteNotification` | `:execrows` — rows-affected check for 404 on double-delete |
+| `GetUserPreferences` | All preferences for a user in an org |
+| `GetUserPreference` | Single preference row; `ErrNoRows` = enabled by default |
+| `UpsertNotificationPreference` | `ON CONFLICT DO UPDATE SET enabled, updated_at` |
+| `GetNotificationPreferencesForEvent` | Batch-load all preferences for `(org, event_type, channel)` — eliminates N+1 |
+
+#### Permission Added
+
+| Permission | Slug | Granted to |
+|-----------|------|------------|
+| Manage Notifications | `notification.manage` | `platform_admin`, `org_owner`, `org_admin` |
+
+Personal notification endpoints (read, delete own, preferences) require only `RequireAuth`.
+
+#### Phase 12 Hardening Review — Defects Found and Resolved
+
+An adversarial production review of the Phase 12 implementation identified two defects. Both were resolved before marking the phase production-ready.
+
+##### Defect 1 — First-Time Preference Creation Fails with Audit Constraint Violation (Critical)
+
+**Problem identified:** `UpsertPreference` always used `AuditActionUpdate`. When creating a preference for the first time, `GetUserPreference` returns `pgx.ErrNoRows`, leaving `oldData = nil`. The audit_logs table enforces `chk_audit_update_has_both_snapshots`: `action = 'update'` requires both `old_data IS NOT NULL` and `new_data IS NOT NULL`. Every first-time preference creation failed with a PostgreSQL constraint violation, rolling back the transaction. The endpoint returned HTTP 500 on first invocation for any user.
+
+**Fix applied:** Added `isCreate bool` flag to `UpsertPreference`. When `GetUserPreference` returns `pgx.ErrNoRows`:
+- `isCreate = true` → `AuditActionCreate` with only `new_data` (valid per constraint — `old_data IS NULL` is allowed for `create` actions)
+
+When an existing row is found:
+- `isCreate = false` → `AuditActionUpdate` with both `old_data` and `new_data` (constraint satisfied)
+
+**Review status: PASS.** First-time and update paths now both satisfy the audit constraint.
+
+##### Defect 2 — DrainOutbox N+1 Preference Queries (Performance FAIL)
+
+**Problem identified:** The drain loop issued one `GetUserPreference` SQL query per `(outbox_entry × org_member)` pair. At 1,000 org members with 100 pending entries, this is 100,000 sequential round-trips in one transaction. At the 100,000-user scale target, it would produce 10,000,000 queries per drain call — incompatible with production operation.
+
+**Fix applied:** Added `GetNotificationPreferencesForEvent` — a single query returning all preference rows for a given `(organization_id, event_type, channel)`. Before the fan-out loop, `DrainOutbox` collects unique `(event_type, channel)` pairs from pending entries and issues one batch query per unique pair. The result is loaded into an in-memory `map[[16]byte]bool` (userID bytes → enabled). The inner fan-out loop resolves preferences from the map with zero SQL.
+
+**Query complexity:**
+
+| Org size | Preference queries — Before | Preference queries — After |
+|----------|----------------------------|---------------------------|
+| 100 users, 100 entries | 10,000 | ≤ 9 (one per event type) |
+| 1,000 users, 100 entries | 100,000 | ≤ 9 |
+| 10,000 users, 100 entries | 1,000,000 | ≤ 9 |
+| 100,000 users, 100 entries | 10,000,000 | ≤ 9 |
+
+Database query count for preference resolution is now bounded by the ENUM cardinality (9 event types), independent of organization size.
+
+**Review status: PASS.** No SQL executes inside the per-member loop. Preference resolution is memory-only after the batch load.
+
+#### Phase 12 Production Hardening Review (adversarial, all PASS after hotfixes)
+
+| Check | Result |
+|-------|--------|
+| Multi-tenant isolation | **PASS** |
+| Personal data isolation (org_id + user_id on every query) | **PASS** |
+| Outbox correctness (atomic with domain write) | **PASS** |
+| Drain idempotency (UNIQUE outbox_id+user_id+channel) | **PASS** |
+| FOR UPDATE SKIP LOCKED (concurrent drain safety) | **PASS** |
+| Match CAS correctness (no stale status overwrites) | **PASS** |
+| Notification preferences — first-time create | **PASS** (hotfix applied) |
+| Notification preferences — update existing | **PASS** |
+| Audit correctness (AuditActionCreate vs AuditActionUpdate) | **PASS** (hotfix applied) |
+| Read / read-all idempotency | **PASS** |
+| Delete correctness (double-delete → 404) | **PASS** |
+| Delivery consistency (drain-failure isolation) | **PASS** |
+| Performance — preference query complexity | **PASS** (hotfix applied; O(event types) not O(members)) |
+
+---
+
+### Auth Security Hotfix v2 — Refresh Token Replay Redesign (Complete)
+
+**Status: COMPLETE. Adversarial review: PASS. Production readiness: PASS.**
+
+#### Problem
+
+The previous replay detection in `RotateRefreshToken` used a 30-second grace window (`rotationWindow = 30 * time.Second`). When a revoked token was presented, the logic compared `time.Since(revoked_at)` against the window:
+
+- If within 30 seconds → `ErrInvalidToken` (no wipe) — assumed concurrent race
+- If older than 30 seconds → `ErrTokenReuse` (full wipe) — assumed replay attack
+
+This design had two failure modes:
+
+1. **False negative (security hole):** A stolen token replayed within 30 seconds of the legitimate rotation was silently accepted as a race — no session wipe, the attacker's request returned the same error as a legitimate retry.
+2. **False positive (DoS on user sessions):** Any legitimate concurrent refresh (two browser tabs, two devices) that landed more than 30 seconds apart triggered a full session wipe, locking the user out everywhere.
+
+The 30-second window was an arbitrary tuning parameter with no correct value. Under load (connection pool saturation, high DB latency), even legitimate sequential retries could breach the window.
+
+#### Solution
+
+Migration 000023 adds `successor_id UUID NULL` to `refresh_tokens`. When a token is rotated, `RevokeAndLinkSuccessor` atomically sets both `revoked_at = NOW()` and `successor_id = new_token.ID` in a single UPDATE. `successor_id` is a **state classification marker**, not a navigable reference — the application only ever tests `IS NULL` or `IS NOT NULL`. No FK, no ON DELETE behaviour.
+
+The `rotationWindow` constant and all `time.Since(...)` comparisons were removed. The replay state machine (see Section 3) is entirely structural.
+
+#### Transaction Order Change
+
+The new rotation transaction inserts the new token **before** revoking the old one, because `RevokeAndLinkSuccessor` needs the new token's ID as a parameter. If the insert fails, the old token is never revoked and remains valid. If the atomic revoke+link fails, the inserted new token is rolled back. No orphaned state in any failure path.
+
+#### Rows-Affected Invariant
+
+`RevokeAndLinkSuccessor` is declared `:execrows` (returns `int64`). The caller (`RotateRefreshToken`) asserts `rowsAffected == 1` after every call. Under correct execution this assertion is always true — the `FOR UPDATE` lock prevents any concurrent modification of the old token row between the state check and the UPDATE. The assertion is a defense-in-depth guard against future bugs (e.g., calling the function without first holding the lock). Any other count returns a hard error and rolls back the transaction.
+
+#### Files Changed
+
+| File | Change |
+|------|--------|
+| `db/migrations/000023_refresh_token_successor_tracking.up.sql` | ADD COLUMN `successor_id UUID NULL`; ADD CONSTRAINT `chk_refresh_tokens_successor` |
+| `db/migrations/000023_refresh_token_successor_tracking.down.sql` | DROP CONSTRAINT; DROP COLUMN |
+| `db/queries/auth.sql` | Added `RevokeAndLinkSuccessor :execrows` query |
+| `db/sqlc/auth.sql.go` | Regenerated — `RevokeAndLinkSuccessorParams`, `RevokeAndLinkSuccessor() (int64, error)`; all SELECT scans include `SuccessorID` |
+| `db/sqlc/models.go` | Regenerated — `RefreshToken` struct gains `SuccessorID pgtype.UUID` |
+| `internal/auth/repository.go` | Removed `rotationWindow` constant; removed `time.Since(...)` comparison; rewrote `RotateRefreshToken` with new state machine; added `"fmt"` import |
+
+No changes to: `service.go`, `handler.go`, `errors.go`, `dto.go`, `tokens.go`, `passwords.go`, `middleware.go`. Service interface is unchanged.
+
+#### Adversarial Review Results
+
+| Check | Result |
+|-------|--------|
+| Concurrent refresh requests (same token) | **PASS** |
+| Concurrent logout + refresh | **PASS** |
+| Concurrent logout-all + refresh | **PASS** |
+| Rotated token replay | **PASS** |
+| Explicitly revoked token replay | **PASS** |
+| Rows-affected invariant | **PASS** |
+| Transaction rollback behavior (all exit paths) | **PASS** |
+| `successor_id` state transitions | **PASS** |
+| Remaining replay-detection bypasses | **PASS** |
+| Session-revocation bypasses | **PASS** |
+
+No defects introduced. Two pre-existing conditions were identified and logged for Phase 13A:
+
+1. **Logout vs concurrent rotation race (Low):** `service.Logout` uses an unlocked pre-fetch and a plain `RevokeRefreshToken` with no transaction. If a rotation commits between the pre-fetch and the revoke, the revoke lands on an already-rotated token (0 rows affected, no error) and the newly-issued successor token remains active. The user receives HTTP 200 for the logout but their concurrent rotation's token survives. Exploitation requires sub-millisecond concurrent timing and the attacker to already possess the original token.
+
+2. **User suspension vs in-flight refresh (Low):** `assertUserActive` is called in `service.Refresh` before the rotation transaction begins. A suspension that arrives after the status check but before the rotation commits allows one final refresh token to be issued. The attacker has no refresh token to rotate and the issued access token expires in 15 minutes. The next refresh will fail the status check.
+
+Both are Phase 13A hardening items.
+
+---
+
+### Phase 13A — Security & Production Blockers (Complete)
+
+**Status: COMPLETE. Adversarial review: all 12 checks PASS. Production readiness: PASS.**
+
+Phase 13A closed all outstanding production blockers and both low-severity auth races from the Hotfix v2 review.
+
+#### Part 1 — Password Reset
+
+Migration 000024 adds `password_reset_tokens` (id, user_id FK, token_hash UNIQUE, expires_at, used_at, created_at). Tokens expire after 1 hour. The raw token is never stored; only the SHA-256 hash is persisted.
+
+**ForgotPassword flow** (`POST /api/v1/auth/forgot-password`):
+- Always returns HTTP 200 with the same message regardless of whether the email exists (prevents user-enumeration)
+- In development, the raw token is returned in the response body; in production the field is stripped by the handler (`IsDevelopment()` gate, identical to the verification token pattern)
+- Token creation and audit record written atomically in `ForgotPasswordTransaction`
+
+**ResetPassword flow** (`POST /api/v1/auth/reset-password`) — single atomic transaction:
+1. `GetPasswordResetTokenByHashForUpdate` — acquires `FOR UPDATE` row lock; serialises concurrent consumption attempts
+2. Validates `used_at IS NULL` and `expires_at > NOW()`
+3. `UsePasswordResetToken(token.ID)` — marks the presented token used
+4. `UseAllUserPasswordResetTokens(token.UserID)` — invalidates all other outstanding tokens for the user; prevents stale tokens from being used after the password changes
+5. `UpdateUserPasswordHash` — replaces the bcrypt hash
+6. `RevokeUserRefreshTokens` — revokes all active sessions; `successor_id` stays NULL (Case 3 semantics from Hotfix v2)
+7. `CreateAuditLog` — `AuditActionUpdate` on `users` entity with both old_data and new_data
+8. COMMIT
+
+#### Part 2 — Rate Limiting
+
+`internal/platform/middleware/ratelimit.go` — per-IP token-bucket rate limiter using `golang.org/x/time/rate`. Replaces the stub.
+
+- `IPRateLimiter` struct: `sync.Mutex`-protected `map[string]*ipEntry`; each entry holds a `*rate.Limiter` and `lastSeen time.Time`
+- Background goroutine prunes idle entries (not seen for > 10 min) every 5 minutes; memory bounded by `O(active unique IPs)`
+- `Stop()` closes a done channel; safe to call multiple times
+- Applied to the entire `/api/v1/auth` route group via `r.Use(limiter.Middleware())`
+- Config: `RATE_LIMIT_ENABLED` (default true), `RATE_LIMIT_AUTH_RPS` (default 10 req/s), `RATE_LIMIT_AUTH_BURST` (default 20)
+- Returns 429 with `{"error":"rate limit exceeded"}` on exhaustion
+
+#### Part 3 — CORS Wiring
+
+`middleware.CORS(cfg.CORSAllowedOrigins)` mounted in `bootstrap/router.go` (after `chimw.RealIP`, before route handlers).
+
+- `Access-Control-Allow-Credentials: true` added; sent only when a specific origin is matched (not for wildcard-only mode, which would be rejected by browsers)
+- `Vary: Origin` header always appended
+- Config: `CORS_ALLOWED_ORIGINS` (comma-separated; defaults to `http://localhost:3000,http://localhost:5173`)
+
+#### Part 4 — Cleanup Scheduler
+
+`internal/cleanup/scheduler.go` — background token expiry scheduler.
+
+- `Scheduler` struct: `*db.Queries`, configurable `interval`, slog logger, done channel
+- `Start()` launches a single goroutine; `Stop()` signals exit (safe to call multiple times)
+- `runOnce()` runs under a 30-second context timeout; calls `DeleteExpiredRefreshTokens`, `DeleteExpiredEmailVerificationTokens`, `DeleteExpiredPasswordResetTokens` independently — a failure in one does not prevent the others
+- Ticker fires every `CLEANUP_INTERVAL_MINUTES` (default 60); missed ticks from slow cycles are dropped (correct — idempotent cleanup)
+- Constructed and started in `App.Handler()`; stopped in `App.Shutdown()` (called from `main.go` before `srv.Shutdown()`)
+- Config: `CLEANUP_INTERVAL_MINUTES` (default 60)
+
+#### Part 5 — Auth Hardening Backlog
+
+**Fix 1 — Logout vs concurrent rotation race:**
+`service.Logout` previously did an unlocked `GetRefreshTokenByHash` → `RevokeRefreshToken`, leaving a window where a concurrent rotation could issue a successor token that the revoke never reached.
+
+New: `LogoutTransaction` wraps the operation in a `BEGIN` / `GetRefreshTokenByHashForUpdate` (FOR UPDATE) / `RevokeRefreshToken` / `COMMIT` sequence. The rotation transaction and the logout transaction now compete for the same row lock — only one can proceed. If rotation won, logout sees `revoked_at IS NOT NULL` and returns success (idempotent). If logout won, any subsequent rotation sees Case 3 (`revoked_at IS NOT NULL, successor_id IS NULL`) → `ErrTokenReuse` → all sessions wiped.
+
+**Fix 2 — User suspension vs in-flight refresh:**
+`assertUserActive` previously ran in `service.Refresh` before the rotation transaction began. The window between that check and the `COMMIT` allowed a suspension to slip through.
+
+New: `GetUserByID` is called inside `RotateRefreshToken` after the `FOR UPDATE` lock on the token row is acquired (Step 3b). This is a READ COMMITTED read — it sees the latest committed user state. The check happens 2–3 DB round-trips before the commit rather than potentially hundreds of milliseconds earlier.
+
+#### Files Changed (Phase 13A)
+
+| File | Change |
+|------|--------|
+| `db/migrations/000024_password_reset_tokens.{up,down}.sql` | New — password_reset_tokens table + indexes |
+| `db/queries/password_reset_tokens.sql` | New — 5 queries: Create, GetForUpdate, UseOne, UseAll, DeleteExpired |
+| `db/queries/users.sql` | Added `UpdateUserPasswordHash :exec` |
+| `db/sqlc/password_reset_tokens.sql.go` | Generated — 5 query functions |
+| `db/sqlc/users.sql.go` | Regenerated — `UpdateUserPasswordHash` added |
+| `db/sqlc/models.go` | Regenerated — `PasswordResetToken` struct added |
+| `internal/auth/errors.go` | Added `ErrResetTokenInvalid`, `ErrResetTokenExpired`, `ErrResetTokenUsed` |
+| `internal/auth/tokens.go` | Added `passwordResetTokenDuration = 1h`, `GetPasswordResetTokenExpiryTime()` |
+| `internal/auth/dto.go` | Added `ForgotPasswordRequest`, `ForgotPasswordResponse`, `ResetPasswordRequest` |
+| `internal/auth/repository.go` | Added `LogoutTransaction`, `ForgotPasswordTransaction`, `ResetPasswordTransaction`, `DeleteExpiredPasswordResetTokens`; added user-status re-check inside `RotateRefreshToken` (Step 3b) |
+| `internal/auth/service.go` | Added `ForgotPassword`, `ResetPassword`; rewired `Logout` → `LogoutTransaction` |
+| `internal/auth/handler.go` | Added `ForgotPassword`, `ResetPassword` handlers; extended `writeAuthError` and `errorKind` |
+| `internal/auth/routes.go` | Added `/forgot-password`, `/reset-password`; wired `limiter.Middleware()` onto auth group; added `limiter` parameter |
+| `internal/platform/config/config.go` | Added `CORSAllowedOrigins`, `RateLimitEnabled/RPS/Burst`, `CleanupIntervalMinutes`; added `getEnvBool/Int/Float/StringSlice` helpers |
+| `internal/platform/middleware/cors.go` | Added `Access-Control-Allow-Credentials`, `Vary: Origin`; wildcard-only mode disables credentials header |
+| `internal/platform/middleware/ratelimit.go` | Full implementation (replaces stub); per-IP limiter + background cleanup goroutine |
+| `internal/cleanup/scheduler.go` | New package — background token cleanup scheduler |
+| `internal/bootstrap/app.go` | Added `scheduler`, `rateLimiter` fields; `Handler()` initialises both; `Shutdown()` stops both |
+| `internal/bootstrap/router.go` | Wired CORS middleware; added `limiter` parameter |
+| `internal/bootstrap/modules.go` | Added `limiter` parameter; passes it to `auth.RegisterRoutes` |
+| `cmd/api/main.go` | Calls `app.Shutdown(ctx)` before `srv.Shutdown(ctx)` |
+| `go.mod` / `go.sum` | Added `golang.org/x/time v0.15.0` |
+
+#### Phase 13A Adversarial Review Results
+
+| Check | Result |
+|-------|--------|
+| Password reset replay resistance | **PASS** |
+| Concurrent consumption of the same token | **PASS** |
+| Concurrent reset requests for same user | **PASS** (PostgreSQL deadlock detected and resolved; no data corruption) |
+| Session revocation on password reset | **PASS** |
+| Forgot-password enumeration resistance | **PASS** (body/status; timing side-channel documented as low-severity) |
+| Rate limiter concurrency correctness | **PASS** |
+| Rate limiter memory cleanup | **PASS** |
+| Scheduler overlap behavior | **PASS** |
+| Scheduler shutdown behavior | **PASS** |
+| Logout vs rotation race fix | **PASS** |
+| Suspension vs refresh race fix | **PASS** |
+| CORS correctness | **PASS** |
+
+Two low-severity findings documented:
+1. **Concurrent same-user reset token deadlock** — two tokens for the same user presented simultaneously can deadlock; PostgreSQL handles this correctly (one aborts, one succeeds, no data corruption). Fix: acquire token locks in deterministic order. Low priority.
+2. **Timing side-channel in ForgotPassword** — "not found" path is faster than "found" path by ~1 DB query. Body and status code are enumeration-resistant. Timing equalization deferred.
+
+---
+
 ### Concurrency Hardening — Registration Capacity
 
 A code review identified a TOCTOU (Time of Check to Time of Use) race condition in the original capacity enforcement:
@@ -1413,19 +1852,25 @@ A code review identified a TOCTOU (Time of Check to Time of Use) race condition 
 
 **Problem:** The service-layer terminal-state guard (`service.go:Update`) reads `current.Status` outside any transaction. Two concurrent PATCH requests that both read a non-terminal status (e.g., `live`) both pass the guard, both enter `UpdateWithAudit`, and both execute `UpdateMatch`. PostgreSQL serialises the two writes on the same row, but the second write has no status filter — it succeeds and overwrites the terminal state committed by the first. A match marked `completed` could be overwritten to `abandoned`, or a `cancelled` match reactivated to `live`.
 
-**Fix applied:**
-
-Both `UpdateMatch` and `CancelMatch` now include a database-level terminal-state guard in their WHERE clauses (`db/queries/matches.sql`):
+**Initial fix (Phase 8A):** Added a NOT IN terminal-state guard:
 
 ```sql
 AND  status NOT IN ('completed', 'cancelled', 'abandoned')
 ```
 
-PostgreSQL evaluates this predicate atomically as part of the row-level write. If the match is already terminal (committed by a concurrent request between the service read and this transaction), the WHERE condition matches zero rows. `pgx.ErrNoRows` is returned and the repository maps it to `ErrMatchNotUpdatable` (HTTP 422). The terminal state is preserved.
+**Phase 12B upgrade — Compare-And-Swap:** The NOT IN guard was replaced with a strict compare-and-swap that asserts the match is still in the exact state the service observed before entering the transaction:
 
-The service-layer guard remains in place as the first line of defence for sequential requests, avoiding unnecessary transaction overhead.
+```sql
+-- UpdateMatch
+AND  status = $20    -- $20 = previous_status (Status_2 in sqlc params)
 
-**Review status: PASS.** Concurrent requests that both pass the service-layer check cannot both write to the same match row if the first write transitions the match to a terminal state.
+-- CancelMatch
+AND  status = $3     -- $3 = previous_status
+```
+
+The CAS is strictly stronger than the NOT IN guard: it rejects any concurrent transition, not only those to terminal states. This was required for Phase 12 outbox correctness — the outbox entry must carry the verified previous and new status values, which is only guaranteed when the write is CAS-protected.
+
+**Review status: PASS.** Concurrent requests that both pass the service-layer check cannot both write to the same match row if the first write transitions the match to any other status.
 
 ---
 
@@ -1452,15 +1897,23 @@ The service-layer guard remains in place as the first line of defence for sequen
 - [x] **Score snapshot at completion** — Phase 10 (`matches.home_score`/`away_score` written once inside locked completion transaction; winner consistency enforced; `ErrWinnerScoreMismatch` HTTP 422)
 - [x] **Tournament Standings & Rankings** — Phase 10 (`internal/standings/`; `GET /tournaments/{id}/standings`; 7-level tiebreak chain; point system from `tournaments.settings`; fully deterministic)
 - [x] **Media Management** — Phase 11 (`internal/media/`; upload/list/get/update/delete endpoints; StorageBackend abstraction; local + S3-compatible backends; server-side MIME detection + image decode + JPEG normalize + thumbnail generation; content-hash duplicate detection; primary-image swap with FOR UPDATE lock + unique-index backstop; adversarial review: all 17 checks PASS)
+- [x] **Notifications module** — Phase 12 (Transactional Outbox Pattern; `notification_outbox`/`notifications`/`notification_preferences` tables; 7 API endpoints; in-app delivery via synchronous post-commit DrainOutbox with FOR UPDATE SKIP LOCKED; drain idempotency via UNIQUE(outbox_id,user_id,channel); match CAS upgrade; batch preference loading — O(event types) queries not O(members); adversarial review: 2 defects identified and resolved; all 13 checks PASS)
+- [x] **Auth Security Hotfix v2** — Replaced time-window refresh-token replay detection with deterministic structural state machine; `successor_id UUID NULL` column on `refresh_tokens` (migration 000023); `RevokeAndLinkSuccessor :execrows` query; removed `rotationWindow` constant and all `time.Since(...)` logic; `RotateRefreshToken` rewritten with 3-case state machine; rows-affected invariant enforced; adversarial review: all 10 checks PASS; no defects introduced
+- [x] **Phase 13A — Security & Production Blockers** — Password reset flow (`POST /forgot-password` / `POST /reset-password`; migration 000024; single-use `FOR UPDATE` transaction; atomic sibling-token invalidation; full session revocation; audit logging); per-IP rate limiting (`golang.org/x/time/rate`; configurable RPS + burst; background cleanup; 429 on exhaustion); CORS wired (`Access-Control-Allow-Credentials`, `Vary: Origin`; wildcard-only mode disables credentials); cleanup scheduler (`internal/cleanup/`; hourly by default; graceful shutdown via done channel); logout race fixed (`LogoutTransaction` with FOR UPDATE); suspension race fixed (user status re-checked inside `RotateRefreshToken` transaction); adversarial review: all 12 checks PASS; two low-severity findings documented
+
+### Previously tracked auth hardening items (resolved in Phase 13A)
+
+- [x] **Logout vs concurrent rotation race** — Fixed by `LogoutTransaction` (FOR UPDATE lock). Adversarial review: PASS.
+- [x] **User suspension vs in-flight refresh** — Fixed by user-status re-check inside `RotateRefreshToken` transaction (Step 3b). Adversarial review: PASS.
 
 ### Must-have before first production deployment
 
-- [ ] **Password reset flow** — `POST /api/v1/auth/forgot-password` / `POST /api/v1/auth/reset-password`
-- [ ] **Refresh token cleanup job** — `DeleteExpiredRefreshTokens` is generated and correct but never called. Without it the `refresh_tokens` table grows unboundedly.
-- [ ] **Email verification token cleanup job** — `DeleteExpiredVerificationTokens` is implemented on the service but never called on a schedule.
-- [ ] **CORS configuration** — `internal/platform/middleware/cors.go` is fully implemented (`CORS(allowedOrigins)` + origin matching + OPTIONS preflight handling) but is not wired into the router. `bootstrap/router.go` does not call `r.Use(middleware.CORS(...))`. Browsers will block cross-origin requests until it is added to the middleware stack.
-- [ ] **Rate limiting** — `internal/platform/middleware/ratelimit.go` is a stub. Auth endpoints are unprotected against brute-force attacks.
-- [ ] **Remove `verification_token` from register response in production** — currently returned for development convenience; must be gated behind `IsDevelopment()` before deployment.
+- [x] **Password reset flow** — Implemented in Phase 13A (`POST /forgot-password`, `POST /reset-password`, migration 000024)
+- [x] **Refresh token cleanup job** — `DeleteExpiredRefreshTokens` called by the cleanup scheduler (`internal/cleanup/`; hourly by default)
+- [x] **Email verification token cleanup job** — `DeleteExpiredEmailVerificationTokens` called by the cleanup scheduler
+- [x] **CORS configuration** — `middleware.CORS(cfg.CORSAllowedOrigins)` wired in `bootstrap/router.go`; `Access-Control-Allow-Credentials` support added
+- [x] **Rate limiting** — Per-IP token-bucket limiter implemented and wired onto the `/api/v1/auth` route group
+- [x] **Remove `verification_token` from register response in production** — Gated behind `IsDevelopment()` in `handler.Register`
 
 ### Required for feature completeness
 
@@ -1501,8 +1954,10 @@ The service-layer guard remains in place as the first line of defence for sequen
 | Phase 9 | Live Scoring | **COMPLETE** |
 | Phase 10 | Rankings & Standings | **COMPLETE** |
 | Phase 11 | Media Management | **COMPLETE** |
-| Phase 12 | Notifications | NOT STARTED |
-| Phase 13 | Hardening, Observability & Tests | NOT STARTED |
+| Phase 12 | Notifications | **COMPLETE** |
+| Auth Security Hotfix v2 | Refresh token replay redesign — structural state machine | **COMPLETE** |
+| Phase 13A | Security & Production Blockers | **COMPLETE** |
+| Phase 13B | Observability & Tests | NOT STARTED |
 
 ---
 
@@ -1524,36 +1979,56 @@ Full media attachment lifecycle implemented and production-hardened. Upload pipe
 
 ---
 
-### Phase 12 — Notifications
+### Phase 12 — Notifications (Complete)
 
-*Not designed. Depends on match events and tournament status changes.*
+Transactional Outbox notification system implemented and production-hardened. Domain transactions (matches, tournaments, registrations) write atomically to `notification_outbox`. After commit, a synchronous `DrainOutbox` call fans out in-app notifications to all org members in a separate transaction using `FOR UPDATE SKIP LOCKED`. `UNIQUE (outbox_id, user_id, channel)` enforces drain idempotency at the DB level. Match `UpdateMatch` and `CancelMatch` upgraded to compare-and-swap guards (`AND status = $previous_status`). Preference resolution batch-loaded in O(distinct event types) queries — independent of org size. Adversarial review identified 2 defects (preference audit constraint violation; N+1 preference queries); both resolved before phase marked complete. All 13 adversarial review checks PASS.
 
 ---
 
-### Phase 13 — Hardening, Observability & Tests
+### Auth Security Hotfix v2 — Refresh Token Replay Redesign (Complete)
 
-1. **Test suite** — integration tests using `testcontainers-go` against a real PostgreSQL 17 instance. Priority: auth service, multi-tenant isolation, tournament registration rules, match lifecycle and concurrency invariants, match event sequence integrity.
+Replaced the 30-second time-window replay detection in `RotateRefreshToken` with a deterministic structural state machine. `refresh_tokens` gains `successor_id UUID NULL` (migration 000023, no FK). Token rotation atomically sets both `revoked_at` and `successor_id` via `RevokeAndLinkSuccessor :execrows`. The three-case state matrix (`IS NULL` / `IS NOT NULL + successor` / `IS NOT NULL + no successor`) eliminates false positives from concurrent legitimate refreshes and closes the 30-second replay blind spot. New token is inserted before the old token is revoked so its ID is available for the link. `rowsAffected == 1` is asserted as a defensive invariant. `go fmt`, `go vet`, `go build` clean. Adversarial review: all 10 checks PASS. No defects introduced.
+
+---
+
+### Phase 13A — Security & Production Blockers (Complete)
+
+All pre-production blockers resolved. Password reset, rate limiting, CORS, cleanup scheduler, logout race, and suspension race — all implemented and adversarially reviewed (12/12 PASS). See Phase 13A implementation notes in Section 7 for full details.
+
+New dependencies: `golang.org/x/time v0.15.0` (rate limiting).  
+New package: `internal/cleanup/` (token expiry scheduler).  
+New migration: `000024_password_reset_tokens`.  
+New config fields: `CORS_ALLOWED_ORIGINS`, `RATE_LIMIT_ENABLED`, `RATE_LIMIT_AUTH_RPS`, `RATE_LIMIT_AUTH_BURST`, `CLEANUP_INTERVAL_MINUTES`.
+
+---
+
+### Phase 13B — Observability & Tests
+
+1. **Test suite** — integration tests using `testcontainers-go` against a real PostgreSQL 17 instance. Priority: auth service (replay state machine, concurrent refresh, logout race), multi-tenant isolation, tournament registration rules, match lifecycle and concurrency invariants, match event sequence integrity, notification drain correctness.
 2. **OpenTelemetry tracing** — instrument repository and service layers.
 3. **Prometheus metrics** — request latency histograms, DB pool stats, active sessions counter.
-4. **Password reset flow** — `POST /auth/forgot-password` / `POST /auth/reset-password`.
-5. **Rate limiting & CORS** — implement stubs before production deployment.
-6. **`go mod tidy`** — move `golang-jwt/jwt/v5` from `indirect` to direct.
+4. **`go mod tidy`** — move `golang-jwt/jwt/v5` from `indirect` to direct.
 
 ---
 
 ## 10. Next Recommended Phase
 
-**Phase 12 — Notifications**
+**Phase 13B — Observability & Tests**
 
-Phase 11 (Media Management) is complete and production-hardened. The media module implements the full upload lifecycle with server-side MIME validation, JPEG normalization, thumbnail generation, and a provider-agnostic storage backend. All 17 adversarial review checks passed after three identified defects were resolved. The next step is the notifications module.
+Phase 13A (Security & Production Blockers) is complete. All pre-production deployment blockers have been resolved. The auth module now has: structural replay detection (Hotfix v2), password reset, per-IP rate limiting, CORS with credentials support, a background cleanup scheduler, and both auth race conditions closed. Adversarial review of Phase 13A produced all 12 PASS verdicts.
 
-**Planning goals:**
+**The system is now functionally production-deployable.** Phase 13B adds observability and a test safety net before handling real user traffic at scale.
 
-- Event-driven notification delivery triggered by domain events: match status transitions, tournament registration approvals, score milestones.
-- Notification delivery channels to design: in-app (DB-persisted), email (transactional via SMTP or SendGrid), webhook (org-configurable).
-- A `notifications` table scoped by `organization_id` and `user_id` with read/unread state and a `payload` JSONB column for channel-specific metadata.
-- A notification preference model — per-user, per-org, per-event-type opt-in/out.
-- All notification writes must be transactional with the domain event that triggered them (or queued atomically if async delivery is introduced).
+**Phase 13B goals:**
+
+1. **Integration test suite** — `testcontainers-go` against real PostgreSQL 17. Priority: auth service (replay state machine, concurrent refresh, logout race, password reset concurrency), multi-tenant isolation, tournament registration rules, match lifecycle and concurrency invariants, match event sequence integrity, notification drain correctness.
+2. **OpenTelemetry tracing** — instrument repository and service layers; trace spans per DB transaction.
+3. **Prometheus metrics** — request latency histograms, DB pool stats, active sessions counter, rate-limit reject counter.
+4. **`go mod tidy`** — promote `golang-jwt/jwt/v5` and `golang.org/x/time` from `indirect` to direct.
+
+**Two low-severity findings from Phase 13A deferred to Phase 13B:**
+- Concurrent same-user reset token deadlock — acquire locks in deterministic order inside `ResetPasswordTransaction`.
+- Timing side-channel in `ForgotPassword` — equalise response time with a dummy transaction when the email is not found.
 
 ---
 
@@ -1566,6 +2041,7 @@ Phase 11 (Media Management) is complete and production-hardened. The media modul
 | `backend/db/sqlc/` | Generated Go — regenerate with `sqlc generate` from `backend/` |
 | `backend/internal/auth/errors.go` | Canonical error sentinels for the auth domain |
 | `backend/internal/auth/tokens.go` | JWT generation, validation, token hashing |
+| `backend/internal/auth/repository.go` | `RotateRefreshToken` — FOR UPDATE lock + 3-case replay state machine + `RevokeAndLinkSuccessor` + rows-affected invariant (Auth Security Hotfix v2) |
 | `backend/internal/auth/service.go` | Auth business logic including multi-org resolution |
 | `backend/internal/auth/middleware.go` | `RequireAuth()`, `RequireRole()`, `RequirePermission()` — gates for protected routes |
 | `backend/internal/auth/authorization.go` | `AuthorizationService` — DB-backed permission checks |
@@ -1596,7 +2072,21 @@ Phase 11 (Media Management) is complete and production-hardened. The media modul
 | `backend/db/migrations/000020_media_hardening.up.sql` | storage_key, content_hash, primary uniqueness index, media.update + media.delete RBAC |
 | `backend/db/migrations/000021_media_content_uniqueness.up.sql` | Unique index preventing concurrent duplicate upload records |
 | `backend/db/queries/media.sql` | 15 media SQL queries including :execrows delete |
+| `backend/db/migrations/000022_notifications.up.sql` | notification_event_type/channel ENUMs, outbox/notifications/preferences tables, idempotency constraint, indexes, notification.manage RBAC |
+| `backend/db/migrations/000023_refresh_token_successor_tracking.up.sql` | Adds `successor_id UUID NULL` and `chk_refresh_tokens_successor` CHECK to `refresh_tokens`; enables structural replay detection |
+| `backend/db/migrations/000024_password_reset_tokens.up.sql` | `password_reset_tokens` table; single-use, SHA-256-hashed, 1-hour expiry; user FK CASCADE; two indexes |
+| `backend/db/queries/auth.sql` | Refresh token lifecycle queries; `RevokeAndLinkSuccessor :execrows` (Auth Security Hotfix v2) |
+| `backend/db/queries/password_reset_tokens.sql` | 5 queries: Create, GetForUpdate, UseOne, UseAll, DeleteExpired |
+| `backend/internal/auth/repository.go` | `RotateRefreshToken` (replay state machine + user status re-check); `LogoutTransaction` (FOR UPDATE); `ForgotPasswordTransaction`; `ResetPasswordTransaction` (7-step atomic reset) |
+| `backend/internal/platform/middleware/ratelimit.go` | `IPRateLimiter` — per-IP token bucket; sync.Mutex-protected map; background cleanup goroutine; Stop() via done channel |
+| `backend/internal/platform/middleware/cors.go` | `CORS()` middleware — origin reflection; `Allow-Credentials` (specific origins only); `Vary: Origin`; preflight 204 |
+| `backend/internal/cleanup/scheduler.go` | `Scheduler` — background token expiry cleanup; configurable interval; graceful shutdown via done channel |
+| `backend/internal/bootstrap/app.go` | `App.Handler()` initialises rate limiter + cleanup scheduler; `App.Shutdown()` stops both |
+| `backend/db/queries/notifications.sql` | 16 notification SQL queries; includes `GetNotificationPreferencesForEvent` for O(event_types) batch preference loading |
+| `backend/internal/notifications/repository.go` | `DrainOutbox` (FOR UPDATE SKIP LOCKED, batch prefs, UNIQUE conflict handling); `UpsertPreference` (dynamic audit action: AuditActionCreate vs AuditActionUpdate) |
+| `backend/internal/notifications/service.go` | `DrainOutbox` entry point — errors swallowed to preserve domain operation result |
+| `backend/internal/notifications/trigger/trigger.go` | `WriteOutboxEntry` — must be called with a transaction-scoped `*db.Queries` handle |
 
 ---
 
-*This document was last updated on 2026-06-02 (Phase 11 complete). It should be updated whenever a phase is completed or significant architectural changes are made.*
+*This document was last updated on 2026-06-03 (Phase 13A complete). It should be updated whenever a phase is completed or significant architectural changes are made.*

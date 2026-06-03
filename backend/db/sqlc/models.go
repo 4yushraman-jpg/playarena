@@ -1134,6 +1134,18 @@ type Organization struct {
 	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
 }
 
+// Single-use password reset tokens. Stores only the SHA-256 hash of the raw token — the raw token is emailed to the user and never stored here. A token is valid when: used_at IS NULL AND expires_at > NOW(). Expired and used rows are removed by the background cleanup scheduler.
+type PasswordResetToken struct {
+	ID     pgtype.UUID `json:"id"`
+	UserID pgtype.UUID `json:"user_id"`
+	// SHA-256 hex-encoded hash of the raw reset token. Lookup: WHERE token_hash = encode(digest($raw, 'sha256'), 'hex').
+	TokenHash string             `json:"token_hash"`
+	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
+	// Set to NOW() when the token is consumed by a successful password reset. Also set on all sibling tokens for the same user when any reset completes, preventing stale tokens from being used after the password has changed.
+	UsedAt    pgtype.Timestamptz `json:"used_at"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
 // Atomic capability definitions. Deployed by application code; not user-editable. slug convention: <resource>.<action> (e.g. tournament.create, match.score). resource and action are kept as separate columns for fine-grained RBAC queries.
 type Permission struct {
 	ID   pgtype.UUID `json:"id"`
@@ -1185,6 +1197,8 @@ type RefreshToken struct {
 	IpAddress *netip.Addr        `json:"ip_address"`
 	UserAgent *string            `json:"user_agent"`
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	// UUID of the token issued to replace this one during rotation. NULL when the token has not been rotated (active or explicitly revoked). Non-NULL when the token was superseded by a rotation. Used exclusively as a boolean state marker — the value is never followed as a reference. Not a foreign key by design.
+	SuccessorID pgtype.UUID `json:"successor_id"`
 }
 
 // Named permission groups. Platform roles (scope = platform) have organization_id = NULL and are reserved for super-admins. Org roles are always paired with a non-NULL organization_id. is_system = TRUE marks roles seeded by migrations that cannot be deleted via the API.

@@ -128,10 +128,6 @@ func (h *Handler) Me(w http.ResponseWriter, r *http.Request) {
 }
 
 // Register handles POST /api/v1/auth/register.
-//
-// Creates a new user with status pending_verification and returns a
-// verification token. In production, remove verification_token from the
-// response and deliver it only via email.
 func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 	var req RegisterRequest
 	if err := validator.DecodeJSON(r, &req); err != nil {
@@ -153,20 +149,15 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 		slog.String("request_id", chimw.GetReqID(r.Context())),
 	)
 
-	// H2 fix: strip the verification token in production.
-	// In development it is returned for testing convenience (no email transport needed).
-	// In production the raw token must only be delivered via email — returning it in
-	// the API response allows any interceptor to bypass email verification entirely.
+	// Strip the verification token in production — it must only be delivered
+	// via email (H2 fix). In development it is returned for testing convenience.
 	if !h.config.IsDevelopment() {
-		resp.VerificationToken = "" // json:"...,omitempty" ensures the field is absent
+		resp.VerificationToken = ""
 	}
 	response.Write(w, http.StatusCreated, resp)
 }
 
 // VerifyEmail handles GET /api/v1/auth/verify-email?token=<raw_token>.
-//
-// Consumes the single-use verification token, activates the account, and
-// returns a plain success message. The client should redirect to login.
 func (h *Handler) VerifyEmail(w http.ResponseWriter, r *http.Request) {
 	rawToken := r.URL.Query().Get("token")
 	if rawToken == "" {
@@ -191,13 +182,75 @@ func (h *Handler) VerifyEmail(w http.ResponseWriter, r *http.Request) {
 	}{Message: "email verified successfully"})
 }
 
+// ForgotPassword handles POST /api/v1/auth/forgot-password.
+//
+// Always returns HTTP 200 with the same message body regardless of whether the
+// email address is registered. This prevents user-enumeration: an attacker
+// cannot distinguish "no account" from "token created" by observing the HTTP
+// response.
+//
+// In development the raw reset token is included in the response body for
+// testing without an email transport. In production the field is stripped;
+// the token is delivered only via email.
+func (h *Handler) ForgotPassword(w http.ResponseWriter, r *http.Request) {
+	var req ForgotPasswordRequest
+	if err := validator.DecodeJSON(r, &req); err != nil {
+		h.writeDecodeError(w, err)
+		return
+	}
+
+	resp, err := h.svc.ForgotPassword(r.Context(), req)
+	if err != nil {
+		h.log.ErrorContext(r.Context(), "auth.forgot_password.internal_error",
+			slog.Any("error", err),
+			slog.String("request_id", chimw.GetReqID(r.Context())),
+		)
+		// Return the generic success message even on internal errors — do not
+		// leak whether the operation failed internally.
+		response.Write(w, http.StatusOK, ForgotPasswordResponse{
+			Message: "if the email is registered, a password reset link has been sent",
+		})
+		return
+	}
+
+	// Strip the token in production — it must only reach the user via email.
+	if !h.config.IsDevelopment() {
+		resp.ResetToken = ""
+	}
+
+	response.Write(w, http.StatusOK, resp)
+}
+
+// ResetPassword handles POST /api/v1/auth/reset-password.
+//
+// Validates the reset token, updates the password, revokes all active
+// sessions, and writes an audit record — all atomically. On success all
+// existing sessions are invalidated; the client must log in again.
+func (h *Handler) ResetPassword(w http.ResponseWriter, r *http.Request) {
+	var req ResetPasswordRequest
+	if err := validator.DecodeJSON(r, &req); err != nil {
+		h.writeDecodeError(w, err)
+		return
+	}
+
+	if err := h.svc.ResetPassword(r.Context(), req); err != nil {
+		h.log.WarnContext(r.Context(), "auth.reset_password.failed",
+			slog.String("kind", errorKind(err)),
+			slog.String("request_id", chimw.GetReqID(r.Context())),
+		)
+		h.writeAuthError(w, r, err)
+		return
+	}
+
+	h.log.InfoContext(r.Context(), "auth.reset_password.success",
+		slog.String("request_id", chimw.GetReqID(r.Context())),
+	)
+	response.Write(w, http.StatusOK, struct {
+		Message string `json:"message"`
+	}{Message: "password reset successfully; all sessions have been revoked"})
+}
+
 // AdminOnly handles GET /api/v1/auth/admin-only.
-//
-// This is a demonstration endpoint that requires RequireAuth +
-// RequirePermission("role.assign") in the middleware chain. It exercises
-// the authorization layer without doing real business logic.
-//
-// Response: the caller's principal (user_id, email, role, org_id).
 func (h *Handler) AdminOnly(w http.ResponseWriter, r *http.Request) {
 	principal := GetAuthUser(r.Context())
 	if principal == nil {
@@ -240,22 +293,6 @@ type meResponse struct {
 
 // ---- error mapping ----------------------------------------------------------
 
-// writeAuthError maps domain errors to HTTP responses.
-//
-//	ErrInvalidCredentials        → 401
-//	ErrInvalidToken / Expired /
-//	  Revoked / TokenReuse       → 401
-//	ErrUserSuspended             → 403
-//	ErrUserInactive              → 403
-//	ErrUserPendingVerification   → 403
-//	ErrEmailAlreadyRegistered    → 409
-//	ErrUsernameAlreadyTaken      → 409
-//	ErrOrganizationRequired      → 409 (with org list)
-//	ErrVerificationTokenInvalid  → 400
-//	ErrVerificationTokenExpired  → 400
-//	ErrVerificationTokenUsed     → 400
-//	ErrOrganizationNotFound      → 422
-//	anything else                → 500
 func (h *Handler) writeAuthError(w http.ResponseWriter, r *http.Request, err error) {
 	var orgReq *ErrOrganizationRequired
 	if errors.As(err, &orgReq) {
@@ -291,6 +328,14 @@ func (h *Handler) writeAuthError(w http.ResponseWriter, r *http.Request, err err
 		response.Error(w, http.StatusBadRequest, "verification token has expired")
 	case errors.Is(err, ErrVerificationTokenUsed):
 		response.Error(w, http.StatusBadRequest, "verification token has already been used")
+	case errors.Is(err, ErrResetTokenInvalid):
+		response.Error(w, http.StatusBadRequest, "invalid password reset token")
+	case errors.Is(err, ErrResetTokenExpired):
+		response.Error(w, http.StatusBadRequest, "password reset token has expired")
+	case errors.Is(err, ErrResetTokenUsed):
+		response.Error(w, http.StatusBadRequest, "password reset token has already been used")
+	case errors.Is(err, ErrPasswordTooLong):
+		response.Error(w, http.StatusUnprocessableEntity, "password exceeds maximum length")
 	case errors.Is(err, ErrOrganizationNotFound):
 		response.Error(w, http.StatusUnprocessableEntity, "organization not found or access denied")
 	default:
@@ -302,7 +347,6 @@ func (h *Handler) writeAuthError(w http.ResponseWriter, r *http.Request, err err
 	}
 }
 
-// writeDecodeError writes a 400 response for body decode or validation failures.
 func (h *Handler) writeDecodeError(w http.ResponseWriter, err error) {
 	var ve *validator.ValidationError
 	if errors.As(err, &ve) {
@@ -339,8 +383,7 @@ func extractUserAgent(r *http.Request) *string {
 	return nil
 }
 
-// errorKind returns a stable loggable string identifying the error type
-// without exposing the message contents.
+// errorKind returns a stable loggable string identifying the error type.
 func errorKind(err error) string {
 	var orgReq *ErrOrganizationRequired
 	switch {
@@ -372,6 +415,14 @@ func errorKind(err error) string {
 		return "verification_token_expired"
 	case errors.Is(err, ErrVerificationTokenUsed):
 		return "verification_token_used"
+	case errors.Is(err, ErrResetTokenInvalid):
+		return "reset_token_invalid"
+	case errors.Is(err, ErrResetTokenExpired):
+		return "reset_token_expired"
+	case errors.Is(err, ErrResetTokenUsed):
+		return "reset_token_used"
+	case errors.Is(err, ErrPasswordTooLong):
+		return "password_too_long"
 	case errors.Is(err, ErrOrganizationNotFound):
 		return "organization_not_found"
 	default:

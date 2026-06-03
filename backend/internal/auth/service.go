@@ -38,12 +38,10 @@ func NewService(repo *Repository, cfg *config.Config) *Service {
 //
 // Timing note: a dummy bcrypt comparison is always performed when the email is
 // not found, so the response time is indistinguishable from a wrong-password
-// failure. This prevents timing-based email enumeration (H3).
+// failure. This prevents timing-based email enumeration.
 func (s *Service) Login(ctx context.Context, req LoginRequest, ipAddress *netip.Addr, userAgent *string) (*LoginResponse, error) {
 	user, err := s.repo.GetUserByEmail(ctx, req.Email)
 	if err != nil {
-		// H3 fix: equalise timing regardless of whether the email exists.
-		// dummyBcryptHash was pre-computed at bcrypt cost 12 (matches real cost).
 		_ = VerifyPassword(req.Password, dummyBcryptHash)
 		return nil, ErrInvalidCredentials
 	}
@@ -100,8 +98,8 @@ func (s *Service) Login(ctx context.Context, req LoginRequest, ipAddress *netip.
 // and issues a new access token + refresh token pair.
 //
 // Token rotation: every successful call revokes the presented token and issues
-// a new one. Replayed (already-revoked) tokens trigger immediate revocation of
-// all user sessions.
+// a new one. Replayed (already-revoked) tokens trigger deterministic replay
+// detection based on successor_id state — no time windows.
 func (s *Service) Refresh(ctx context.Context, req RefreshRequest, ipAddress *netip.Addr, userAgent *string) (*RefreshResponse, error) {
 	if req.RefreshToken == "" {
 		return nil, ErrInvalidToken
@@ -116,8 +114,6 @@ func (s *Service) Refresh(ctx context.Context, req RefreshRequest, ipAddress *ne
 
 	user, err := s.repo.GetUserByID(ctx, existingToken.UserID)
 	if err != nil {
-		// H5 fix: a deleted user with a live refresh token must return 401,
-		// not 500. ErrUserNotFound is an expected condition here.
 		if errors.Is(err, ErrUserNotFound) {
 			return nil, ErrInvalidToken
 		}
@@ -168,18 +164,15 @@ func (s *Service) Refresh(ctx context.Context, req RefreshRequest, ipAddress *ne
 	}, nil
 }
 
-// Logout revokes the presented refresh token.
+// Logout revokes the presented refresh token inside a transaction with a
+// FOR UPDATE row lock, closing the race where a concurrent rotation could
+// complete between a plain pre-fetch and the revoke, leaving the successor
+// token active despite the user's intent to log out.
 func (s *Service) Logout(ctx context.Context, refreshToken string) error {
 	if refreshToken == "" {
 		return ErrInvalidToken
 	}
-
-	storedToken, err := s.repo.GetRefreshTokenByHash(ctx, HashTokenForStorage(refreshToken))
-	if err != nil {
-		return err
-	}
-
-	return s.repo.RevokeRefreshToken(ctx, storedToken.ID)
+	return s.repo.LogoutTransaction(ctx, HashTokenForStorage(refreshToken))
 }
 
 // Me returns profile information for the authenticated user.
@@ -208,11 +201,11 @@ func (s *Service) Me(ctx context.Context, principal *AuthUser) (*MeResponse, err
 
 // Register creates a new user account with status pending_verification.
 // Both the user row and the email verification token are written in a single
-// transaction (H1 fix): if either write fails, the entire operation rolls back
-// so there are no orphaned accounts that can never be verified.
+// transaction: if either write fails, the entire operation rolls back so there
+// are no orphaned accounts that can never be verified.
 //
 // NOTE: VerificationToken is returned here to allow testing without a live
-// email service. The handler gates this field behind IsDevelopment() (H2 fix).
+// email service. The handler gates this field behind IsDevelopment().
 func (s *Service) Register(ctx context.Context, req RegisterRequest) (*RegisterResponse, error) {
 	hash, err := HashPassword(req.Password)
 	if err != nil {
@@ -221,8 +214,6 @@ func (s *Service) Register(ctx context.Context, req RegisterRequest) (*RegisterR
 
 	firstName, lastName := splitFullName(req.FullName)
 
-	// Generate the token BEFORE the transaction so the transaction only does
-	// DB work and we avoid holding the connection open during crypto ops.
 	rawToken, err := GenerateVerificationToken()
 	if err != nil {
 		return nil, err
@@ -253,29 +244,68 @@ func (s *Service) Register(ctx context.Context, req RegisterRequest) (*RegisterR
 }
 
 // VerifyEmail consumes a single-use verification token and activates the account.
+// All validation (token existence, used_at, expires_at) is performed inside
+// VerifyEmailTransaction under a FOR UPDATE row lock.
 func (s *Service) VerifyEmail(ctx context.Context, rawToken string) error {
 	if rawToken == "" {
 		return ErrVerificationTokenInvalid
 	}
+	return s.repo.VerifyEmailTransaction(ctx, HashTokenForStorage(rawToken))
+}
 
-	token, err := s.repo.GetEmailVerificationTokenByHash(ctx, HashTokenForStorage(rawToken))
+// ForgotPassword creates a password reset token for the given email address.
+//
+// The response is identical whether the email is registered or not to prevent
+// user-enumeration: callers cannot determine from the response whether an
+// account exists for the submitted email.
+//
+// The raw token is included in the response in development mode so engineers
+// can test the reset flow without an email transport configured. The handler
+// strips it in production.
+func (s *Service) ForgotPassword(ctx context.Context, req ForgotPasswordRequest) (*ForgotPasswordResponse, error) {
+	genericResp := &ForgotPasswordResponse{
+		Message: "if the email is registered, a password reset link has been sent",
+	}
+
+	user, err := s.repo.GetUserByEmail(ctx, req.Email)
+	if err != nil {
+		// Email not found — return the same response as success to prevent enumeration.
+		return genericResp, nil
+	}
+
+	rawToken, err := GenerateVerificationToken()
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = s.repo.ForgotPasswordTransaction(ctx, ForgotPasswordTxParams{
+		UserID:    user.ID,
+		TokenHash: HashTokenForStorage(rawToken),
+		ExpiresAt: GetPasswordResetTokenExpiryTime(),
+	})
+	if err != nil {
+		// Internal failure — don't leak it. Callers see the generic message.
+		return genericResp, nil
+	}
+
+	return &ForgotPasswordResponse{
+		Message:    genericResp.Message,
+		ResetToken: rawToken, // dev only — stripped by handler in production
+	}, nil
+}
+
+// ResetPassword validates the reset token, updates the password, revokes all
+// active sessions, and writes an audit record — all in one transaction.
+func (s *Service) ResetPassword(ctx context.Context, req ResetPasswordRequest) error {
+	hash, err := HashPassword(req.Password)
 	if err != nil {
 		return err
 	}
-
-	if token.UsedAt.Valid {
-		return ErrVerificationTokenUsed
-	}
-
-	if token.ExpiresAt.Time.Before(time.Now()) {
-		return ErrVerificationTokenExpired
-	}
-
-	return s.repo.VerifyEmailTransaction(ctx, token.ID, token.UserID)
+	return s.repo.ResetPasswordTransaction(ctx, HashTokenForStorage(req.Token), hash)
 }
 
 // DeleteExpiredVerificationTokens removes tokens that have passed their expiry.
-// Intended to be called from a background cleanup job (e.g. hourly cron).
+// Intended to be called from the background cleanup scheduler.
 func (s *Service) DeleteExpiredVerificationTokens(ctx context.Context) error {
 	return s.repo.DeleteExpiredEmailVerificationTokens(ctx, pgtype.Timestamptz{
 		Time:  time.Now(),

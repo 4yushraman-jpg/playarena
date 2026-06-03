@@ -30,6 +30,17 @@ SET    revoked_at = NOW()
 WHERE  user_id = $1
   AND  revoked_at IS NULL;
 
+-- name: RevokeAndLinkSuccessor :execrows
+-- Atomically revokes a token and records the ID of its successor.
+-- Used exclusively during token rotation: the new token must be inserted first
+-- so its ID is available as $2. Returns the number of rows affected; the caller
+-- must assert exactly 1 (enforced by the FOR UPDATE lock held on the old token).
+UPDATE refresh_tokens
+SET    revoked_at   = NOW(),
+       successor_id = $2
+WHERE  id           = $1
+  AND  revoked_at   IS NULL;
+
 -- name: DeleteExpiredRefreshTokens :exec
 DELETE FROM refresh_tokens
 WHERE  expires_at <= $1;
