@@ -160,6 +160,183 @@ func HashToken(raw string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// CreatePendingUser creates a user in pending_verification state and an
+// associated email verification token. Returns the user row and the raw
+// (unhashed) verification token so callers can exercise the verify-email flow.
+func CreatePendingUser(ctx context.Context, t testing.TB, pool *pgxpool.Pool) (db.User, string) {
+	t.Helper()
+
+	uid := newUUID(ctx, t, pool)
+	short := uid.Bytes[0:4]
+	email := fmt.Sprintf("pending_%x@example.com", short)
+	username := fmt.Sprintf("pending_%x", short)
+
+	queries := db.New(pool)
+	user, err := queries.CreateUser(ctx, db.CreateUserParams{
+		Email:        email,
+		Username:     username,
+		PasswordHash: knownPasswordHash,
+		FirstName:    "Pending",
+		LastName:     "User",
+	})
+	if err != nil {
+		t.Fatalf("fixtures.CreatePendingUser CreateUser: %v", err)
+	}
+
+	raw := pseudoRandomToken(ctx, t, pool)
+	if _, err := queries.CreateEmailVerificationToken(ctx, db.CreateEmailVerificationTokenParams{
+		UserID:    user.ID,
+		TokenHash: HashToken(raw),
+		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(24 * time.Hour), Valid: true},
+	}); err != nil {
+		t.Fatalf("fixtures.CreatePendingUser CreateEmailVerificationToken: %v", err)
+	}
+
+	return user, raw
+}
+
+// CreateSuspendedUser creates an active user then sets their status to suspended.
+func CreateSuspendedUser(ctx context.Context, t testing.TB, pool *pgxpool.Pool) db.User {
+	t.Helper()
+	user := CreateActiveUser(ctx, t, pool)
+	if _, err := pool.Exec(ctx,
+		"UPDATE users SET status = 'suspended' WHERE id = $1",
+		user.ID,
+	); err != nil {
+		t.Fatalf("fixtures.CreateSuspendedUser: %v", err)
+	}
+	user.Status = db.UserStatusSuspended
+	return user
+}
+
+// CreateInactiveUser creates an active user then sets their status to inactive.
+func CreateInactiveUser(ctx context.Context, t testing.TB, pool *pgxpool.Pool) db.User {
+	t.Helper()
+	user := CreateActiveUser(ctx, t, pool)
+	if _, err := pool.Exec(ctx,
+		"UPDATE users SET status = 'inactive' WHERE id = $1",
+		user.ID,
+	); err != nil {
+		t.Fatalf("fixtures.CreateInactiveUser: %v", err)
+	}
+	user.Status = db.UserStatusInactive
+	return user
+}
+
+// CreatePlatformAdmin creates an active user and grants them the platform_admin
+// role (organization_id = NULL). Cleanup cascades via CleanupUser.
+func CreatePlatformAdmin(ctx context.Context, t testing.TB, pool *pgxpool.Pool) db.User {
+	t.Helper()
+	user := CreateActiveUser(ctx, t, pool)
+
+	var roleID pgtype.UUID
+	if err := pool.QueryRow(ctx,
+		"SELECT id FROM roles WHERE slug = 'platform_admin' LIMIT 1",
+	).Scan(&roleID); err != nil {
+		t.Fatalf("fixtures.CreatePlatformAdmin lookup role: %v", err)
+	}
+
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO user_organization_roles (user_id, organization_id, role_id, granted_by)
+		 VALUES ($1, NULL, $2, $1)
+		 ON CONFLICT DO NOTHING`,
+		user.ID, roleID,
+	); err != nil {
+		t.Fatalf("fixtures.CreatePlatformAdmin grant role: %v", err)
+	}
+
+	return user
+}
+
+// CreateOrgWithRole creates an organization and grants the given user a role
+// within it. roleSlug must be one of the system roles seeded by migration 000017
+// (e.g. "org_owner", "org_admin", "viewer").
+//
+// Returns the organization UUID as a formatted string ready for HTTP requests.
+// Registers t.Cleanup to delete the organization (CASCADE removes role grants).
+// User cleanup is the caller's responsibility (via CleanupUser).
+func CreateOrgWithRole(ctx context.Context, t testing.TB, pool *pgxpool.Pool, userID pgtype.UUID, roleSlug string) string {
+	t.Helper()
+
+	uid := newUUID(ctx, t, pool)
+	orgName := fmt.Sprintf("Test Org %x", uid.Bytes[0:4])
+	orgSlug := fmt.Sprintf("test-org-%x", uid.Bytes[0:4])
+
+	queries := db.New(pool)
+	org, err := queries.CreateOrganization(ctx, db.CreateOrganizationParams{
+		Name: orgName,
+		Slug: orgSlug,
+		Type: db.OrgTypeClub,
+	})
+	if err != nil {
+		t.Fatalf("fixtures.CreateOrgWithRole create org: %v", err)
+	}
+
+	var roleID pgtype.UUID
+	if err := pool.QueryRow(ctx,
+		"SELECT id FROM roles WHERE slug = $1 LIMIT 1",
+		roleSlug,
+	).Scan(&roleID); err != nil {
+		t.Fatalf("fixtures.CreateOrgWithRole lookup role %q: %v", roleSlug, err)
+	}
+
+	if err := queries.GrantRoleToUserInOrg(ctx, db.GrantRoleToUserInOrgParams{
+		UserID:         userID,
+		OrganizationID: org.ID,
+		RoleID:         roleID,
+		GrantedBy:      userID,
+	}); err != nil {
+		t.Fatalf("fixtures.CreateOrgWithRole grant role: %v", err)
+	}
+
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, "DELETE FROM organizations WHERE id = $1", org.ID)
+	})
+
+	return uuidStr(org.ID)
+}
+
+// CreateExpiredEmailVerificationToken inserts an already-expired email
+// verification token (used_at IS NULL, expires_at in the past).
+func CreateExpiredEmailVerificationToken(ctx context.Context, t testing.TB, pool *pgxpool.Pool, userID pgtype.UUID) string {
+	t.Helper()
+	raw := pseudoRandomToken(ctx, t, pool)
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO email_verification_tokens (user_id, token_hash, expires_at)
+		 VALUES ($1, $2, NOW() - INTERVAL '2 hours')`,
+		userID, HashToken(raw),
+	); err != nil {
+		t.Fatalf("fixtures.CreateExpiredEmailVerificationToken: %v", err)
+	}
+	return raw
+}
+
+// CreateExpiredRefreshToken inserts a refresh token that is already past its
+// expiry. The token is otherwise active (revoked_at IS NULL, successor_id IS NULL).
+func CreateExpiredRefreshToken(ctx context.Context, t testing.TB, pool *pgxpool.Pool, userID pgtype.UUID) string {
+	t.Helper()
+	raw := pseudoRandomToken(ctx, t, pool)
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO refresh_tokens (user_id, token_hash, expires_at, created_at)
+		 VALUES ($1, $2, NOW() - INTERVAL '1 day', NOW() - INTERVAL '9 days')`,
+		userID, HashToken(raw),
+	); err != nil {
+		t.Fatalf("fixtures.CreateExpiredRefreshToken: %v", err)
+	}
+	return raw
+}
+
+// uuidStr formats a pgtype.UUID as the standard hyphenated UUID string
+// (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).
+func uuidStr(u pgtype.UUID) string {
+	b := u.Bytes
+	return hex.EncodeToString(b[0:4]) + "-" +
+		hex.EncodeToString(b[4:6]) + "-" +
+		hex.EncodeToString(b[6:8]) + "-" +
+		hex.EncodeToString(b[8:10]) + "-" +
+		hex.EncodeToString(b[10:16])
+}
+
 // ---- internal helpers -------------------------------------------------------
 
 // newUUID generates a new UUID by querying gen_random_uuid() from PostgreSQL.
