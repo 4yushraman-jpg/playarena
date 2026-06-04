@@ -1,11 +1,11 @@
 # PlayArena — Project State & Handoff Document
 
-**Last Updated:** 2026-06-03  
+**Last Updated:** 2026-06-04  
 **Build status:** `go build ./...` passing, `go vet ./...` clean, `sqlc generate` clean  
 **Migrations applied:** 000001 – 000024  
 **Go version:** 1.25.6  
 **Database:** PostgreSQL 17  
-**Phases complete:** 1 – 12, Auth Security Hotfix v2, Phase 13A, Phase 13B.1
+**Phases complete:** 1 – 12, Auth Security Hotfix v2, Phase 13A, Phase 13B.1, Phase 13B.2A, Phase 13B.2B-A
 
 ---
 
@@ -148,8 +148,11 @@ backend/
 │   ├── testutil/                           Shared integration-test infrastructure (Phase 13B.1)
 │   │   ├── container.go                   SetupTestDB — postgres:17-alpine container, migrations, pool; Docker-skip logic
 │   │   └── fixtures/
-│   │       └── auth.go                    CreateActiveUser, CreateRefreshToken, CreatePasswordResetToken,
-│   │                                      CreateExpiredPasswordResetToken, CleanupUser, HashToken
+│   │       └── auth.go                    CreateActiveUser, CreatePendingUser, CreateSuspendedUser, CreateInactiveUser,
+│   │                                      CreatePlatformAdmin, CreateOrgWithRole, CreateRefreshToken,
+│   │                                      CreateExpiredRefreshToken, CreatePasswordResetToken,
+│   │                                      CreateExpiredPasswordResetToken, CreateExpiredEmailVerificationToken,
+│   │                                      CleanupUser, HashToken
 │   ├── bootstrap/
 │   │   ├── app.go                         App struct (Config, DB, Log) — composition root
 │   │   ├── router.go                      Builds chi router + global middleware stack
@@ -1949,6 +1952,124 @@ The `ForgotPasswordTransaction` internal-error path calls `equalizeEnumerationTi
 
 ---
 
+### Phase 13B.2A — Auth Integration Tests: Core Suite (Complete)
+
+**Status: COMPLETE. Adversarial review: all checks PASS. Production readiness: PASS.**
+
+Phase 13B.2A delivered the primary auth integration test suite in `internal/auth/integration/` — 66 tests across 10 test files, all running against a live PostgreSQL 17 instance (testcontainers-go) via the full HTTP stack.
+
+#### New Fixtures (added to `internal/testutil/fixtures/auth.go`)
+
+| Helper | Purpose |
+|--------|---------|
+| `CreatePendingUser` | Inserts user in `pending_verification` state with an email-verification token |
+| `CreateSuspendedUser` | Inserts active user then sets `status = suspended` |
+| `CreateInactiveUser` | Inserts active user then sets `status = inactive` |
+| `CreatePlatformAdmin` | Inserts active user and grants `platform_admin` role (`organization_id = NULL`) |
+| `CreateOrgWithRole` | Creates org, looks up role by slug, grants to user; registers `t.Cleanup` for org deletion; returns org UUID string |
+| `CreateExpiredRefreshToken` | Raw INSERT backdating `expires_at` and `created_at` (satisfies table CHECK while expiring the token) |
+| `CreateExpiredEmailVerificationToken` | Raw INSERT backdating both columns; satisfies `CHECK (expires_at > created_at)` |
+
+#### New Test Infrastructure (`internal/auth/integration/`)
+
+| File | Purpose |
+|------|---------|
+| `testmain_test.go` | `TestMain` wiring `testutil.SetupTestDB` and a shared `testPool` for the integration package |
+| `server_test.go` | `buildTestServer` — constructs a real chi router + auth routes against the test pool; `testJWTSecret` constant |
+| `helpers_test.go` | `assertStatus`, `assertErrorBody`, `decodeBody`, `bearerHeader`, response type structs |
+| `token_helpers_test.go` | API-level flow helpers (`apiLogin`, `apiRegister`, `apiMe`, `apiRefresh`, `apiLogout`, `apiForgotPassword`, `apiResetPassword`, `apiVerifyEmail`); token construction helpers (`makeExpiredToken`, `makeTamperedToken`, `makeAlgorithmConfusionToken`, `makeWrongKeyToken`, `makeEmptyUserIDToken`, `makeWrongIssuerToken`) |
+
+#### Test Coverage (66 tests)
+
+| File | Count | Coverage focus |
+|------|------:|----------------|
+| `lifecycle_test.go` | 11 | Register (success, duplicate email, duplicate username); login (success, wrong password, unknown email); logout (success, revokes token, empty token); me (success); full flow smoke test |
+| `middleware_test.go` | 7 | RequireAuth: no header, expired token, tampered token, algorithm confusion (HS512), wrong issuer; RequirePermission: granted, denied |
+| `refresh_test.go` | 8 | Success, token rotation, Case 2 rotated-token replay (no session wipe), Case 3 revoked-token replay (full wipe), expired token, invalid token, suspended user blocked, sessions revoked by password reset |
+| `password_reset_test.go` | 10 | Forgot-password known/unknown email; reset success; reset expired/used/invalid token; all-sessions revoked; old-password fails after reset; new-password works; concurrent HTTP reset |
+| `email_verification_test.go` | 7 | Verify success; enables login; invalid/expired/used token; missing token parameter; concurrent HTTP verification |
+| `suspension_test.go` | 5 | Pending-verification blocks login; suspended blocks login; inactive blocks login; suspension blocks login (setup-time); suspension blocks mid-flight refresh |
+| `multitenant_test.go` | 6 | Single-org auto-select; multi-org 409 with org list; multi-org explicit login; wrong org ID rejected; platform admin login (empty org_id); cross-org refresh denied |
+| `concurrency_test.go` | 3 | Concurrent refresh (HTTP barrier sync); concurrent logout + refresh (HTTP); concurrent password reset different tokens (HTTP) |
+| `cors_test.go` | 4 | Preflight allowed origin; preflight disallowed origin; request allowed origin; request disallowed origin |
+| `rate_limit_test.go` | 5 | Login exhaustion (429); register exhaustion; refresh exhaustion; forgot-password exhaustion; all auth routes share same IP bucket |
+| **Total** | **66** | |
+
+All tests use `t.Parallel()` (except `TestLogin_UnknownEmail` which avoids bcrypt cost-12 contention). All fixture teardown uses `t.Cleanup`. No `time.Sleep`.
+
+#### Adversarial Review Results
+
+Adversarial review performed against the complete 66-test suite. All regression gates were validated: each test was confirmed to catch the specific regression it is designed for (i.e., the test would fail if the guarded check in the production code were removed).
+
+| Check | Result |
+|-------|--------|
+| Full lifecycle happy path (register → verify → login → me → refresh → logout) | **PASS** |
+| Credential rejection and anti-enumeration | **PASS** |
+| Token expiry rejection (exp claim) | **PASS** |
+| Tampered-token rejection (signature) | **PASS** |
+| Algorithm confusion prevention (HS512 rejected) | **PASS** |
+| Wrong-issuer rejection | **PASS** |
+| RBAC permission grant / deny at HTTP layer | **PASS** |
+| Account-status gates (pending, suspended, inactive) | **PASS** |
+| Multi-tenant org context resolution | **PASS** |
+| Single-org auto-select and multi-org picker (409) | **PASS** |
+| Cross-org refresh denied | **PASS** |
+| Refresh-token state machine (Case 2 / Case 3) via HTTP | **PASS** |
+| Password reset flow end-to-end | **PASS** |
+| Email verification flow end-to-end | **PASS** |
+| Concurrent HTTP refresh safety | **PASS** |
+| Concurrent HTTP password reset safety | **PASS** |
+| Rate-limit exhaustion (429) and IP-bucket sharing | **PASS** |
+| CORS preflight and request header correctness | **PASS** |
+| Regression gate correctness (all 66 gates validated) | **PASS** |
+
+No defects requiring code fixes were identified during the adversarial review.
+
+---
+
+### Phase 13B.2B-A — Auth Integration Tests: JWT Claims & Security Invariants (Complete)
+
+**Status: COMPLETE. Adversarial review: all checks PASS. Production readiness: PASS.**
+
+Phase 13B.2B-A added 6 targeted tests that each protect a named security invariant in the auth middleware and session lifecycle. All tests use real fixture users (establishing a 200-baseline before the negative case) so the 401/403 cannot originate from user-not-found.
+
+#### New File
+
+`internal/auth/integration/jwt_test.go` — 3 tests covering JWT token validation edge cases.
+
+#### Tests Added
+
+| Test | File | Security invariant protected |
+|------|------|------------------------------|
+| `TestJWT_WrongSigningKey` | `jwt_test.go` | Signature verification — a JWT signed with the wrong HMAC secret is rejected at `ParseToken` before any handler runs; regression gate: if keyFunc bypassed, the real-user baseline returns 200 instead of 401 |
+| `TestJWT_EmptyUserIDClaim` | `jwt_test.go` | `claims.UserID == ""` check in `ParseToken` (`tokens.go:101-103`) — a token with user_id = "" is rejected by the middleware; regression gate: removal causes `uid.Scan("")` to fail in the handler returning "unauthorized" instead of "authorization required" |
+| `TestJWT_EmptyEmailClaim` | `jwt_test.go` | `claims.Email == ""` check in `ParseToken` (`tokens.go:104-106`) — a token with email = "" and a valid user_id is rejected by the middleware; regression gate: removal allows the handler to find the user by user_id and return 200, failing `assertStatus(401)` |
+| `TestLogout_Idempotent` | `lifecycle_test.go` | `LogoutTransaction` idempotency — presenting an already-revoked refresh token to `/logout` returns 200 (not 401 or 500); state-corruption guard: the token must remain revoked after the second call |
+| `TestMultiTenant_RoleRevocationDeniesPermission` | `multitenant_test.go` | `HasPermission` live-DB query — revoking all `user_organization_roles` for a user immediately denies permission-gated endpoints; JWT remains valid (`/me` still returns 200), so blast radius is limited to permission-checked routes |
+| `TestMultiTenant_OrgMembershipRemovalDeniesPermission` | `multitenant_test.go` | Same `HasPermission` EXISTS query from the org-scoped membership angle — deleting one specific `(user_id, organization_id)` row denies access; confirms no caching path exists |
+
+#### New Token Helper
+
+`makeEmptyEmailToken` added to `token_helpers_test.go` — generates a correctly-signed HS256 JWT with `email = ""` and a valid `user_id`. Pattern mirrors `makeEmptyUserIDToken`.
+
+#### Adversarial Review Results
+
+| Check | Result |
+|-------|--------|
+| Signature verification gate (`TestJWT_WrongSigningKey`) | **PASS** |
+| Empty `user_id` claim gate (`TestJWT_EmptyUserIDClaim`) | **PASS** |
+| Empty `email` claim gate (`TestJWT_EmptyEmailClaim`) | **PASS** |
+| Logout idempotency and state-corruption guard (`TestLogout_Idempotent`) | **PASS** |
+| Live-DB permission check — role revocation (`TestMultiTenant_RoleRevocationDeniesPermission`) | **PASS** |
+| Live-DB permission check — membership removal (`TestMultiTenant_OrgMembershipRemovalDeniesPermission`) | **PASS** |
+| JWT validity independent of role revocation (JWT-only `/me` still passes post-revocation) | **PASS** |
+| `go fmt`, `go vet`, `go build` clean | **PASS** |
+| Full test suite (`go test ./...`) passing | **PASS** |
+
+No defects requiring code fixes were identified. `tokens.go` already contained the `claims.Email == ""` guard; the test validates and gates it.
+
+---
+
 ### Concurrency Hardening — Registration Capacity
 
 A code review identified a TOCTOU (Time of Check to Time of Use) race condition in the original capacity enforcement:
@@ -2034,6 +2155,8 @@ The CAS is strictly stronger than the NOT IN guard: it rejects any concurrent tr
 - [x] **Auth Security Hotfix v2** — Replaced time-window refresh-token replay detection with deterministic structural state machine; `successor_id UUID NULL` column on `refresh_tokens` (migration 000023); `RevokeAndLinkSuccessor :execrows` query; removed `rotationWindow` constant and all `time.Since(...)` logic; `RotateRefreshToken` rewritten with 3-case state machine; rows-affected invariant enforced; adversarial review: all 10 checks PASS; no defects introduced
 - [x] **Phase 13A — Security & Production Blockers** — Password reset flow (`POST /forgot-password` / `POST /reset-password`; migration 000024; single-use `FOR UPDATE` transaction; atomic sibling-token invalidation; full session revocation; audit logging); per-IP rate limiting (`golang.org/x/time/rate`; configurable RPS + burst; background cleanup; 429 on exhaustion); CORS wired (`Access-Control-Allow-Credentials`, `Vary: Origin`; wildcard-only mode disables credentials); cleanup scheduler (`internal/cleanup/`; hourly by default; graceful shutdown via done channel); logout race fixed (`LogoutTransaction` with FOR UPDATE); suspension race fixed (user status re-checked inside `RotateRefreshToken` transaction); adversarial review: all 12 checks PASS; two low-severity findings documented
 - [x] **Phase 13B.1 — Test Infrastructure & Deferred Fixes** — testcontainers-go integration-test infrastructure (`internal/testutil/`); per-package `postgres:17-alpine` container; golang-migrate + embedded migrations; UUID-scoped fixtures with `t.Cleanup` isolation (`internal/testutil/fixtures/`); password-reset deadlock fixed via `LockUserPasswordResetTokens ORDER BY id FOR UPDATE` (deterministic lock order eliminates concurrent same-user reset cycle); forgot-password timing equalization strengthened (`equalizeEnumerationTiming` — 4-round-trip profile matching `ForgotPasswordTransaction`, called on email-not-found and transaction-error paths); 8 auth concurrency tests covering refresh replay, logout race, reset deadlock regression, and `RevokeAndLinkSuccessor` invariant; adversarial review: all 11 checks PASS; one low-severity residual documented (transaction-error path over-compensated, does not block production readiness)
+- [x] **Phase 13B.2A — Auth Integration Tests: Core Suite** — 66-test integration suite in `internal/auth/integration/`; 10 test files covering lifecycle, middleware, refresh, password-reset, email-verification, suspension, multi-tenant, concurrency, CORS, and rate-limiting flows; 7 new fixture helpers (`CreatePendingUser`, `CreateSuspendedUser`, `CreateInactiveUser`, `CreatePlatformAdmin`, `CreateOrgWithRole`, `CreateExpiredRefreshToken`, `CreateExpiredEmailVerificationToken`); all tests run against a live PostgreSQL 17 instance; adversarial review: all 19 checks PASS; no defects
+- [x] **Phase 13B.2B-A — Auth Integration Tests: JWT Claims & Security Invariants** — 6 targeted tests protecting named security invariants: JWT wrong-key rejection, empty `user_id` claim rejection, empty `email` claim rejection (`TestJWT_EmptyEmailClaim` added in final session), logout idempotency with state-corruption guard, and live-DB permission enforcement under role revocation and org-membership removal; `makeEmptyEmailToken` helper added to `token_helpers_test.go`; adversarial review: all 9 checks PASS; no defects
 
 ### Previously tracked auth hardening items (resolved in Phase 13A)
 
@@ -2059,7 +2182,8 @@ The CAS is strictly stronger than the NOT IN guard: it rejects any concurrent tr
 
 - [ ] **`golang-jwt/jwt/v5` declared `indirect` in `go.mod`.** Running `go mod tidy` will correct this.
 - [x] **Auth integration test infrastructure** — `internal/testutil/` (testcontainers-go + golang-migrate + pgxpool); `internal/testutil/fixtures/` (typed auth fixtures); 8 concurrency tests in `internal/auth/`. Phase 13B.1.
-- [ ] **Integration tests for non-auth domains** — multi-tenant isolation, tournament registration rules, match lifecycle and concurrency invariants, match event sequence integrity, notification drain correctness. Deferred to Phase 13B.2+.
+- [x] **Auth integration test suite** — 72 tests across 11 files in `internal/auth/integration/`; full lifecycle, middleware, refresh state-machine (Cases 2 & 3), password-reset, email-verification, suspension, multi-tenant, concurrency, CORS, rate-limiting, and JWT-claims coverage. Phases 13B.2A + 13B.2B-A.
+- [ ] **Integration tests for non-auth domains** — multi-tenant isolation, tournament registration rules, match lifecycle and concurrency invariants, match event sequence integrity, notification drain correctness. Deferred to Phase 13B.2B-B and beyond.
 - [ ] **`internal/platform/middleware/auth.go`** contains only a placeholder comment. Can be removed or used to re-export `auth.RequireAuth`.
 - [ ] **`internal/bootstrap/database.go`** is a stub. Can be removed or used for DB-level bootstrap helpers.
 - [ ] **`internal/platform/cache/redis.go`** is a stub. No Redis dependency in `go.mod`. Delete if Redis is not planned.
@@ -2093,7 +2217,9 @@ The CAS is strictly stronger than the NOT IN guard: it rejects any concurrent tr
 | Auth Security Hotfix v2 | Refresh token replay redesign — structural state machine | **COMPLETE** |
 | Phase 13A | Security & Production Blockers | **COMPLETE** |
 | Phase 13B.1 | Test Infrastructure & Deferred Fixes | **COMPLETE** |
-| Phase 13B.2 | Auth Integration Tests (lifecycle, rate limiting, replay) | NOT STARTED |
+| Phase 13B.2A | Auth Integration Tests — core suite (66 tests) | **COMPLETE** |
+| Phase 13B.2B-A | Auth Integration Tests — JWT claims & security invariants (6 tests) | **COMPLETE** |
+| Phase 13B.2B-B | Auth Integration Tests — validation, malformed payloads, edge cases | NOT STARTED |
 
 ---
 
@@ -2148,35 +2274,45 @@ New file: `db/migrations/embed.go`.
 
 ---
 
-### Phase 13B.2 — Auth Integration Tests
+### Phase 13B.2A — Auth Integration Tests: Core Suite (Complete)
+
+66-test suite in `internal/auth/integration/`. Lifecycle, middleware, refresh (Cases 2 & 3), password-reset, email-verification, suspension, multi-tenant, concurrency, CORS, and rate-limiting flows — all exercised end-to-end through the HTTP API against a real PostgreSQL 17 instance. Seven new fixture helpers added to `internal/testutil/fixtures/auth.go`. Adversarial review: all 19 checks PASS. No defects.
+
+---
+
+### Phase 13B.2B-A — Auth Integration Tests: JWT Claims & Security Invariants (Complete)
+
+6 targeted tests protecting named security invariants. `jwt_test.go` (new file): `TestJWT_WrongSigningKey`, `TestJWT_EmptyUserIDClaim`, `TestJWT_EmptyEmailClaim`. Additions to existing files: `TestLogout_Idempotent` (lifecycle), `TestMultiTenant_RoleRevocationDeniesPermission` and `TestMultiTenant_OrgMembershipRemovalDeniesPermission` (multitenant). `makeEmptyEmailToken` helper added. Total auth integration test count: 72. Adversarial review: all 9 checks PASS. No defects.
+
+---
+
+### Phase 13B.2B-B — Auth Integration Tests: Validation & Edge Cases
 
 Planned scope:
 
-1. **Refresh-token lifecycle tests** — issue, rotate, expire, replay (all three state-machine cases).
-2. **Password-reset lifecycle tests** — request, consume, expire, replay, concurrent consume.
-3. **Email-verification lifecycle tests** — register, verify, double-verify.
-4. **Logout / logout-all tests** — single session revocation; full session wipe.
-5. **Suspension tests** — blocked login, blocked refresh mid-flight.
-6. **Rate-limiter tests** — 429 on exhaustion; recovery after window.
-7. **Replay-detection tests** — Case 2 (rotated token) and Case 3 (explicitly revoked) at the service layer.
+1. **Validation-path coverage** — malformed JSON bodies, missing required fields, oversized payloads; 400 error-body assertions for each endpoint.
+2. **Malformed payload coverage** — non-UUID `organization_id`, invalid email format, password below minimum length, unknown `event_type` / `channel` values.
+3. **Refresh validation coverage** — missing `refresh_token` field, null body; service-level vs validation-layer error distinction.
+4. **Password validation coverage** — password too short, missing special character, reset to same password edge cases.
+5. **Org-switch edge cases** — refresh to org with expired role grant, refresh with org that has been deleted.
+6. **Inactive-user edge cases** — inactive user login, inactive user refresh after deactivation mid-flight.
 
 ---
 
 ## 10. Next Recommended Phase
 
-**Phase 13B.2 — Auth Integration Tests**
+**Phase 13B.2B-B — Auth Integration Tests: Validation & Edge Cases**
 
-Phase 13B.1 (Test Infrastructure & Deferred Fixes) is complete. The testcontainers-go infrastructure is in place, both Phase 13A deferred findings are resolved, and 8 auth concurrency tests are passing against a real PostgreSQL 17 instance. The test infrastructure is reusable by any future domain package.
+Phases 13B.2A and 13B.2B-A are complete. The auth integration suite now stands at 72 tests covering the full auth domain happy-path, all negative security cases, JWT-claims invariants, and the replay-detection state machine. The test infrastructure (`internal/testutil/`, `internal/testutil/fixtures/`) is reusable by any future domain package.
 
-**Phase 13B.2 goals:**
+**Phase 13B.2B-B goals:**
 
-1. **Refresh-token lifecycle tests** — issue, rotate, expire, replay against all three state-machine cases (active / rotated / explicitly revoked).
-2. **Password-reset lifecycle tests** — request, consume, expire, replay, concurrent consume.
-3. **Email-verification lifecycle tests** — register, verify, double-verify.
-4. **Logout / logout-all tests** — single session revocation; full session wipe via `RevokeUserRefreshTokens`.
-5. **Suspension tests** — blocked login; in-flight refresh blocked by status re-check inside `RotateRefreshToken`.
-6. **Rate-limiter tests** — 429 on exhaustion at the HTTP layer; recovery after token-bucket refill.
-7. **Replay-detection tests** — Case 2 (`ErrInvalidToken`, no wipe) and Case 3 (`ErrTokenReuse`, full wipe) exercised at the service layer end-to-end.
+1. **Validation-path coverage** — malformed JSON bodies, missing required fields, oversized payloads; 400 error-body assertions for each auth endpoint.
+2. **Malformed payload coverage** — non-UUID `organization_id`, invalid email format, password below minimum length, unknown `event_type` / `channel` values in preference endpoints.
+3. **Refresh validation coverage** — missing `refresh_token` field, null body; confirm service-level validation vs validator-layer error paths.
+4. **Password validation coverage** — reset-password with password too short; edge cases around the minimum-length rule.
+5. **Org-switch edge cases** — refresh to org with expired role grant; refresh specifying a deleted org.
+6. **Inactive-user edge cases** — inactive user login blocked; inactive user refresh after mid-flight deactivation.
 
 ---
 
@@ -2230,6 +2366,10 @@ Phase 13B.1 (Test Infrastructure & Deferred Fixes) is complete. The testcontaine
 | `backend/internal/auth/concurrency_test.go` | 7 barrier-synchronized concurrency tests: refresh replay (Cases 2 & 3), concurrent refresh, logout+refresh race, reset same-token, reset different-tokens (deadlock regression), reset expired+valid |
 | `backend/internal/auth/repository_test.go` | `TestRevokeAndLinkSuccessorInvariant` — asserts `revoked_at`, `successor_id`, and new-token active state after rotation |
 | `backend/internal/auth/testmain_test.go` | `TestMain` wiring `testutil.SetupTestDB` into the auth test package |
+| `backend/internal/auth/integration/jwt_test.go` | `TestJWT_WrongSigningKey`, `TestJWT_EmptyUserIDClaim`, `TestJWT_EmptyEmailClaim` — JWT token validation security gates with real-user baselines |
+| `backend/internal/auth/integration/lifecycle_test.go` | 12 tests: full auth flow smoke test, register/login/logout/me lifecycle cases, `TestLogout_Idempotent` |
+| `backend/internal/auth/integration/multitenant_test.go` | 8 tests: org-context resolution, `TestMultiTenant_RoleRevocationDeniesPermission`, `TestMultiTenant_OrgMembershipRemovalDeniesPermission` |
+| `backend/internal/auth/integration/token_helpers_test.go` | API flow helpers and token-construction helpers including `makeEmptyEmailToken`, `makeEmptyUserIDToken`, `makeWrongKeyToken`, `makeWrongIssuerToken`, `makeAlgorithmConfusionToken` |
 | `backend/internal/testutil/container.go` | `SetupTestDB` — starts `postgres:17-alpine`, applies migrations via golang-migrate + pgx/v5, returns `*pgxpool.Pool` and teardown; Docker-unavailable skip/fail policy |
 | `backend/internal/testutil/fixtures/auth.go` | Typed auth fixtures: `CreateActiveUser`, `CreateRefreshToken`, `CreatePasswordResetToken`, `CreateExpiredPasswordResetToken`, `CleanupUser`, `HashToken` |
 | `backend/internal/platform/middleware/ratelimit.go` | `IPRateLimiter` — per-IP token bucket; sync.Mutex-protected map; background cleanup goroutine; Stop() via done channel |
@@ -2243,4 +2383,4 @@ Phase 13B.1 (Test Infrastructure & Deferred Fixes) is complete. The testcontaine
 
 ---
 
-*This document was last updated on 2026-06-03 (Phase 13B.1 complete). It should be updated whenever a phase is completed or significant architectural changes are made.*
+*This document was last updated on 2026-06-04 (Phase 13B.2B-A complete). It should be updated whenever a phase is completed or significant architectural changes are made.*

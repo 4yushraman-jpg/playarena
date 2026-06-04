@@ -209,6 +209,94 @@ func makeAlgorithmConfusionToken(t testing.TB, userID, orgID, role, email, secre
 	return tok
 }
 
+// testWrongKey is a signing secret distinct from testJWTSecret. Any token
+// signed with this key will fail HMAC verification against testJWTSecret.
+const testWrongKey = "playarena-wrong-signing-key-for-testing!!"
+
+// makeWrongKeyToken generates a fully valid HS256 JWT — correct structure,
+// correct claims, correct algorithm, correct issuer — but signed with
+// testWrongKey instead of testJWTSecret. The server rejects it at the HMAC
+// verification step inside ParseToken.
+func makeWrongKeyToken(t testing.TB, userID, orgID, role, email string) string {
+	t.Helper()
+	now := time.Now()
+	claims := auth.JWTClaims{
+		UserID:         userID,
+		OrganizationID: orgID,
+		Role:           role,
+		Email:          email,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    jwtIssuer,
+			Subject:   userID,
+			ExpiresAt: jwt.NewNumericDate(now.Add(15 * time.Minute)),
+			IssuedAt:  jwt.NewNumericDate(now),
+			NotBefore: jwt.NewNumericDate(now),
+		},
+	}
+	tok, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(testWrongKey))
+	if err != nil {
+		t.Fatalf("makeWrongKeyToken: %v", err)
+	}
+	return tok
+}
+
+// makeEmptyUserIDToken generates a correctly-signed HS256 JWT with user_id set
+// to the empty string. ParseToken's explicit claims check
+// (`claims.UserID == "" → ErrInvalidToken`) must reject it. If that check is
+// removed, the token passes to the Me handler, which fails at uid.Scan("") and
+// returns "unauthorized" instead of "authorization required" — making tests
+// that assert the latter body catch the regression.
+func makeEmptyUserIDToken(t testing.TB, orgID, role, email, secret string) string {
+	t.Helper()
+	now := time.Now()
+	claims := auth.JWTClaims{
+		UserID:         "",
+		OrganizationID: orgID,
+		Role:           role,
+		Email:          email,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    jwtIssuer,
+			Subject:   "",
+			ExpiresAt: jwt.NewNumericDate(now.Add(15 * time.Minute)),
+			IssuedAt:  jwt.NewNumericDate(now),
+			NotBefore: jwt.NewNumericDate(now),
+		},
+	}
+	tok, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(secret))
+	if err != nil {
+		t.Fatalf("makeEmptyUserIDToken: %v", err)
+	}
+	return tok
+}
+
+// makeEmptyEmailToken generates a correctly-signed HS256 JWT with email set
+// to the empty string. ParseToken's explicit claims check
+// (`claims.Email == "" → ErrInvalidToken`) must reject it. If that check is
+// removed, the token passes to the Me handler, which finds the user by user_id
+// and returns 200 — making tests that assert 401 catch the regression.
+func makeEmptyEmailToken(t testing.TB, userID, orgID, role, secret string) string {
+	t.Helper()
+	now := time.Now()
+	claims := auth.JWTClaims{
+		UserID:         userID,
+		OrganizationID: orgID,
+		Role:           role,
+		Email:          "",
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    jwtIssuer,
+			Subject:   userID,
+			ExpiresAt: jwt.NewNumericDate(now.Add(15 * time.Minute)),
+			IssuedAt:  jwt.NewNumericDate(now),
+			NotBefore: jwt.NewNumericDate(now),
+		},
+	}
+	tok, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(secret))
+	if err != nil {
+		t.Fatalf("makeEmptyEmailToken: %v", err)
+	}
+	return tok
+}
+
 // makeWrongIssuerToken generates a correctly-signed HS256 token with a
 // non-"playarena" issuer claim. ValidateToken must reject it.
 func makeWrongIssuerToken(t testing.TB, userID, orgID, role, email, secret string) string {

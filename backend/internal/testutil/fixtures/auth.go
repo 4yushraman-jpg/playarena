@@ -298,12 +298,16 @@ func CreateOrgWithRole(ctx context.Context, t testing.TB, pool *pgxpool.Pool, us
 
 // CreateExpiredEmailVerificationToken inserts an already-expired email
 // verification token (used_at IS NULL, expires_at in the past).
+//
+// The table has a CHECK constraint requiring expires_at > created_at, so both
+// columns must be back-dated: created_at = NOW()-3h, expires_at = NOW()-2h
+// satisfies the constraint while placing expires_at before the current time.
 func CreateExpiredEmailVerificationToken(ctx context.Context, t testing.TB, pool *pgxpool.Pool, userID pgtype.UUID) string {
 	t.Helper()
 	raw := pseudoRandomToken(ctx, t, pool)
 	if _, err := pool.Exec(ctx,
-		`INSERT INTO email_verification_tokens (user_id, token_hash, expires_at)
-		 VALUES ($1, $2, NOW() - INTERVAL '2 hours')`,
+		`INSERT INTO email_verification_tokens (user_id, token_hash, expires_at, created_at)
+		 VALUES ($1, $2, NOW() - INTERVAL '2 hours', NOW() - INTERVAL '3 hours')`,
 		userID, HashToken(raw),
 	); err != nil {
 		t.Fatalf("fixtures.CreateExpiredEmailVerificationToken: %v", err)

@@ -169,6 +169,104 @@ func TestLogin_PlatformAdmin(t *testing.T) {
 	}
 }
 
+// TestMultiTenant_RoleRevocationDeniesPermission verifies that HasPermission
+// performs a live DB query on every request. After the user's role grant is
+// deleted from user_organization_roles, the next permission-gated request must
+// be denied — even though the user's access token is still valid.
+//
+// Regression gate: if HasPermission were cached (in memory or via Redis), the
+// post-revocation request would return 200 rather than 403. assertStatus(403)
+// would fail, catching the regression. This test therefore enforces that
+// permission checks remain live-DB-backed.
+//
+// The test also confirms the JWT itself is not invalidated by role revocation:
+// RequireAuth (which only validates the JWT) continues to pass, so /me still
+// returns 200 — the blast radius of a revocation is limited to permission-gated
+// endpoints, not to authentication itself.
+func TestMultiTenant_RoleRevocationDeniesPermission(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ts := buildTestServer(t, testPool)
+
+	user := fixtures.CreateActiveUser(ctx, t, testPool)
+	t.Cleanup(func() { fixtures.CleanupUser(ctx, t, testPool, user.ID) })
+	fixtures.CreateOrgWithRole(ctx, t, testPool, user.ID, "org_owner")
+
+	// Login. org_owner holds role.assign, so /admin-only requires this permission.
+	accessToken, _ := apiLogin(t, ts, user.Email, fixtures.KnownPasswordRaw, "")
+
+	// Baseline: permission is granted.
+	baseResp := ts.get(t, "/api/v1/auth/admin-only", bearerHeader(accessToken))
+	defer baseResp.Body.Close()
+	assertStatus(t, baseResp, 200)
+
+	// Revoke all role grants for this user.
+	if _, err := testPool.Exec(ctx,
+		"DELETE FROM user_organization_roles WHERE user_id = $1",
+		user.ID,
+	); err != nil {
+		t.Fatalf("revoke role grant: %v", err)
+	}
+
+	// Same access token, role revoked in DB: HasPermission must return false.
+	postResp := ts.get(t, "/api/v1/auth/admin-only", bearerHeader(accessToken))
+	defer postResp.Body.Close()
+	assertStatus(t, postResp, 403)
+	assertErrorBody(t, postResp, "insufficient permissions")
+
+	// RequireAuth still passes (JWT is valid). /me must succeed.
+	// This proves that role revocation does not invalidate the JWT itself.
+	meResp := apiMe(t, ts, accessToken)
+	if meResp.Email != user.Email {
+		t.Errorf("me after role revocation: email got %q, want %q", meResp.Email, user.Email)
+	}
+}
+
+// TestMultiTenant_OrgMembershipRemovalDeniesPermission verifies the same live-DB
+// permission invariant as TestMultiTenant_RoleRevocationDeniesPermission, but
+// targets the org-scoped membership row specifically rather than all of the
+// user's grants. This exercises the same HasPermission EXISTS query from a
+// different deletion angle.
+func TestMultiTenant_OrgMembershipRemovalDeniesPermission(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ts := buildTestServer(t, testPool)
+
+	user := fixtures.CreateActiveUser(ctx, t, testPool)
+	t.Cleanup(func() { fixtures.CleanupUser(ctx, t, testPool, user.ID) })
+	orgID := fixtures.CreateOrgWithRole(ctx, t, testPool, user.ID, "org_owner")
+
+	// Login using the single org so the access token carries orgID.
+	accessToken, _ := apiLogin(t, ts, user.Email, fixtures.KnownPasswordRaw, orgID)
+
+	// Baseline: user is a member of orgID and has role.assign.
+	baseResp := ts.get(t, "/api/v1/auth/admin-only", bearerHeader(accessToken))
+	defer baseResp.Body.Close()
+	assertStatus(t, baseResp, 200)
+
+	// Remove the org-scoped membership row. The WHERE filters by both user and
+	// org to ensure only this grant is removed, not platform-level grants that
+	// might exist for other users in future test scenarios.
+	if _, err := testPool.Exec(ctx,
+		"DELETE FROM user_organization_roles WHERE user_id = $1 AND organization_id = $2",
+		user.ID, orgID,
+	); err != nil {
+		t.Fatalf("remove org membership: %v", err)
+	}
+
+	// Permission-gated endpoint must now deny the request.
+	postResp := ts.get(t, "/api/v1/auth/admin-only", bearerHeader(accessToken))
+	defer postResp.Body.Close()
+	assertStatus(t, postResp, 403)
+	assertErrorBody(t, postResp, "insufficient permissions")
+
+	// JWT-authenticated-only endpoint must still pass (token is valid).
+	meResp := apiMe(t, ts, accessToken)
+	if meResp.Email != user.Email {
+		t.Errorf("me after membership removal: email got %q, want %q", meResp.Email, user.Email)
+	}
+}
+
 // TestMultiTenant_CrossOrgRefreshDenied verifies that a user cannot use their
 // refresh token to obtain an access token for an organization they are not a
 // member of. The refresh endpoint performs the same org resolution as login.

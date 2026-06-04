@@ -301,6 +301,51 @@ func TestMe_Success(t *testing.T) {
 	}
 }
 
+// TestLogout_Idempotent verifies that calling logout on an already-revoked
+// refresh token returns 200 (idempotent). LogoutTransaction sees
+// revoked_at IS NOT NULL and returns success without touching any other state.
+//
+// Regression gate: if LogoutTransaction were changed to return an error when
+// the token is already revoked, the second logout would return 401 or 500.
+// assertStatus(t, secondResp, 200) would fail, catching the regression.
+//
+// This matters at 100,000 concurrent users: clients retry failed requests.
+// Double-logout must be safe and must not corrupt session state.
+func TestLogout_Idempotent(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ts := buildTestServer(t, testPool)
+
+	user := fixtures.CreateActiveUser(ctx, t, testPool)
+	t.Cleanup(func() { fixtures.CleanupUser(ctx, t, testPool, user.ID) })
+	orgID := fixtures.CreateOrgWithRole(ctx, t, testPool, user.ID, "org_owner")
+
+	_, refreshToken := apiLogin(t, ts, user.Email, fixtures.KnownPasswordRaw, orgID)
+
+	// First logout — expected success.
+	apiLogout(t, ts, refreshToken)
+
+	// Second logout of the same already-revoked token.
+	secondResp := ts.post(t, "/api/v1/auth/logout", map[string]string{
+		"refresh_token": refreshToken,
+	})
+	defer secondResp.Body.Close()
+	assertStatus(t, secondResp, 200)
+
+	var m messageResp
+	decodeBody(t, secondResp, &m)
+	if m.Message != "logged out" {
+		t.Errorf("idempotent logout: body got %q, want %q", m.Message, "logged out")
+	}
+
+	// State-corruption check: the token must still be revoked (not re-activated).
+	refreshResp := ts.post(t, "/api/v1/auth/refresh", map[string]string{
+		"refresh_token": refreshToken,
+	})
+	defer refreshResp.Body.Close()
+	assertStatus(t, refreshResp, 401)
+}
+
 // TestLogout_EmptyRefreshToken verifies that presenting an empty string as the
 // refresh_token field returns 400.
 //

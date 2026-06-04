@@ -122,6 +122,10 @@ func TestRefresh_Case3_RevokedReplay(t *testing.T) {
 
 // TestRefresh_ExpiredToken verifies that a refresh token past its expiry
 // returns 401.
+//
+// The user must have an org grant so resolveOrgContext succeeds and control
+// reaches RotateRefreshToken where the expiry check lives. Without an org the
+// service returns 409 (ErrOrganizationRequired) before checking expiry.
 func TestRefresh_ExpiredToken(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -129,6 +133,7 @@ func TestRefresh_ExpiredToken(t *testing.T) {
 
 	user := fixtures.CreateActiveUser(ctx, t, testPool)
 	t.Cleanup(func() { fixtures.CleanupUser(ctx, t, testPool, user.ID) })
+	fixtures.CreateOrgWithRole(ctx, t, testPool, user.ID, "org_owner")
 
 	rawExpired := fixtures.CreateExpiredRefreshToken(ctx, t, testPool, user.ID)
 
