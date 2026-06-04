@@ -197,6 +197,44 @@ func TestRefresh_SuspendedUserBlocked(t *testing.T) {
 	assertErrorBody(t, resp, "account suspended")
 }
 
+// TestRefresh_InactiveUserBlocked verifies that deactivating a user after they
+// obtain a refresh token prevents them from exchanging it — 403 "account inactive".
+//
+// This test exercises the assertUserActive call in service.Refresh on the
+// ErrUserInactive branch. TestRefresh_SuspendedUserBlocked covers ErrUserSuspended
+// on the same code path; this test closes the asymmetric coverage gap for the
+// inactive status value.
+//
+// The in-transaction user-status re-check (Step 3b inside RotateRefreshToken,
+// added by Phase 13A hardening) is defense-in-depth for the sub-millisecond race
+// where deactivation commits between the service pre-check and the rotation
+// commit. That window is not deterministically exercisable in a sequential test.
+func TestRefresh_InactiveUserBlocked(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ts := buildTestServer(t, testPool)
+
+	user := fixtures.CreateActiveUser(ctx, t, testPool)
+	t.Cleanup(func() { fixtures.CleanupUser(ctx, t, testPool, user.ID) })
+	orgID := fixtures.CreateOrgWithRole(ctx, t, testPool, user.ID, "org_owner")
+
+	_, refreshToken := apiLogin(t, ts, user.Email, fixtures.KnownPasswordRaw, orgID)
+
+	// Deactivate the user after the token is issued.
+	if _, err := testPool.Exec(ctx,
+		"UPDATE users SET status = 'inactive' WHERE id = $1", user.ID,
+	); err != nil {
+		t.Fatalf("deactivate user: %v", err)
+	}
+
+	resp := ts.post(t, "/api/v1/auth/refresh", map[string]string{
+		"refresh_token": refreshToken,
+	})
+	defer resp.Body.Close()
+	assertStatus(t, resp, 403)
+	assertErrorBody(t, resp, "account inactive")
+}
+
 // TestRefresh_SessionsRevokedByPasswordReset verifies that after a successful
 // password reset all existing refresh tokens are revoked (successor_id = NULL,
 // Case 3 on next presentation).

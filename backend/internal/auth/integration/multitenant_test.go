@@ -7,6 +7,44 @@ import (
 	"github.com/4yushraman-jpg/playarena/internal/testutil/fixtures"
 )
 
+// TestLogin_ZeroOrgs verifies that a user with no organization memberships
+// receives 409 with code "organization_required" and an empty organizations
+// list. This is the zero-element case of the multi-org 409 path: the service's
+// resolveOrgContext calls GetUserOrganizations, gets an empty slice, and returns
+// ErrOrganizationRequired{Organizations: nil}.
+//
+// At 100,000-user scale, newly registered users (pre-org-grant) or users whose
+// last org membership was revoked are real occurrences. This test verifies the
+// correct 409 response rather than an unexpected 500 or panic.
+func TestLogin_ZeroOrgs(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ts := buildTestServer(t, testPool)
+
+	// Create an active user with no organization memberships.
+	user := fixtures.CreateActiveUser(ctx, t, testPool)
+	t.Cleanup(func() { fixtures.CleanupUser(ctx, t, testPool, user.ID) })
+
+	resp := ts.post(t, "/api/v1/auth/login", map[string]any{
+		"email":    user.Email,
+		"password": fixtures.KnownPasswordRaw,
+		// no organization_id — server must resolve from memberships
+	})
+	defer resp.Body.Close()
+	assertStatus(t, resp, 409)
+
+	var r orgRequiredResp
+	decodeBody(t, resp, &r)
+	if r.Code != "organization_required" {
+		t.Errorf("zero-orgs 409: code got %q, want %q", r.Code, "organization_required")
+	}
+	// The organizations list must be empty (not absent). len handles both nil
+	// and empty-slice JSON representations after unmarshaling.
+	if len(r.Organizations) != 0 {
+		t.Errorf("zero-orgs 409: got %d organizations, want 0", len(r.Organizations))
+	}
+}
+
 // TestLogin_SingleOrgAutoSelect verifies that a user belonging to exactly one
 // organization can log in without providing an organization_id — the service
 // auto-selects the single org and embeds it in the access token.

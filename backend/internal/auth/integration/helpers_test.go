@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -197,4 +198,51 @@ func assertErrorBody(t testing.TB, resp *http.Response, wantMsg string) {
 // bearerHeader returns an Authorization header map for the given access token.
 func bearerHeader(accessToken string) map[string]string {
 	return map[string]string{"Authorization": "Bearer " + accessToken}
+}
+
+// postRaw sends the rawBody string with Content-Type: application/json without
+// marshaling it. Use when testing malformed JSON or empty-body scenarios where
+// ts.post's automatic marshaling would produce valid JSON.
+func (ts *testServer) postRaw(t testing.TB, path string, rawBody string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, ts.url+path, strings.NewReader(rawBody))
+	if err != nil {
+		t.Fatalf("helpers: build POST request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("helpers: POST %s: %v", path, err)
+	}
+	return resp
+}
+
+// assertValidationError asserts that the response body has the ValidationError
+// shape: {"error": "validation failed", "fields": {"<field>": "<message>"}}.
+// If wantField is non-empty it also asserts that the named field is present in
+// the fields map with a non-empty message. assertValidationError closes
+// resp.Body (mirrors assertErrorBody).
+func assertValidationError(t testing.TB, resp *http.Response, wantField string) {
+	t.Helper()
+	defer resp.Body.Close()
+	var body struct {
+		Error  string            `json:"error"`
+		Fields map[string]string `json:"fields"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("assertValidationError: decode body: %v", err)
+	}
+	if body.Error != "validation failed" {
+		t.Errorf("assertValidationError: error = %q, want %q", body.Error, "validation failed")
+	}
+	if wantField == "" {
+		return
+	}
+	if body.Fields == nil {
+		t.Errorf("assertValidationError: fields is nil, want key %q present", wantField)
+		return
+	}
+	if msg, ok := body.Fields[wantField]; !ok || msg == "" {
+		t.Errorf("assertValidationError: fields[%q] missing or empty; fields = %v", wantField, body.Fields)
+	}
 }
