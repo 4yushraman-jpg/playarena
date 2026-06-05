@@ -310,6 +310,58 @@ func (s *Service) ResetPassword(ctx context.Context, req ResetPasswordRequest) e
 	return s.repo.ResetPasswordTransaction(ctx, HashTokenForStorage(req.Token), hash)
 }
 
+// ResendVerification creates a fresh email-verification token for an account
+// that is still in the pending_verification state. It returns the raw token
+// for the handler to deliver via email.
+//
+// Returns ("", nil) for all outcomes where no email should be sent:
+//   - email address not found in the database
+//   - account already active (or suspended / inactive)
+//   - any internal error
+//
+// The caller must treat all of these outcomes identically — the HTTP response
+// is always 200 regardless of the return value. This prevents user-enumeration.
+//
+// Timing equalization is applied on every non-sending path so that response
+// latency does not reveal whether the account exists.
+func (s *Service) ResendVerification(ctx context.Context, email string) (string, error) {
+	user, err := s.repo.GetUserByEmail(ctx, strings.ToLower(strings.TrimSpace(email)))
+	if err != nil {
+		s.repo.equalizeEnumerationTiming(ctx)
+		return "", nil
+	}
+
+	if user.Status != db.UserStatusPendingVerification {
+		// Account is already active, suspended, or inactive — no re-send needed
+		// or appropriate. Equalize timing and return empty to prevent enumeration.
+		s.repo.equalizeEnumerationTiming(ctx)
+		return "", nil
+	}
+
+	rawToken, err := GenerateVerificationToken()
+	if err != nil {
+		return "", err
+	}
+
+	err = s.repo.CreateEmailVerificationToken(ctx, db.CreateEmailVerificationTokenParams{
+		UserID:    user.ID,
+		TokenHash: HashTokenForStorage(rawToken),
+		ExpiresAt: GetVerificationTokenExpiryTime(),
+	})
+	if err != nil {
+		// Mask DB errors — treat the same as not found.
+		s.repo.equalizeEnumerationTiming(ctx)
+		return "", nil
+	}
+
+	// Equalize timing so the success path (SELECT + INSERT) is not measurably
+	// faster than the not-found / already-active paths (SELECT + equalization).
+	// Without this a timing adversary can distinguish pending_verification
+	// accounts by observing shorter response times.
+	s.repo.equalizeEnumerationTiming(ctx)
+	return rawToken, nil
+}
+
 // DeleteExpiredVerificationTokens removes tokens that have passed their expiry.
 // Intended to be called from the background cleanup scheduler.
 func (s *Service) DeleteExpiredVerificationTokens(ctx context.Context) error {

@@ -14,11 +14,18 @@ import (
 
 // NewRouter builds and returns the fully-configured application HTTP router.
 // Middleware is applied in registration order.
+//
+// authLimiter — per-IP rate limiter for /api/v1/auth/* (most restrictive)
+// writeLimiter — per-IP rate limiter for domain write endpoints (POST/PATCH/DELETE)
+// mediaLimiter — per-IP rate limiter for media upload endpoint (most expensive)
+// All limiter parameters are nil-safe: nil means no rate limiting for that group.
 func NewRouter(
 	db *pgxpool.Pool,
 	log *slog.Logger,
 	cfg *config.Config,
-	limiter *middleware.IPRateLimiter,
+	authLimiter *middleware.IPRateLimiter,
+	writeLimiter *middleware.IPRateLimiter,
+	mediaLimiter *middleware.IPRateLimiter,
 ) http.Handler {
 	r := chi.NewRouter()
 
@@ -28,7 +35,7 @@ func NewRouter(
 	r.Use(middleware.RequestLogger(log))           // Structured per-request logging via slog
 	r.Use(middleware.CORS(cfg.CORSAllowedOrigins)) // Cross-Origin Resource Sharing headers
 
-	registerModules(r, db, log, cfg, limiter)
+	registerModules(r, db, log, cfg, authLimiter, writeLimiter, mediaLimiter)
 
 	return r
 }

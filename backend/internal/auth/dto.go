@@ -117,6 +117,14 @@ type ResetPasswordRequest struct {
 
 // ---- me ---------------------------------------------------------------------
 
+// ResendVerificationRequest is the payload for POST /api/v1/auth/resend-verification.
+//
+// The endpoint always returns HTTP 200 regardless of whether the email is
+// registered or already verified. This prevents user-enumeration.
+type ResendVerificationRequest struct {
+	Email string `json:"email" validate:"required,email"`
+}
+
 // MeResponse is the payload returned by GET /api/v1/auth/me (service layer).
 // The HTTP handler augments this with role and organization_id from the token.
 type MeResponse struct {

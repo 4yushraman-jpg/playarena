@@ -97,6 +97,16 @@ func (r *Repository) GetUserByID(ctx context.Context, userID pgtype.UUID) (*db.U
 	return &user, nil
 }
 
+// CreateEmailVerificationToken inserts a new single-use verification token for
+// an existing user. Used by ResendVerification to issue a replacement token
+// when the original expired or was not delivered. The old token remains in the
+// database and is valid until it expires or is consumed — concurrent tokens
+// for the same user are allowed by the schema.
+func (r *Repository) CreateEmailVerificationToken(ctx context.Context, params db.CreateEmailVerificationTokenParams) error {
+	_, err := r.queries.CreateEmailVerificationToken(ctx, params)
+	return err
+}
+
 // ---- refresh token operations -----------------------------------------------
 
 func (r *Repository) CreateRefreshToken(ctx context.Context, params db.CreateRefreshTokenParams) (*db.RefreshToken, error) {

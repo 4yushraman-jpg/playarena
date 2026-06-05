@@ -1,14 +1,17 @@
 package auth
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
+	"time"
 
 	chimw "github.com/go-chi/chi/v5/middleware"
 
+	"github.com/4yushraman-jpg/playarena/internal/email"
 	"github.com/4yushraman-jpg/playarena/internal/platform/config"
 	"github.com/4yushraman-jpg/playarena/internal/platform/response"
 	"github.com/4yushraman-jpg/playarena/internal/platform/validator"
@@ -16,14 +19,16 @@ import (
 
 // Handler exposes the auth service over HTTP.
 type Handler struct {
-	svc    *Service
-	config *config.Config
-	log    *slog.Logger
+	svc         *Service
+	config      *config.Config
+	log         *slog.Logger
+	emailSender *email.Sender // nil-safe: methods are no-ops when nil
 }
 
-// NewHandler constructs a Handler.
-func NewHandler(svc *Service, cfg *config.Config, log *slog.Logger) *Handler {
-	return &Handler{svc: svc, config: cfg, log: log}
+// NewHandler constructs a Handler. emailSender may be nil in tests that do
+// not exercise email delivery paths.
+func NewHandler(svc *Service, cfg *config.Config, log *slog.Logger, emailSender *email.Sender) *Handler {
+	return &Handler{svc: svc, config: cfg, log: log, emailSender: emailSender}
 }
 
 // ---- endpoints --------------------------------------------------------------
@@ -149,6 +154,25 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 		slog.String("request_id", chimw.GetReqID(r.Context())),
 	)
 
+	// Deliver verification email asynchronously. The goroutine uses a fresh
+	// context with a 30-second deadline — r.Context() is cancelled when the
+	// response is written, so it must not be used here. Failure is logged but
+	// does not affect the registration response; the account is already committed.
+	if h.emailSender != nil {
+		toEmail := resp.Email
+		toName := resp.Username
+		rawToken := resp.VerificationToken // captured before the production strip below
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if emailErr := h.emailSender.SendVerificationEmail(ctx, toEmail, toName, rawToken); emailErr != nil {
+				h.log.ErrorContext(context.Background(), "auth.register.email_failed",
+					slog.String("error", emailErr.Error()),
+				)
+			}
+		}()
+	}
+
 	// Strip the verification token in production — it must only be delivered
 	// via email (H2 fix). In development it is returned for testing convenience.
 	if !h.config.IsDevelopment() {
@@ -213,12 +237,73 @@ func (h *Handler) ForgotPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Deliver password-reset email asynchronously. The goroutine uses
+	// context.Background() — r.Context() is cancelled when the HTTP response
+	// is written, which may happen before the goroutine completes. Async
+	// delivery also preserves the timing-equalization invariant: the HTTP
+	// response time is governed by DB operations only, so an attacker cannot
+	// distinguish "email found" from "email not found" paths by measuring
+	// response latency.
+	if h.emailSender != nil && resp.ResetToken != "" {
+		// Capture before the strip below so the goroutine has the token value.
+		rawToken := resp.ResetToken
+		toEmail := req.Email
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if emailErr := h.emailSender.SendPasswordResetEmail(ctx, toEmail, toEmail, rawToken); emailErr != nil {
+				h.log.ErrorContext(context.Background(), "auth.forgot_password.email_failed",
+					slog.String("error", emailErr.Error()),
+				)
+			}
+		}()
+	}
+
 	// Strip the token in production — it must only reach the user via email.
 	if !h.config.IsDevelopment() {
 		resp.ResetToken = ""
 	}
 
 	response.Write(w, http.StatusOK, resp)
+}
+
+// ResendVerification handles POST /api/v1/auth/resend-verification.
+//
+// Always returns HTTP 200 with the same message body regardless of whether
+// the email is registered, already active, or never existed. This prevents
+// user-enumeration: an attacker cannot determine account existence from the
+// response.
+//
+// If the email sender is not configured (nil), the handler still returns 200
+// but no email is dispatched.
+func (h *Handler) ResendVerification(w http.ResponseWriter, r *http.Request) {
+	var req ResendVerificationRequest
+	if err := validator.DecodeJSON(r, &req); err != nil {
+		h.writeDecodeError(w, err)
+		return
+	}
+
+	if h.emailSender != nil {
+		rawToken, err := h.svc.ResendVerification(r.Context(), req.Email)
+		if err == nil && rawToken != "" {
+			toEmail := req.Email
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				if emailErr := h.emailSender.ResendVerificationEmail(ctx, toEmail, toEmail, rawToken); emailErr != nil {
+					h.log.ErrorContext(context.Background(), "auth.resend_verification.email_failed",
+						slog.String("error", emailErr.Error()),
+					)
+				}
+			}()
+		}
+		// All other outcomes (not found, already active, DB error) are silently
+		// ignored — the response is always 200. No information is leaked.
+	}
+
+	response.Write(w, http.StatusOK, struct {
+		Message string `json:"message"`
+	}{Message: "if the email is registered and unverified, a new verification link has been sent"})
 }
 
 // ResetPassword handles POST /api/v1/auth/reset-password.
@@ -348,6 +433,10 @@ func (h *Handler) writeAuthError(w http.ResponseWriter, r *http.Request, err err
 }
 
 func (h *Handler) writeDecodeError(w http.ResponseWriter, err error) {
+	if errors.Is(err, validator.ErrBodyTooLarge) {
+		response.Error(w, http.StatusRequestEntityTooLarge, "request body too large")
+		return
+	}
 	var ve *validator.ValidationError
 	if errors.As(err, &ve) {
 		response.Write(w, http.StatusBadRequest, struct {

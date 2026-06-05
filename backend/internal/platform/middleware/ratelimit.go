@@ -121,6 +121,30 @@ func (l *IPRateLimiter) Middleware() func(http.Handler) http.Handler {
 	}
 }
 
+// WriteMiddleware returns an HTTP middleware that applies rate limiting only to
+// write requests (POST, PUT, PATCH, DELETE). GET and HEAD requests pass through
+// unconditionally so read-heavy routes are not throttled.
+//
+// Use this for domain write endpoints. For route groups where all methods should
+// be rate-limited (e.g. the /auth subtree), use Middleware() instead.
+func (l *IPRateLimiter) WriteMiddleware() func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.Method {
+			case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+				ip := clientIP(r)
+				if !l.get(ip).Allow() {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusTooManyRequests)
+					_, _ = w.Write([]byte(`{"error":"rate limit exceeded"}`))
+					return
+				}
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
 // clientIP extracts the host portion of r.RemoteAddr, which chimw.RealIP
 // has already normalised to the real client address.
 func clientIP(r *http.Request) string {

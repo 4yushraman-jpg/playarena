@@ -73,6 +73,75 @@ type Config struct {
 	// StorageCDNBaseURL is the public CDN URL prefix, e.g.
 	// "https://cdn.playarena.com". file_url = StorageCDNBaseURL + "/" + key.
 	StorageCDNBaseURL string
+
+	// ── Email ────────────────────────────────────────────────────────────────
+
+	// EmailProvider selects the delivery backend.
+	// Options: "ses" (production), "smtp" (local dev with MailHog), "log" (dev
+	// default — logs email details without sending), "noop" (testing only).
+	// Defaults to "log" so the binary starts without any email configuration
+	// in development.
+	EmailProvider string
+
+	// EmailFromAddress is the sender email address, e.g. "noreply@playarena.com".
+	// Required in all environments.
+	EmailFromAddress string
+
+	// EmailFromName is the sender display name, e.g. "PlayArena".
+	// Defaults to "PlayArena".
+	EmailFromName string
+
+	// AppBaseURL is the frontend base URL used to construct verification and
+	// password-reset links. Must begin with "https://" in production.
+	// Example: "https://app.playarena.com"
+	AppBaseURL string
+
+	// EmailSESRegion is the AWS region for SES, e.g. "us-east-1".
+	EmailSESRegion string
+
+	// EmailSESAccessKey is the AWS access key ID for SES.
+	// Leave empty on ECS/EC2 to use the IAM task/instance role (recommended).
+	EmailSESAccessKey string
+
+	// EmailSESSecretKey is the AWS secret access key for SES.
+	// Leave empty on ECS/EC2 to use the IAM task/instance role.
+	EmailSESSecretKey string
+
+	// EmailSMTPHost is the SMTP server hostname (EMAIL_PROVIDER=smtp only).
+	// Defaults to "localhost" for use with MailHog in local development.
+	EmailSMTPHost string
+
+	// EmailSMTPPort is the SMTP server port (EMAIL_PROVIDER=smtp only).
+	// Defaults to 1025 for MailHog.
+	EmailSMTPPort int
+
+	// EmailSMTPUsername is the SMTP authentication username. May be empty.
+	EmailSMTPUsername string
+
+	// EmailSMTPPassword is the SMTP authentication password. May be empty.
+	EmailSMTPPassword string
+
+	// EmailSMTPTLS enables STARTTLS for the SMTP connection. Default: false.
+	// Set to true for real SMTP servers (port 587). Leave false for MailHog.
+	EmailSMTPTLS bool
+
+	// ── Rate limiting — domain write and media upload endpoints ─────────────
+
+	// RateLimitWriteRPS is the sustained request rate per IP for domain write
+	// endpoints (POST/PATCH/DELETE on organizations, players, teams, matches,
+	// etc.). More permissive than auth. Default: 30.
+	RateLimitWriteRPS float64
+
+	// RateLimitWriteBurst is the burst size for domain write endpoints. Default: 60.
+	RateLimitWriteBurst int
+
+	// RateLimitMediaRPS is the sustained rate per IP for media upload endpoints.
+	// Lower than domain writes because uploads trigger S3 writes and image
+	// processing. Default: 5.
+	RateLimitMediaRPS float64
+
+	// RateLimitMediaBurst is the burst size for media upload endpoints. Default: 10.
+	RateLimitMediaBurst int
 }
 
 // Load reads configuration from environment variables and returns a validated Config.
@@ -123,6 +192,26 @@ func Load() (*Config, error) {
 		StorageS3AccessKey:  os.Getenv("STORAGE_S3_ACCESS_KEY"),
 		StorageS3SecretKey:  os.Getenv("STORAGE_S3_SECRET_KEY"),
 		StorageCDNBaseURL:   os.Getenv("STORAGE_CDN_BASE_URL"),
+
+		EmailProvider:    getEnv("EMAIL_PROVIDER", "log"),
+		EmailFromAddress: os.Getenv("EMAIL_FROM_ADDRESS"),
+		EmailFromName:    getEnv("EMAIL_FROM_NAME", "PlayArena"),
+		AppBaseURL:       os.Getenv("APP_BASE_URL"),
+
+		EmailSESRegion:    getEnv("EMAIL_SES_REGION", "us-east-1"),
+		EmailSESAccessKey: os.Getenv("EMAIL_SES_ACCESS_KEY"),
+		EmailSESSecretKey: os.Getenv("EMAIL_SES_SECRET_KEY"),
+
+		EmailSMTPHost:     getEnv("EMAIL_SMTP_HOST", "localhost"),
+		EmailSMTPPort:     getEnvInt("EMAIL_SMTP_PORT", 1025),
+		EmailSMTPUsername: os.Getenv("EMAIL_SMTP_USERNAME"),
+		EmailSMTPPassword: os.Getenv("EMAIL_SMTP_PASSWORD"),
+		EmailSMTPTLS:      getEnvBool("EMAIL_SMTP_TLS", false),
+
+		RateLimitWriteRPS:   getEnvFloat("RATE_LIMIT_WRITE_RPS", 30.0),
+		RateLimitWriteBurst: getEnvInt("RATE_LIMIT_WRITE_BURST", 60),
+		RateLimitMediaRPS:   getEnvFloat("RATE_LIMIT_MEDIA_RPS", 5.0),
+		RateLimitMediaBurst: getEnvInt("RATE_LIMIT_MEDIA_BURST", 10),
 	}
 
 	if err := cfg.validate(); err != nil {
@@ -169,6 +258,36 @@ func (c *Config) validate() error {
 	}
 	if c.CleanupIntervalMinutes <= 0 {
 		errs = append(errs, "CLEANUP_INTERVAL_MINUTES must be positive")
+	}
+
+	// Email
+	if c.EmailFromAddress == "" {
+		errs = append(errs, "EMAIL_FROM_ADDRESS is required")
+	}
+	if c.AppBaseURL == "" {
+		errs = append(errs, "APP_BASE_URL is required")
+	}
+	if c.IsProduction() {
+		if !strings.HasPrefix(c.AppBaseURL, "https://") {
+			errs = append(errs, "APP_BASE_URL must begin with https:// in production")
+		}
+		if c.EmailProvider == "noop" || c.EmailProvider == "log" {
+			errs = append(errs, "EMAIL_PROVIDER must not be 'noop' or 'log' in production")
+		}
+	}
+
+	// Write + media rate limits
+	if c.RateLimitWriteRPS <= 0 {
+		errs = append(errs, "RATE_LIMIT_WRITE_RPS must be positive")
+	}
+	if c.RateLimitWriteBurst <= 0 {
+		errs = append(errs, "RATE_LIMIT_WRITE_BURST must be positive")
+	}
+	if c.RateLimitMediaRPS <= 0 {
+		errs = append(errs, "RATE_LIMIT_MEDIA_RPS must be positive")
+	}
+	if c.RateLimitMediaBurst <= 0 {
+		errs = append(errs, "RATE_LIMIT_MEDIA_BURST must be positive")
 	}
 
 	if len(errs) > 0 {

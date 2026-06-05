@@ -1,0 +1,15 @@
+Verify your {{.AppName}} email address
+
+Hi {{.UserName}},
+
+Please verify your email address to activate your {{.AppName}} account.
+
+Click the link below to verify your email (expires in {{.ExpiresIn}}):
+
+{{.VerifyURL}}
+
+If you cannot click the link, copy and paste it into your browser.
+
+If you did not create this account, you can safely ignore this email.
+
+— The {{.AppName}} Team

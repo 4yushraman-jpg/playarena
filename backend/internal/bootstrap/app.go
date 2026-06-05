@@ -23,28 +23,39 @@ type App struct {
 	DB     *pgxpool.Pool
 	Log    *slog.Logger
 
-	scheduler   *cleanup.Scheduler
-	rateLimiter *middleware.IPRateLimiter
+	scheduler    *cleanup.Scheduler
+	authLimiter  *middleware.IPRateLimiter // /api/v1/auth/* — most restrictive
+	writeLimiter *middleware.IPRateLimiter // domain write endpoints (POST/PATCH/DELETE)
+	mediaLimiter *middleware.IPRateLimiter // media upload endpoint
 }
 
 // Handler returns the fully-wired HTTP handler for the application.
 //
 // It also initialises and starts background services:
-//   - The per-IP rate-limiter cleanup goroutine (when rate limiting is enabled).
+//   - Per-IP rate-limiter cleanup goroutines (when rate limiting is enabled).
 //   - The token cleanup scheduler.
 //
 // Handler must be called exactly once. Call Shutdown() to stop background
 // services before the process exits.
 func (a *App) Handler() http.Handler {
-	// Rate limiter — constructed only when enabled in config.
+	// Rate limiters — constructed only when rate limiting is enabled in config.
 	if a.Config.RateLimitEnabled {
-		a.rateLimiter = middleware.NewIPRateLimiter(
+		a.authLimiter = middleware.NewIPRateLimiter(
 			rate.Limit(a.Config.RateLimitAuthRPS),
 			a.Config.RateLimitAuthBurst,
 		)
-		a.Log.Info("rate limiter started",
-			slog.Float64("rps", a.Config.RateLimitAuthRPS),
-			slog.Int("burst", a.Config.RateLimitAuthBurst),
+		a.writeLimiter = middleware.NewIPRateLimiter(
+			rate.Limit(a.Config.RateLimitWriteRPS),
+			a.Config.RateLimitWriteBurst,
+		)
+		a.mediaLimiter = middleware.NewIPRateLimiter(
+			rate.Limit(a.Config.RateLimitMediaRPS),
+			a.Config.RateLimitMediaBurst,
+		)
+		a.Log.Info("rate limiters started",
+			slog.Float64("auth_rps", a.Config.RateLimitAuthRPS),
+			slog.Float64("write_rps", a.Config.RateLimitWriteRPS),
+			slog.Float64("media_rps", a.Config.RateLimitMediaRPS),
 		)
 	}
 
@@ -54,7 +65,7 @@ func (a *App) Handler() http.Handler {
 	a.scheduler.Start()
 	a.Log.Info("cleanup scheduler started", slog.String("interval", interval.String()))
 
-	return NewRouter(a.DB, a.Log, a.Config, a.rateLimiter)
+	return NewRouter(a.DB, a.Log, a.Config, a.authLimiter, a.writeLimiter, a.mediaLimiter)
 }
 
 // Shutdown stops background services. It should be called after the HTTP
@@ -64,7 +75,13 @@ func (a *App) Shutdown(_ context.Context) {
 	if a.scheduler != nil {
 		a.scheduler.Stop()
 	}
-	if a.rateLimiter != nil {
-		a.rateLimiter.Stop()
+	if a.authLimiter != nil {
+		a.authLimiter.Stop()
+	}
+	if a.writeLimiter != nil {
+		a.writeLimiter.Stop()
+	}
+	if a.mediaLimiter != nil {
+		a.mediaLimiter.Stop()
 	}
 }

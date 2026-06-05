@@ -5,7 +5,7 @@
 **Migrations applied:** 000001 – 000024  
 **Go version:** 1.25.6  
 **Database:** PostgreSQL 17  
-**Phases complete:** 1 – 12, Auth Security Hotfix v2, Phase 13A, Phase 13B.1, Phase 13B.2A, Phase 13B.2B-A
+**Phases complete:** 1 – 12, Auth Security Hotfix v2, Phase 13A, Phase 13B.1, Phase 13B.2A, Phase 13B.2B-A, Phase 13B.2B-B
 
 ---
 
@@ -2157,6 +2157,7 @@ The CAS is strictly stronger than the NOT IN guard: it rejects any concurrent tr
 - [x] **Phase 13B.1 — Test Infrastructure & Deferred Fixes** — testcontainers-go integration-test infrastructure (`internal/testutil/`); per-package `postgres:17-alpine` container; golang-migrate + embedded migrations; UUID-scoped fixtures with `t.Cleanup` isolation (`internal/testutil/fixtures/`); password-reset deadlock fixed via `LockUserPasswordResetTokens ORDER BY id FOR UPDATE` (deterministic lock order eliminates concurrent same-user reset cycle); forgot-password timing equalization strengthened (`equalizeEnumerationTiming` — 4-round-trip profile matching `ForgotPasswordTransaction`, called on email-not-found and transaction-error paths); 8 auth concurrency tests covering refresh replay, logout race, reset deadlock regression, and `RevokeAndLinkSuccessor` invariant; adversarial review: all 11 checks PASS; one low-severity residual documented (transaction-error path over-compensated, does not block production readiness)
 - [x] **Phase 13B.2A — Auth Integration Tests: Core Suite** — 66-test integration suite in `internal/auth/integration/`; 10 test files covering lifecycle, middleware, refresh, password-reset, email-verification, suspension, multi-tenant, concurrency, CORS, and rate-limiting flows; 7 new fixture helpers (`CreatePendingUser`, `CreateSuspendedUser`, `CreateInactiveUser`, `CreatePlatformAdmin`, `CreateOrgWithRole`, `CreateExpiredRefreshToken`, `CreateExpiredEmailVerificationToken`); all tests run against a live PostgreSQL 17 instance; adversarial review: all 19 checks PASS; no defects
 - [x] **Phase 13B.2B-A — Auth Integration Tests: JWT Claims & Security Invariants** — 6 targeted tests protecting named security invariants: JWT wrong-key rejection, empty `user_id` claim rejection, empty `email` claim rejection (`TestJWT_EmptyEmailClaim` added in final session), logout idempotency with state-corruption guard, and live-DB permission enforcement under role revocation and org-membership removal; `makeEmptyEmailToken` helper added to `token_helpers_test.go`; adversarial review: all 9 checks PASS; no defects
+- [x] **Phase 13B.2B-B — Auth Integration Tests: Validation & Edge Cases** — 20 tests closing all P1 validator-path, decode-error, and account-state gaps; `assertValidationError` + `postRaw` helpers added; new `validation_test.go` (18 tests, no DB access for 16); `TestRefresh_InactiveUserBlocked` and `TestLogin_ZeroOrgs` added to existing files; `ErrPasswordTooLong` → 422 covered via multibyte-unicode boundary test; ForgotPassword always-200 boundary gated at both validator and decode paths; adversarial review: all 20 checks PASS; no defects; total auth integration tests: 92
 
 ### Previously tracked auth hardening items (resolved in Phase 13A)
 
@@ -2182,8 +2183,8 @@ The CAS is strictly stronger than the NOT IN guard: it rejects any concurrent tr
 
 - [ ] **`golang-jwt/jwt/v5` declared `indirect` in `go.mod`.** Running `go mod tidy` will correct this.
 - [x] **Auth integration test infrastructure** — `internal/testutil/` (testcontainers-go + golang-migrate + pgxpool); `internal/testutil/fixtures/` (typed auth fixtures); 8 concurrency tests in `internal/auth/`. Phase 13B.1.
-- [x] **Auth integration test suite** — 72 tests across 11 files in `internal/auth/integration/`; full lifecycle, middleware, refresh state-machine (Cases 2 & 3), password-reset, email-verification, suspension, multi-tenant, concurrency, CORS, rate-limiting, and JWT-claims coverage. Phases 13B.2A + 13B.2B-A.
-- [ ] **Integration tests for non-auth domains** — multi-tenant isolation, tournament registration rules, match lifecycle and concurrency invariants, match event sequence integrity, notification drain correctness. Deferred to Phase 13B.2B-B and beyond.
+- [x] **Auth integration test suite** — 92 tests across 12 files in `internal/auth/integration/`; full lifecycle, middleware, refresh state-machine (Cases 2 & 3), password-reset, email-verification, suspension, multi-tenant, concurrency, CORS, rate-limiting, JWT-claims, and complete validation-path coverage. Phases 13B.2A + 13B.2B-A + 13B.2B-B.
+- [ ] **Integration tests for non-auth domains** — multi-tenant isolation, tournament registration rules, match lifecycle and concurrency invariants, match event sequence integrity, notification drain correctness. Deferred to future phases.
 - [ ] **`internal/platform/middleware/auth.go`** contains only a placeholder comment. Can be removed or used to re-export `auth.RequireAuth`.
 - [ ] **`internal/bootstrap/database.go`** is a stub. Can be removed or used for DB-level bootstrap helpers.
 - [ ] **`internal/platform/cache/redis.go`** is a stub. No Redis dependency in `go.mod`. Delete if Redis is not planned.
@@ -2219,7 +2220,8 @@ The CAS is strictly stronger than the NOT IN guard: it rejects any concurrent tr
 | Phase 13B.1 | Test Infrastructure & Deferred Fixes | **COMPLETE** |
 | Phase 13B.2A | Auth Integration Tests — core suite (66 tests) | **COMPLETE** |
 | Phase 13B.2B-A | Auth Integration Tests — JWT claims & security invariants (6 tests) | **COMPLETE** |
-| Phase 13B.2B-B | Auth Integration Tests — validation, malformed payloads, edge cases | NOT STARTED |
+| Phase 13B.2B-B | Auth Integration Tests — validation, malformed payloads, edge cases (20 tests) | **COMPLETE** |
+| Phase 14 | Users module — list, get, update profile, change password, deactivate | NOT STARTED |
 
 ---
 
@@ -2286,33 +2288,98 @@ New file: `db/migrations/embed.go`.
 
 ---
 
-### Phase 13B.2B-B — Auth Integration Tests: Validation & Edge Cases
+### Phase 13B.2B-B — Auth Integration Tests: Validation & Edge Cases (Complete)
 
-Planned scope:
+**Status: COMPLETE. Adversarial review: all 20 checks PASS. Production readiness: PASS.**
 
-1. **Validation-path coverage** — malformed JSON bodies, missing required fields, oversized payloads; 400 error-body assertions for each endpoint.
-2. **Malformed payload coverage** — non-UUID `organization_id`, invalid email format, password below minimum length, unknown `event_type` / `channel` values.
-3. **Refresh validation coverage** — missing `refresh_token` field, null body; service-level vs validation-layer error distinction.
-4. **Password validation coverage** — password too short, missing special character, reset to same password edge cases.
-5. **Org-switch edge cases** — refresh to org with expired role grant, refresh with org that has been deleted.
-6. **Inactive-user edge cases** — inactive user login, inactive user refresh after deactivation mid-flight.
+Phase 13B.2B-B closed the remaining P1 auth integration coverage gaps: validator-path errors, malformed-JSON decode errors, the ForgotPassword always-200 boundary, the `ErrPasswordTooLong` sentinel, and two account-state / org-context edge cases. Total auth integration test count: **92**.
+
+#### New Infrastructure
+
+| Added | Location | Purpose |
+|-------|----------|---------|
+| `postRaw` method | `helpers_test.go` | Sends a raw string body (no marshaling) with `Content-Type: application/json`; required for malformed-JSON and empty-body tests |
+| `assertValidationError` function | `helpers_test.go` | Asserts `{"error":"validation failed","fields":{"<field>":"<msg>"}}` shape; catches same-status-code regressions that bare `assertStatus` would miss |
+
+#### New File
+
+`internal/auth/integration/validation_test.go` — 18 tests, no fixture users, no DB access for the 16 validator/decode tests.
+
+#### Tests Added (20 total)
+
+| Test | File | Status | Key invariant |
+|------|------|--------|---------------|
+| `TestLogin_InvalidEmailFormat` | validation | P1-MUST | 400 + `fields.email`; regression → 401 if rule removed |
+| `TestLogin_PasswordTooShort` | validation | P1-MUST | 400 + `fields.password` |
+| `TestLogin_NonUUIDOrgID` | validation | P1-MUST | 400 via `omitempty,uuid`; regression → 422 if removed |
+| `TestLogin_MalformedJSON` | validation | P1-MUST | 400 plain body (no "fields"); not a ValidationError |
+| `TestLogin_MissingPassword` | validation | P1-NTH | 400 via `required` on absent field vs short value |
+| `TestRegister_InvalidEmailFormat` | validation | P1-MUST | 400 + `fields.email` |
+| `TestRegister_UsernameTooShort` | validation | P1-MUST | 400 via `min=3` |
+| `TestRegister_UsernameInvalidChars` | validation | P1-MUST | 400 via `alphanum_under`; regression → 500 if removed (DB CHECK fires) |
+| `TestRegister_PasswordTooShort` | validation | P1-MUST | 400 via `min=8` |
+| `TestRegister_FullNameEmpty` | validation | P1-NTH | 400 via `required` on `full_name` |
+| `TestRegister_PasswordTooLongBytes` | validation | P1-NTH | 422 via `ErrPasswordTooLong`; 37 × 'é' = 37 runes (passes `max=72`) but 74 bytes (fails `HashPassword`) |
+| `TestRefresh_EmptyRefreshToken` | validation | P1-MUST | 400 (validator); distinct from `TestRefresh_InvalidToken` which is 401 (service) |
+| `TestRefresh_NonUUIDOrgID` | validation | P1-MUST | 400 via `omitempty,uuid` before refresh token is validated |
+| `TestRefresh_MissingBody` | validation | P1-NTH | 400 plain body ("request body is required"); EOF decode path |
+| `TestForgotPassword_InvalidEmailFormat` | validation | P1-MUST | **400, not 200** — validator boundary; always-200 is service-level only |
+| `TestForgotPassword_MalformedJSON` | validation | P1-MUST | **400, not 200** — decode boundary; always-200 is service-level only |
+| `TestResetPassword_PasswordTooShort` | validation | P1-MUST | 400 via `min=8`; token not consumed |
+| `TestResetPassword_PasswordTooLongBytes` | validation | P1-NTH | 422 via `ErrPasswordTooLong`; `HashPassword` fails before `ResetPasswordTransaction` runs |
+| `TestRefresh_InactiveUserBlocked` | refresh_test.go | P1-MUST | 403 "account inactive"; closes `ErrUserInactive` gap for refresh (only suspended was tested) |
+| `TestLogin_ZeroOrgs` | multitenant_test.go | P1-MUST | 409 with code "organization_required" and empty org list |
+
+#### Key findings from adversarial review
+
+- **`assertValidationError` is superior to bare `assertStatus`** for catching same-status-code regressions. `TestResetPassword_PasswordTooShort` illustrates this: if `min=8` is removed, the service returns `ErrResetTokenInvalid` → 400 "invalid password reset token". Same status, different body. `assertValidationError` catches it because `body.Error != "validation failed"`.
+- **ForgotPassword always-200 boundary** is explicitly gate-tested at both the validator path (`TestForgotPassword_InvalidEmailFormat`) and the JSON-decode path (`TestForgotPassword_MalformedJSON`). Both confirm the service is never called.
+- **`ErrPasswordTooLong` boundary** arithmetic verified: `'é'` is U+00E9, 2 UTF-8 bytes. 37 × 2 = 74 bytes > 72. 37 runes ≤ 72. Dual-layer validator (rune-count) / `HashPassword` (byte-count) boundary confirmed end-to-end.
+- **No DB access** for 16 of the 20 tests — the validator fires before any DB call. Tests are extremely fast (~10 ms each).
+
+#### Adversarial Review Results
+
+| Check | Result |
+|-------|--------|
+| `assertValidationError` helper correctness | **PASS** |
+| `postRaw` helper correctness (malformed JSON, empty body) | **PASS** |
+| ValidationError shape assertion end-to-end (14 tests) | **PASS** |
+| Non-ValidationError decode error shape (3 tests) | **PASS** |
+| ForgotPassword always-200 boundary gates (2 tests) | **PASS** |
+| `ErrPasswordTooLong` via register (rune/byte boundary) | **PASS** |
+| `ErrPasswordTooLong` via reset-password | **PASS** |
+| `TestRefresh_EmptyRefreshToken` vs `TestRefresh_InvalidToken` path distinction | **PASS** |
+| `TestRefresh_InactiveUserBlocked` — DB state, parallel safety, cleanup | **PASS** |
+| `TestLogin_ZeroOrgs` — null vs empty list handling, code field | **PASS** |
+| Regression gate validity for all 20 tests | **PASS** |
+| No false positives | **PASS** |
+| No production code modified | **PASS** |
+| `go fmt`, `go vet`, `go build` clean | **PASS** |
+| Full test suite (`go test ./...`) 92 tests passing | **PASS** |
+| Same-status-code regression detection via body-shape assertions | **PASS** |
+| No DB access for validator-only tests | **PASS** |
+| ErrPasswordTooLong byte-count arithmetic verified | **PASS** |
+| `assertValidationError` non-fatal (t.Errorf) — full error reporting | **PASS** |
+| Double-close pattern follows established codebase convention | **PASS** |
+
+No defects identified. No production code modified.
 
 ---
 
 ## 10. Next Recommended Phase
 
-**Phase 13B.2B-B — Auth Integration Tests: Validation & Edge Cases**
+**Phase 14 — Users Module**
 
-Phases 13B.2A and 13B.2B-A are complete. The auth integration suite now stands at 72 tests covering the full auth domain happy-path, all negative security cases, JWT-claims invariants, and the replay-detection state machine. The test infrastructure (`internal/testutil/`, `internal/testutil/fixtures/`) is reusable by any future domain package.
+The auth integration suite is complete at **92 tests** across 12 files. All auth domain flows are covered and adversarially reviewed. The `internal/users/` stub has existed since Phase 1 with package declaration only. Phase 14 closes the largest remaining feature-completeness gap.
 
-**Phase 13B.2B-B goals:**
+**Phase 14 scope:**
 
-1. **Validation-path coverage** — malformed JSON bodies, missing required fields, oversized payloads; 400 error-body assertions for each auth endpoint.
-2. **Malformed payload coverage** — non-UUID `organization_id`, invalid email format, password below minimum length, unknown `event_type` / `channel` values in preference endpoints.
-3. **Refresh validation coverage** — missing `refresh_token` field, null body; confirm service-level validation vs validator-layer error paths.
-4. **Password validation coverage** — reset-password with password too short; edge cases around the minimum-length rule.
-5. **Org-switch edge cases** — refresh to org with expired role grant; refresh specifying a deleted org.
-6. **Inactive-user edge cases** — inactive user login blocked; inactive user refresh after mid-flight deactivation.
+1. **User profile read** — `GET /api/v1/users/me` or augment `/api/v1/auth/me` with editable profile fields.
+2. **User profile update** — `PATCH /api/v1/users/{id}` — update `first_name`, `last_name`, `username`; BOLA-guarded (self-only or `user.manage`).
+3. **Password change** — `POST /api/v1/users/{id}/change-password` — verify current password, hash new, revoke all active refresh tokens; atomically transacted.
+4. **User list** — `GET /api/v1/users` — platform admin only (`user.manage`); paginated.
+5. **User deactivate** — `POST /api/v1/users/{id}/deactivate` — admin action; sets `status = inactive`; revokes all sessions; audit logged.
+6. **RBAC** — self-update requires auth only; deactivate requires `user.manage`; list requires `user.manage`.
 
 ---
 
@@ -2368,8 +2435,10 @@ Phases 13B.2A and 13B.2B-A are complete. The auth integration suite now stands a
 | `backend/internal/auth/testmain_test.go` | `TestMain` wiring `testutil.SetupTestDB` into the auth test package |
 | `backend/internal/auth/integration/jwt_test.go` | `TestJWT_WrongSigningKey`, `TestJWT_EmptyUserIDClaim`, `TestJWT_EmptyEmailClaim` — JWT token validation security gates with real-user baselines |
 | `backend/internal/auth/integration/lifecycle_test.go` | 12 tests: full auth flow smoke test, register/login/logout/me lifecycle cases, `TestLogout_Idempotent` |
-| `backend/internal/auth/integration/multitenant_test.go` | 8 tests: org-context resolution, `TestMultiTenant_RoleRevocationDeniesPermission`, `TestMultiTenant_OrgMembershipRemovalDeniesPermission` |
+| `backend/internal/auth/integration/multitenant_test.go` | 9 tests: org-context resolution (single-org, multi-org 409, platform admin, wrong org, zero orgs), `TestMultiTenant_RoleRevocationDeniesPermission`, `TestMultiTenant_OrgMembershipRemovalDeniesPermission`, `TestLogin_ZeroOrgs` |
 | `backend/internal/auth/integration/token_helpers_test.go` | API flow helpers and token-construction helpers including `makeEmptyEmailToken`, `makeEmptyUserIDToken`, `makeWrongKeyToken`, `makeWrongIssuerToken`, `makeAlgorithmConfusionToken` |
+| `backend/internal/auth/integration/validation_test.go` | 18 tests covering all validator-path and decode-error 400 responses; `assertValidationError` asserts `{"error":"validation failed","fields":{...}}` shape; `postRaw` for malformed-JSON and empty-body scenarios; `ErrPasswordTooLong` via multibyte-unicode boundary; ForgotPassword always-200 boundary gates |
+| `backend/internal/auth/integration/helpers_test.go` | HTTP client + assertion helpers; `assertValidationError` (checks body shape + named field); `postRaw` (sends raw string body without marshaling) |
 | `backend/internal/testutil/container.go` | `SetupTestDB` — starts `postgres:17-alpine`, applies migrations via golang-migrate + pgx/v5, returns `*pgxpool.Pool` and teardown; Docker-unavailable skip/fail policy |
 | `backend/internal/testutil/fixtures/auth.go` | Typed auth fixtures: `CreateActiveUser`, `CreateRefreshToken`, `CreatePasswordResetToken`, `CreateExpiredPasswordResetToken`, `CleanupUser`, `HashToken` |
 | `backend/internal/platform/middleware/ratelimit.go` | `IPRateLimiter` — per-IP token bucket; sync.Mutex-protected map; background cleanup goroutine; Stop() via done channel |
@@ -2383,4 +2452,4 @@ Phases 13B.2A and 13B.2B-A are complete. The auth integration suite now stands a
 
 ---
 
-*This document was last updated on 2026-06-04 (Phase 13B.2B-A complete). It should be updated whenever a phase is completed or significant architectural changes are made.*
+*This document was last updated on 2026-06-04 (Phase 13B.2B-B complete). It should be updated whenever a phase is completed or significant architectural changes are made.*

@@ -7,6 +7,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	db "github.com/4yushraman-jpg/playarena/db/sqlc"
+	"github.com/4yushraman-jpg/playarena/internal/email"
 	"github.com/4yushraman-jpg/playarena/internal/platform/config"
 	"github.com/4yushraman-jpg/playarena/internal/platform/middleware"
 )
@@ -16,9 +17,13 @@ import (
 // Rate limiting is applied to the entire /api/v1/auth route group when limiter
 // is non-nil (controlled by RateLimitEnabled in config).
 //
+// A 64 KB body-size limit is applied to all auth routes to prevent OOM
+// attacks via oversized JSON payloads.
+//
 // Public routes (no auth required):
 //
 //	POST /api/v1/auth/register
+//	POST /api/v1/auth/resend-verification
 //	GET  /api/v1/auth/verify-email
 //	POST /api/v1/auth/login
 //	POST /api/v1/auth/refresh
@@ -39,14 +44,19 @@ func RegisterRoutes(
 	cfg *config.Config,
 	log *slog.Logger,
 	limiter *middleware.IPRateLimiter,
+	emailSender *email.Sender,
 ) {
 	queries := db.New(pool)
 	repo := NewRepository(queries, pool)
 	svc := NewService(repo, cfg)
 	authz := NewAuthorizationService(queries)
-	h := NewHandler(svc, cfg, log)
+	h := NewHandler(svc, cfg, log, emailSender)
 
 	r.Route("/api/v1/auth", func(r chi.Router) {
+		// Cap request bodies at 64 KB — generous for any auth JSON payload,
+		// prevents OOM from adversarial oversized bodies.
+		r.Use(middleware.BodySizeLimit(64 * 1024))
+
 		// Apply per-IP rate limiting to all auth routes when enabled.
 		// chimw.RealIP (mounted in NewRouter) has already normalised
 		// r.RemoteAddr to the true client IP before this middleware runs.
@@ -56,6 +66,7 @@ func RegisterRoutes(
 
 		// ── public ──────────────────────────────────────────────────────────
 		r.Post("/register", h.Register)
+		r.Post("/resend-verification", h.ResendVerification)
 		r.Get("/verify-email", h.VerifyEmail)
 		r.Post("/login", h.Login)
 		r.Post("/refresh", h.Refresh)

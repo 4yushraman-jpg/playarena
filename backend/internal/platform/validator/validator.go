@@ -18,6 +18,11 @@ var (
 	reUUID  = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 )
 
+// ErrBodyTooLarge is returned by DecodeJSON when the request body exceeds the
+// MaxBytesReader limit set by the BodySizeLimit middleware. Handlers that map
+// this error to an HTTP status should use http.StatusRequestEntityTooLarge (413).
+var ErrBodyTooLarge = errors.New("request body too large")
+
 // ValidationError carries per-field validation failures.
 // The Fields map is keyed by the JSON field name; values are human-readable
 // messages suitable for a 400 response body.
@@ -42,6 +47,11 @@ func (e *ValidationError) Error() string {
 //   - nil               when everything is valid
 func DecodeJSON(r *http.Request, dst any) error {
 	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+		// http.MaxBytesReader sets this error type when the body exceeds the limit.
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			return ErrBodyTooLarge
+		}
 		if errors.Is(err, io.EOF) {
 			return errors.New("request body is required")
 		}

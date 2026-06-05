@@ -12,6 +12,7 @@ import (
 	"golang.org/x/time/rate"
 
 	"github.com/4yushraman-jpg/playarena/internal/auth"
+	"github.com/4yushraman-jpg/playarena/internal/email"
 	"github.com/4yushraman-jpg/playarena/internal/platform/config"
 	mw "github.com/4yushraman-jpg/playarena/internal/platform/middleware"
 )
@@ -34,6 +35,7 @@ type testServer struct {
 	pool    *pgxpool.Pool
 	cfg     *config.Config
 	limiter *mw.IPRateLimiter
+	mailer  *email.NoOpProvider // inspect sent emails in tests
 }
 
 // testConfig returns a Config appropriate for integration tests.
@@ -42,6 +44,7 @@ type testServer struct {
 func testConfig() *config.Config {
 	return &config.Config{
 		AppEnv:                 "development",
+		AppBaseURL:             "http://localhost:8080",
 		DatabaseURL:            "postgres://integration-test:placeholder/playarena_test",
 		JWTSecret:              testJWTSecret,
 		CORSAllowedOrigins:     []string{testAllowedOrigin},
@@ -49,6 +52,8 @@ func testConfig() *config.Config {
 		RateLimitAuthRPS:       100,
 		RateLimitAuthBurst:     200,
 		CleanupIntervalMinutes: 60,
+		EmailFromAddress:       "noreply@test.example.com",
+		EmailFromName:          "PlayArena Test",
 	}
 }
 
@@ -79,13 +84,20 @@ func buildServerWithLimiter(t testing.TB, pool *pgxpool.Pool, limiter *mw.IPRate
 	cfg := testConfig()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
+	noopMailer := &email.NoOpProvider{}
+	sender := email.NewSenderWithProvider(noopMailer, email.SenderConfig{
+		FromAddress: cfg.EmailFromAddress,
+		FromName:    cfg.EmailFromName,
+		AppBaseURL:  cfg.AppBaseURL,
+	}, logger)
+
 	r := chi.NewRouter()
 	r.Use(chimw.RequestID)
 	r.Use(chimw.RealIP)
 	r.Use(chimw.Recoverer)
 	r.Use(mw.CORS(cfg.CORSAllowedOrigins))
 
-	auth.RegisterRoutes(r, pool, cfg, logger, limiter)
+	auth.RegisterRoutes(r, pool, cfg, logger, limiter, sender)
 
 	srv := httptest.NewServer(r)
 	t.Cleanup(func() {
@@ -98,5 +110,6 @@ func buildServerWithLimiter(t testing.TB, pool *pgxpool.Pool, limiter *mw.IPRate
 		pool:    pool,
 		cfg:     cfg,
 		limiter: limiter,
+		mailer:  noopMailer,
 	}
 }
