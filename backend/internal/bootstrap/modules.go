@@ -24,7 +24,8 @@ import (
 	"github.com/4yushraman-jpg/playarena/internal/tournaments"
 )
 
-// registerModules wires all domain modules into the router.
+// registerModules wires all domain modules into the router and returns the auth
+// Handler so the bootstrap can call DrainEmail during graceful shutdown.
 //
 // authLimiter   — per-IP limiter for /api/v1/auth/* (applied inside auth.RegisterRoutes)
 // writeLimiter  — per-IP limiter for domain write endpoints (POST/PATCH/DELETE)
@@ -38,7 +39,7 @@ func registerModules(
 	authLimiter *middleware.IPRateLimiter,
 	writeLimiter *middleware.IPRateLimiter,
 	mediaLimiter *middleware.IPRateLimiter,
-) {
+) *auth.Handler {
 	queries := db.New(pool)
 	authz := auth.NewAuthorizationService(queries)
 
@@ -59,11 +60,16 @@ func registerModules(
 	log.Info("email sender initialised", slog.String("provider", cfg.EmailProvider))
 
 	health.RegisterRoutes(r, pool)
-	auth.RegisterRoutes(r, pool, cfg, log, authLimiter, emailSender)
+	authHandler := auth.RegisterRoutes(r, pool, cfg, log, authLimiter, emailSender)
 
 	// Domain write endpoints — writeLimiter applied to POST/PUT/PATCH/DELETE.
 	// GET requests pass through without consuming tokens.
 	r.Group(func(r chi.Router) {
+		// Cap request bodies at 64 KB to prevent OOM from adversarial oversized
+		// JSON payloads. Applied before the rate limiter so malformed large bodies
+		// are rejected cheaply. Media upload routes are excluded — they manage
+		// their own size limit inside the handler.
+		r.Use(middleware.BodySizeLimit(64 * 1024))
 		if writeLimiter != nil {
 			r.Use(writeLimiter.WriteMiddleware())
 		}
@@ -95,4 +101,6 @@ func registerModules(
 		}
 		media.RegisterRoutes(r, pool, cfg, log, authz, mediaBackend)
 	})
+
+	return authHandler
 }

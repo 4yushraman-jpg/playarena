@@ -10,6 +10,7 @@ import (
 	"golang.org/x/time/rate"
 
 	db "github.com/4yushraman-jpg/playarena/db/sqlc"
+	"github.com/4yushraman-jpg/playarena/internal/auth"
 	"github.com/4yushraman-jpg/playarena/internal/cleanup"
 	"github.com/4yushraman-jpg/playarena/internal/platform/config"
 	"github.com/4yushraman-jpg/playarena/internal/platform/middleware"
@@ -27,6 +28,7 @@ type App struct {
 	authLimiter  *middleware.IPRateLimiter // /api/v1/auth/* — most restrictive
 	writeLimiter *middleware.IPRateLimiter // domain write endpoints (POST/PATCH/DELETE)
 	mediaLimiter *middleware.IPRateLimiter // media upload endpoint
+	authHandler  *auth.Handler             // for DrainEmail on graceful shutdown
 }
 
 // Handler returns the fully-wired HTTP handler for the application.
@@ -65,13 +67,25 @@ func (a *App) Handler() http.Handler {
 	a.scheduler.Start()
 	a.Log.Info("cleanup scheduler started", slog.String("interval", interval.String()))
 
-	return NewRouter(a.DB, a.Log, a.Config, a.authLimiter, a.writeLimiter, a.mediaLimiter)
+	handler, authH := NewRouter(a.DB, a.Log, a.Config, a.authLimiter, a.writeLimiter, a.mediaLimiter)
+	a.authHandler = authH
+	return handler
 }
 
-// Shutdown stops background services. It should be called after the HTTP
-// server has stopped accepting new connections but before the process exits.
-// Safe to call multiple times.
-func (a *App) Shutdown(_ context.Context) {
+// Shutdown stops background services. It drains in-flight email goroutines
+// before stopping the rate limiters. Safe to call multiple times.
+func (a *App) Shutdown(ctx context.Context) {
+	// Drain email goroutines first — they may still be running after the HTTP
+	// server stops accepting connections. The provided ctx carries the overall
+	// shutdown deadline; if it expires the drain is abandoned (goroutines will
+	// eventually self-terminate via their own 30-second context timeout).
+	if a.authHandler != nil {
+		if err := a.authHandler.DrainEmail(ctx); err != nil {
+			a.Log.Warn("shutdown: email drain timed out, some emails may not have been sent",
+				slog.String("error", err.Error()),
+			)
+		}
+	}
 	if a.scheduler != nil {
 		a.scheduler.Stop()
 	}

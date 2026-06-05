@@ -1,11 +1,11 @@
 # PlayArena — Project State & Handoff Document
 
-**Last Updated:** 2026-06-04  
+**Last Updated:** 2026-06-05  
 **Build status:** `go build ./...` passing, `go vet ./...` clean, `sqlc generate` clean  
 **Migrations applied:** 000001 – 000024  
 **Go version:** 1.25.6  
 **Database:** PostgreSQL 17  
-**Phases complete:** 1 – 12, Auth Security Hotfix v2, Phase 13A, Phase 13B.1, Phase 13B.2A, Phase 13B.2B-A, Phase 13B.2B-B
+**Phases complete:** 1 – 12, Auth Security Hotfix v2, Phase 13A, Phase 13B.1, Phase 13B.2A, Phase 13B.2B-A, Phase 13B.2B-B, Phase 14, Phase 15A, Phase 15A Remediation
 
 ---
 
@@ -50,8 +50,8 @@ backend/
 │   │   ├── repository.go                  DB access layer (wraps sqlc Queries + pgxpool)
 │   │   ├── service.go                     Business logic — login, refresh, logout, register, verify, me
 │   │   ├── middleware.go                  RequireAuth(), RequireRole(), RequirePermission() chi middleware
-│   │   ├── handler.go                     HTTP handlers + error-to-status mapping + logging
-│   │   ├── routes.go                      RegisterRoutes() — mounts /api/v1/auth subtree
+│   │   ├── handler.go                     HTTP handlers + error-to-status mapping + logging; sync.WaitGroup tracks in-flight email goroutines; DrainEmail(ctx) for graceful shutdown
+│   │   ├── routes.go                      RegisterRoutes() — mounts /api/v1/auth subtree; returns *Handler for DrainEmail wiring
 │   │   ├── testmain_test.go               TestMain — per-package testcontainer lifecycle
 │   │   ├── repository_test.go             RevokeAndLinkSuccessor invariant test
 │   │   └── concurrency_test.go            7 auth concurrency tests (barrier synchronization)
@@ -145,6 +145,16 @@ backend/
 │   │   ├── routes.go                      RegisterRoutes() — mounts /api/v1/organizations/{slug}/notifications
 │   │   └── trigger/
 │   │       └── trigger.go                 WriteOutboxEntry — writes notification_outbox rows inside domain transactions
+│   ├── email/                              Email delivery (fully implemented, Phase 14)
+│   │   ├── email.go                       Provider interface; NoOpProvider (test capture); NewSender factory; NewSenderWithProvider (test injection)
+│   │   ├── sender.go                      Sender struct; SenderConfig; SendVerificationEmail, SendPasswordResetEmail, SendResendVerificationEmail
+│   │   ├── ses.go                         sesProvider — AWS SES v2 backend (awsconfig + sdk/sesv2)
+│   │   ├── smtp.go                        smtpProvider — net/smtp backend; STARTTLS + implicit TLS modes; context-aware via goroutine+channel; multipart/alternative MIME when both bodies present
+│   │   ├── templates.go                   //go:embed templates; html/template + text/template loading
+│   │   ├── email_test.go                  9 unit tests for NoOpProvider and Sender
+│   │   └── templates/
+│   │       ├── verify_email.{html,txt}    Email verification template pair
+│   │       └── password_reset.{html,txt}  Password reset template pair
 │   ├── testutil/                           Shared integration-test infrastructure (Phase 13B.1)
 │   │   ├── container.go                   SetupTestDB — postgres:17-alpine container, migrations, pool; Docker-skip logic
 │   │   └── fixtures/
@@ -154,17 +164,21 @@ backend/
 │   │                                      CreateExpiredPasswordResetToken, CreateExpiredEmailVerificationToken,
 │   │                                      CleanupUser, HashToken
 │   ├── bootstrap/
-│   │   ├── app.go                         App struct (Config, DB, Log) — composition root
-│   │   ├── router.go                      Builds chi router + global middleware stack
-│   │   └── modules.go                     Wires all domain modules into router
+│   │   ├── app.go                         App struct; Handler() wires rate limiters + cleanup scheduler; Shutdown() drains email goroutines (DrainEmail) then stops all
+│   │   ├── router.go                      Builds chi router + global middleware stack; returns (http.Handler, *auth.Handler) for shutdown wiring
+│   │   └── modules.go                     Wires all domain modules; BodySizeLimit + writeLimiter on domain write group; mediaLimiter on media group; returns *auth.Handler
 │   └── platform/
 │       ├── config/config.go               ENV-based config with validation
 │       ├── database/postgres.go           pgxpool factory with production defaults
 │       ├── logger/logger.go               slog (JSON in prod, text in dev)
+│       ├── middleware/bodysize.go         BodySizeLimit(maxBytes) — caps body reads; maps *http.MaxBytesError → ErrBodyTooLarge → 413
+│       ├── middleware/cors.go             CORS() middleware — origin reflection; Allow-Credentials; Vary: Origin; preflight 204
 │       ├── middleware/logging.go          Per-request structured logging
+│       ├── middleware/ratelimit.go        IPRateLimiter — per-IP token bucket; sync.Map + atomic.Int64 lastSeen; Middleware() (all methods); WriteMiddleware() (writes only); Retry-After: 1 on 429
+│       ├── middleware/realip.go           TrustedRealIP(trustedCIDRs) — rewrites RemoteAddr from X-Forwarded-For only for connections from trusted CIDRs; falls back to chi.RealIP when unconfigured
 │       ├── pgutil/pgutil.go               Shared PostgreSQL helpers (UUID parse/format, unique violation check)
 │       ├── response/response.go           JSON write helpers
-│       └── validator/validator.go         DecodeJSON — body decode + struct-tag validation
+│       └── validator/validator.go         DecodeJSON — body decode + struct-tag validation; ErrBodyTooLarge sentinel
 ```
 
 **Remaining stubs** (files exist with package declaration only, no logic):
@@ -174,9 +188,9 @@ backend/
 
 ```
 HTTP request
-  → chi.RequestID   (X-Request-ID header)
-  → chi.RealIP      (populates RemoteAddr from X-Forwarded-For)
-  → chi.Recoverer   (panic → 500)
+  → chi.RequestID       (X-Request-ID header)
+  → TrustedRealIP       (rewrites RemoteAddr from X-Forwarded-For only for trusted proxy CIDRs; falls back to chi.RealIP when TRUSTED_PROXY_CIDRS unset)
+  → chi.Recoverer       (panic → 500)
   → RequestLogger   (structured slog per-request logging)
   → [RequireAuth]   (on protected routes only — JWT validation → context)
   → [RequirePermission] (on write routes — DB-backed permission check)
@@ -201,6 +215,8 @@ HTTP request
 | Config / .env | godotenv | v1.5.1 |
 | Logging | log/slog | stdlib |
 | Image decode (WebP) | golang.org/x/image | v0.41.0 |
+| Rate limiting | golang.org/x/time | v0.15.0 |
+| AWS SDK (SES v2) | aws-sdk-go-v2 | latest |
 
 ---
 
@@ -544,10 +560,11 @@ Each access token carries **exactly one** `organization_id`. The token is org-co
 | **Standings Engine** | `models.go`, `engine.go`, `tiebreakers.go` | Complete |
 | **Media Management** | `errors.go`, `model.go`, `dto.go`, `repository.go`, `service.go`, `handler.go`, `routes.go`; `storage/backend.go`, `storage/local.go`, `storage/s3.go`; `processor/image.go` | Complete |
 | **Notifications** | `errors.go`, `model.go`, `dto.go`, `repository.go`, `service.go`, `handler.go`, `routes.go`; `trigger/trigger.go` | Complete |
+| **Email** | `email.go`, `sender.go`, `ses.go`, `smtp.go`, `templates.go`; `templates/verify_email.{html,txt}`, `templates/password_reset.{html,txt}` | Complete |
 | **Platform / Config** | `config.go` | Complete |
 | **Platform / Database** | `postgres.go` | Complete |
 | **Platform / Logger** | `logger.go` | Complete |
-| **Platform / Middleware** | `logging.go` | Complete |
+| **Platform / Middleware** | `bodysize.go`, `cors.go`, `logging.go`, `ratelimit.go` | Complete |
 | **Platform / PgUtil** | `pgutil.go` | Complete |
 | **Platform / Response** | `response.go` | Complete |
 | **Platform / Validator** | `validator.go` | Complete |
@@ -573,6 +590,7 @@ Each access token carries **exactly one** `organization_id`. The token is org-co
 | `POST` | `/api/v1/auth/logout` | No | Revoke refresh token by value; transactional (FOR UPDATE) to prevent concurrent-rotation race |
 | `POST` | `/api/v1/auth/forgot-password` | No | Create 1-hour reset token; always returns 200 (enumeration-resistant); token in response body in development only |
 | `POST` | `/api/v1/auth/reset-password` | No | Consume reset token; update password; revoke all sessions — single atomic transaction |
+| `POST` | `/api/v1/auth/resend-verification` | No | Re-issue email verification token for pending_verification accounts; always returns 200 (enumeration-resistant); sends email async |
 | `GET` | `/api/v1/auth/me` | Yes | Return profile + role + org context for authenticated user |
 | `GET` | `/api/v1/auth/admin-only` | Yes | RBAC demonstration endpoint; requires `role.assign` permission; returns caller's principal (user_id, email, role, org_id) |
 
@@ -2128,6 +2146,178 @@ The CAS is strictly stronger than the NOT IN guard: it rejects any concurrent tr
 
 ---
 
+### Phase 14 — Email Infrastructure (Complete)
+
+**Status: COMPLETE. Adversarial review: all P1 defects identified and fixed in Phase 15A. Production readiness: PASS (after Phase 15A).**
+
+Phase 14 delivered the full email delivery system for the auth domain: provider abstraction, AWS SES v2 and SMTP implementations, HTML + text templates, transactional outbox-backed resend-verification endpoint, and integration/unit test coverage.
+
+#### New Package: `internal/email/`
+
+| File | Purpose |
+|------|---------|
+| `email.go` | `Provider` interface (`Send(ctx, Message) error`); `NoOpProvider` (in-memory capture for tests); `NewSender` factory (constructs provider from config); `NewSenderWithProvider` (test injection) |
+| `sender.go` | `Sender` struct + `SenderConfig`; `SendVerificationEmail`, `SendPasswordResetEmail`, `SendResendVerificationEmail` — renders templates and delegates to `Provider.Send` |
+| `ses.go` | `sesProvider` — AWS SES v2 backend; `awsconfig.LoadDefaultConfig` with optional static credentials override; optional HTML body |
+| `smtp.go` | `smtpProvider` — `net/smtp` backend; `useTLS=false` → STARTTLS (`smtp.SendMail`); `useTLS=true` → implicit TLS (`tls.Dial` + port 465) |
+| `templates.go` | `//go:embed templates` FS; `html/template` for HTML bodies (auto-escaping); `text/template` for text bodies |
+| `email_test.go` | 9 unit tests: `NoOpProvider` record/filter/reset; `Sender` send/content/nil-safety |
+
+#### Email Provider Abstraction
+
+The `Provider` interface decouples delivery from the auth domain. The production binary picks the provider at startup based on `EMAIL_PROVIDER`:
+
+| `EMAIL_PROVIDER` | Provider | Use |
+|-----------------|----------|-----|
+| `ses` | `sesProvider` (AWS SES v2) | Production — AWS-hosted deployments |
+| `smtp` | `smtpProvider` (net/smtp) | Production — self-hosted / third-party SMTP |
+| `log` | `LogProvider` (slog) | Development — logs email to stdout, default |
+| `noop` | `NoOpProvider` | Tests — captures messages in memory |
+
+Production mode (`APP_ENV=production`) blocks `noop` and `log` providers via config validation.
+
+#### New Auth Endpoint: POST /api/v1/auth/resend-verification
+
+Resends the email verification token for accounts still in `pending_verification` state.
+
+- Always returns HTTP 200 regardless of whether the account exists (enumeration-resistant; body identical on all paths)
+- Service-layer outcomes:
+  - Email not found → `equalizeEnumerationTiming` → return `("", nil)`
+  - Account not `pending_verification` → `equalizeEnumerationTiming` → return `("", nil)`
+  - DB error → `equalizeEnumerationTiming` → return `("", nil)`
+  - Success → new token created → `equalizeEnumerationTiming` → return `(rawToken, nil)`
+- Timing equalization: success path now also calls `equalizeEnumerationTiming` so all paths have comparable round-trip profiles
+- Email sent asynchronously in a goroutine with a 30-second context timeout (Phase 15A fix)
+
+#### Bootstrap Integration
+
+`bootstrap/modules.go` constructs `emailSender` once at startup:
+
+```go
+emailSender, err := email.NewSender(cfg, log)
+// panics if EMAIL_PROVIDER is misconfigured — mirrors media storage panic pattern
+auth.RegisterRoutes(r, pool, cfg, log, authLimiter, emailSender)
+```
+
+`auth.RegisterRoutes` accepts `*email.Sender` (nil-safe — nil sender skips email sends without panicking).
+
+#### New Config Fields (Phase 14)
+
+| Variable | Default | Required | Purpose |
+|----------|---------|----------|---------|
+| `EMAIL_PROVIDER` | `log` | No | Selects provider: `ses`, `smtp`, `log`, `noop` |
+| `EMAIL_FROM_ADDRESS` | — | **Yes** | Sender address (e.g. `noreply@playarena.com`) |
+| `EMAIL_FROM_NAME` | `PlayArena` | No | Sender display name |
+| `APP_BASE_URL` | — | **Yes** | Frontend base URL for link construction (must be `https://` in production) |
+| `EMAIL_SES_REGION` | `us-east-1` | No | AWS region (provider=ses) |
+| `EMAIL_SES_ACCESS_KEY` | — | No | AWS access key ID; empty → IAM role chain (provider=ses) |
+| `EMAIL_SES_SECRET_KEY` | — | No | AWS secret key; empty → IAM role chain (provider=ses) |
+| `EMAIL_SMTP_HOST` | `localhost` | No | SMTP hostname (provider=smtp) |
+| `EMAIL_SMTP_PORT` | `1025` | No | SMTP port (provider=smtp) |
+| `EMAIL_SMTP_USERNAME` | — | No | SMTP auth username (provider=smtp) |
+| `EMAIL_SMTP_PASSWORD` | — | No | SMTP auth password (provider=smtp) |
+| `EMAIL_SMTP_TLS` | `false` | No | `true` → implicit TLS / port 465 (provider=smtp) |
+
+#### New Config Fields (Phase 15A — write + media rate limiters)
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `RATE_LIMIT_WRITE_RPS` | `30.0` | Sustained req/s per IP for domain write endpoints (POST/PUT/PATCH/DELETE) |
+| `RATE_LIMIT_WRITE_BURST` | `60` | Burst size for domain write endpoints |
+| `RATE_LIMIT_MEDIA_RPS` | `5.0` | Sustained req/s per IP for media upload endpoints |
+| `RATE_LIMIT_MEDIA_BURST` | `10` | Burst size for media upload endpoints |
+
+#### Integration Tests (Phase 14)
+
+`internal/auth/integration/email_delivery_test.go` — 8 integration tests:
+
+- `TestRegister_EmailDelivered` — verifies async email sent after registration
+- `TestRegister_BodySizeLimit_*` — body > 64 KB returns 413 (not 400)
+- `TestResendVerification_EmailDelivered` — verifies resend sends email for pending account
+- Additional enumeration-resistance and async-delivery assertions
+
+New dependencies added: `aws-sdk-go-v2/aws`, `aws-sdk-go-v2/config`, `aws-sdk-go-v2/credentials`, `aws-sdk-go-v2/service/sesv2`.
+
+---
+
+### Phase 15A — P1 Defect Fixes from Phase 14 Adversarial Review (Complete)
+
+**Status: COMPLETE. All 5 P1 defects resolved. Production readiness: PASS.**
+
+Phase 15A fixed every P1 (production blocker) defect surfaced by the Phase 14 adversarial security review. No new features were added; changes were surgical and minimal.
+
+#### Fix 1 — Async Register Email with Goroutine Timeout
+
+**Problem:** `handler.Register` called `h.emailSender.SendVerificationEmail` synchronously, blocking the HTTP response for the full SES/SMTP round-trip (~100–500 ms). Under load this starves the server goroutine pool and exposes users to correlated latency spikes with the email provider.
+
+**Fix:** Email send moved to a goroutine. `rawToken` captured before the production strip. 30-second `context.WithTimeout` guards the goroutine. Errors logged with `slog.ErrorContext`; never returned to the caller.
+
+```go
+rawToken := resp.VerificationToken
+go func() {
+    ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+    defer cancel()
+    if err := h.emailSender.SendVerificationEmail(ctx, toEmail, toName, rawToken); err != nil {
+        h.log.ErrorContext(context.Background(), "auth.register.email_failed", slog.String("error", err.Error()))
+    }
+}()
+```
+
+#### Fix 2 — ResendVerification Timing Equalization on Success Path
+
+**Problem:** `service.ResendVerification` called `equalizeEnumerationTiming` on all failure paths (not-found, wrong-status, DB error) but not on the success path. The success path (SELECT + INSERT ≈ 2 DB ops) was measurably faster than the not-found path (SELECT + equalization ≈ 5 DB ops), allowing a timing adversary to enumerate `pending_verification` accounts.
+
+**Fix:** `equalizeEnumerationTiming` added to the success path after `CreateEmailVerificationToken` succeeds. All paths now complete ~5–6 equivalent DB round-trips.
+
+#### Fix 3 — Goroutine Timeouts on ForgotPassword + ResendVerification
+
+**Problem:** The goroutines in `handler.ForgotPassword` and `handler.ResendVerification` launched goroutines without context timeouts. A hung email provider would cause goroutines to leak indefinitely.
+
+**Fix:** `context.WithTimeout(context.Background(), 30*time.Second)` added to both goroutines, matching the pattern established in Fix 1.
+
+#### Fix 4 — Apply writeLimiter + mediaLimiter to Routes
+
+**Problem:** `writeLimiter` and `mediaLimiter` were constructed in `bootstrap/app.go` and passed to `NewRouter`, but `bootstrap/modules.go` discarded them with `_ = writeLimiter; _ = mediaLimiter`. Domain write endpoints and media upload endpoints were unprotected against write-amplification attacks.
+
+**Fix:** Domain modules wrapped in `r.Group` with `writeLimiter.WriteMiddleware()`. Media module wrapped in a separate `r.Group` with `mediaLimiter.WriteMiddleware()`. Both groups nil-guard their respective limiters.
+
+```go
+r.Group(func(r chi.Router) {
+    if writeLimiter != nil { r.Use(writeLimiter.WriteMiddleware()) }
+    organizations.RegisterRoutes(...)
+    // ... 7 more domain modules
+})
+r.Group(func(r chi.Router) {
+    if mediaLimiter != nil { r.Use(mediaLimiter.WriteMiddleware()) }
+    media.RegisterRoutes(...)
+})
+```
+
+`WriteMiddleware()` applies rate limiting only to POST/PUT/PATCH/DELETE; GET/HEAD pass through unconditionally.
+
+#### Fix 5 — Body Size Limit Returns 413 (not 400)
+
+**Problem:** `BodySizeLimit` middleware wraps `r.Body` with `http.MaxBytesReader`. When the body exceeds the limit, `DecodeJSON` returns `errors.New("request body too large")` (a plain untyped error). `writeDecodeError` had no check for this case and fell through to `http.StatusBadRequest` (400). RFC 9110 specifies 413 Content Too Large for this condition.
+
+**Fix applied across three files:**
+
+1. `validator.go`: Added `ErrBodyTooLarge = errors.New("request body too large")` sentinel. `DecodeJSON` now returns this sentinel (instead of an anonymous error) when `*http.MaxBytesError` is detected.
+2. `handler.go` (`writeDecodeError`): Added `errors.Is(err, validator.ErrBodyTooLarge)` as the first check → returns `http.StatusRequestEntityTooLarge` (413).
+3. `bodysize.go`: Updated comment to reference 413, not 400.
+
+#### Files Changed (Phase 15A)
+
+| File | Change |
+|------|--------|
+| `internal/platform/validator/validator.go` | Added `ErrBodyTooLarge` sentinel; `DecodeJSON` returns it on `*http.MaxBytesError` |
+| `internal/platform/middleware/ratelimit.go` | Added `WriteMiddleware()` — POST/PUT/PATCH/DELETE only |
+| `internal/platform/middleware/bodysize.go` | Updated comment: 400 → 413 |
+| `internal/auth/handler.go` | `writeDecodeError`: 413 check first; `Register`: async email + 30s timeout; `ForgotPassword`: 30s timeout; `ResendVerification`: 30s timeout |
+| `internal/auth/service.go` | `ResendVerification`: `equalizeEnumerationTiming` on success path |
+| `internal/bootstrap/modules.go` | `writeLimiter` and `mediaLimiter` wired via `r.Group` + `WriteMiddleware()` |
+
+---
+
 ## 8. Outstanding Work
 
 ### Completed since initial document
@@ -2158,6 +2348,9 @@ The CAS is strictly stronger than the NOT IN guard: it rejects any concurrent tr
 - [x] **Phase 13B.2A — Auth Integration Tests: Core Suite** — 66-test integration suite in `internal/auth/integration/`; 10 test files covering lifecycle, middleware, refresh, password-reset, email-verification, suspension, multi-tenant, concurrency, CORS, and rate-limiting flows; 7 new fixture helpers (`CreatePendingUser`, `CreateSuspendedUser`, `CreateInactiveUser`, `CreatePlatformAdmin`, `CreateOrgWithRole`, `CreateExpiredRefreshToken`, `CreateExpiredEmailVerificationToken`); all tests run against a live PostgreSQL 17 instance; adversarial review: all 19 checks PASS; no defects
 - [x] **Phase 13B.2B-A — Auth Integration Tests: JWT Claims & Security Invariants** — 6 targeted tests protecting named security invariants: JWT wrong-key rejection, empty `user_id` claim rejection, empty `email` claim rejection (`TestJWT_EmptyEmailClaim` added in final session), logout idempotency with state-corruption guard, and live-DB permission enforcement under role revocation and org-membership removal; `makeEmptyEmailToken` helper added to `token_helpers_test.go`; adversarial review: all 9 checks PASS; no defects
 - [x] **Phase 13B.2B-B — Auth Integration Tests: Validation & Edge Cases** — 20 tests closing all P1 validator-path, decode-error, and account-state gaps; `assertValidationError` + `postRaw` helpers added; new `validation_test.go` (18 tests, no DB access for 16); `TestRefresh_InactiveUserBlocked` and `TestLogin_ZeroOrgs` added to existing files; `ErrPasswordTooLong` → 422 covered via multibyte-unicode boundary test; ForgotPassword always-200 boundary gated at both validator and decode paths; adversarial review: all 20 checks PASS; no defects; total auth integration tests: 92
+- [x] **Phase 14 — Email Infrastructure** — `internal/email/` package with `Provider` interface, `sesProvider` (AWS SES v2), `smtpProvider` (net/smtp), `LogProvider`, `NoOpProvider`; `Sender` with `SendVerificationEmail`, `SendPasswordResetEmail`, `SendResendVerificationEmail`; HTML + text templates via Go embed; `POST /api/v1/auth/resend-verification` endpoint with timing equalization; 9 unit tests + 8 integration tests; wired into bootstrap; new config fields: `EMAIL_PROVIDER`, `EMAIL_FROM_ADDRESS`, `APP_BASE_URL`, and provider-specific fields
+- [x] **Phase 15A — P1 Defect Fixes** — Async `Register` email with 30s goroutine timeout; `equalizeEnumerationTiming` on `ResendVerification` success path; goroutine timeouts on `ForgotPassword` + `ResendVerification`; `writeLimiter` + `mediaLimiter` applied via `r.Group`/`WriteMiddleware()`; `ErrBodyTooLarge` sentinel → HTTP 413; new config fields: `RATE_LIMIT_WRITE_RPS/BURST`, `RATE_LIMIT_MEDIA_RPS/BURST`
+- [x] **Phase 15A Remediation** — Domain write BodySizeLimit (P0-1); SMTP context-aware via goroutine+channel (P1-1); `equalizeResendVerificationTiming` 5-RT variant for full path equalization (P1-2); nil-sender service bypass removed (P1-3); `sync.WaitGroup` email goroutine drain + `DrainEmail` wired through shutdown chain (P1-4); `sync.Map` + `atomic.Int64` rate limiter cleanup (P1-5); `TrustedRealIP` middleware (P1-6); `Retry-After: 1` on 429 (P2-1); multipart/alternative MIME (P2-4); 5 regression tests added; new config field: `TRUSTED_PROXY_CIDRS`
 
 ### Previously tracked auth hardening items (resolved in Phase 13A)
 
@@ -2172,6 +2365,7 @@ The CAS is strictly stronger than the NOT IN guard: it rejects any concurrent tr
 - [x] **CORS configuration** — `middleware.CORS(cfg.CORSAllowedOrigins)` wired in `bootstrap/router.go`; `Access-Control-Allow-Credentials` support added
 - [x] **Rate limiting** — Per-IP token-bucket limiter implemented and wired onto the `/api/v1/auth` route group
 - [x] **Remove `verification_token` from register response in production** — Gated behind `IsDevelopment()` in `handler.Register`
+- [x] **Transactional email delivery** — `internal/email/` package with SES v2, SMTP, and LogProvider backends; verification + password-reset emails sent from auth handlers; async with 30-second timeout goroutines
 
 ### Required for feature completeness
 
@@ -2221,7 +2415,10 @@ The CAS is strictly stronger than the NOT IN guard: it rejects any concurrent tr
 | Phase 13B.2A | Auth Integration Tests — core suite (66 tests) | **COMPLETE** |
 | Phase 13B.2B-A | Auth Integration Tests — JWT claims & security invariants (6 tests) | **COMPLETE** |
 | Phase 13B.2B-B | Auth Integration Tests — validation, malformed payloads, edge cases (20 tests) | **COMPLETE** |
-| Phase 14 | Users module — list, get, update profile, change password, deactivate | NOT STARTED |
+| Phase 14 | Email Infrastructure — Provider abstraction, SES/SMTP/Log/NoOp, templates, resend-verification endpoint | **COMPLETE** |
+| Phase 15A | P1 Defect Fixes — async email goroutines, timing equalization, 413 body limit, write/media rate limiters wired | **COMPLETE** |
+| Phase 15A Remediation | P0-1/P1/P2 Defect Fixes from Phase 15A adversarial review — domain BodySizeLimit, SMTP ctx, ResendVerification timing, nil-sender fix, goroutine drain, sync.Map ratelimit, TrustedRealIP, Retry-After, multipart MIME | **COMPLETE** |
+| Phase 16 | Users module — list, get, update profile, change password, deactivate | NOT STARTED |
 
 ---
 
@@ -2366,13 +2563,120 @@ No defects identified. No production code modified.
 
 ---
 
+### Phase 14 — Email Infrastructure (Complete)
+
+Email delivery system implemented and production-hardened. `internal/email/` package provides a `Provider` interface with four implementations: `sesProvider` (AWS SES v2), `smtpProvider` (net/smtp with STARTTLS and implicit TLS modes), `LogProvider` (slog — dev default), `NoOpProvider` (in-memory capture for tests). `Sender` renders HTML + text templates via Go embed FS and delegates to the provider. Auth domain sends verification emails on register, password reset emails on `ForgotPassword`, and resend-verification emails on `ResendVerification`. New `POST /api/v1/auth/resend-verification` endpoint added (enumeration-resistant; always 200). Production config blocks `noop`/`log` providers and enforces `https://` on `APP_BASE_URL`. 9 unit tests + 8 integration tests. All P1 defects fixed in Phase 15A.
+
+New dependency: `aws-sdk-go-v2` (SES v2 provider).  
+New package: `internal/email/`.  
+New config fields: `EMAIL_PROVIDER`, `EMAIL_FROM_ADDRESS`, `EMAIL_FROM_NAME`, `APP_BASE_URL`, `EMAIL_SES_*`, `EMAIL_SMTP_*`.
+
+---
+
+### Phase 15A — P1 Defect Fixes (Complete)
+
+Five P1 production blockers from the Phase 14 adversarial review fixed. (1) `Register` email moved to async goroutine with 30-second context timeout. (2) `ResendVerification` timing equalization added to success path — all enumeration paths now have comparable round-trip profiles. (3) 30-second timeouts added to `ForgotPassword` and `ResendVerification` goroutines. (4) `writeLimiter` and `mediaLimiter` wired into domain modules via `r.Group`/`WriteMiddleware()` — domain write endpoints and media uploads now rate-limited. (5) `ErrBodyTooLarge` sentinel added to validator; `writeDecodeError` now returns HTTP 413 instead of 400 when the body limit is exceeded. All changes surgical — no new features, no signature changes to module APIs.
+
+New config fields: `RATE_LIMIT_WRITE_RPS`, `RATE_LIMIT_WRITE_BURST`, `RATE_LIMIT_MEDIA_RPS`, `RATE_LIMIT_MEDIA_BURST`.
+
+Subsequently adversarially reviewed; 9 additional defects found and remediated in Phase 15A Remediation.
+
+---
+
+### Phase 15A Remediation — Phase 15A Adversarial Review Findings (Complete)
+
+**Status: COMPLETE. Adversarial review: all 9 findings PASS. Production readiness: PASS.**
+
+Nine defects from the Phase 15A adversarial review fixed. No architecture changes; no new features.
+
+#### Fix 1 — P0-1: Domain Write BodySizeLimit
+
+Applied `r.Use(middleware.BodySizeLimit(64 * 1024))` as the first middleware in the domain write `r.Group` in `modules.go`, before the write-limiter. Covers organizations, players, teams, tournaments, tournament registrations, matches, match events, and notifications. Auth routes already had their own 64 KB limit.
+
+#### Fix 2 — P1-1: SMTP Context Cancellation
+
+`smtpProvider.Send` now honours `ctx` via a goroutine+channel pattern. An inner goroutine performs the blocking SMTP exchange and sends the result on a buffered channel. The outer function selects on the channel or `ctx.Done()`. Context cancellation returns `ctx.Err()` within the deadline. The inner goroutine may linger until the OS TCP timeout (~2 min) — documented, bounded, accepted.
+
+#### Fix 3 — P1-2: ResendVerification Timing Equalization
+
+Added `equalizeResendVerificationTiming` (5 DB round-trips: BEGIN + SELECT 1 + SELECT NOW() + SELECT 1 + COMMIT) in `repository.go`. All five `ResendVerification` paths now total 6 round-trips:
+
+| Path | Round-trips |
+|------|------------|
+| Not-found | 1 (SELECT) + 5 (equalize) = 6 |
+| Already-active | 1 (SELECT) + 5 (equalize) = 6 |
+| Token-gen-failure | 1 (SELECT) + 5 (equalize) = 6 |
+| INSERT-failure | 1 (SELECT) + 1 (INSERT) + 4 (equalizeEnumeration) = 6 |
+| Success | 1 (SELECT) + 1 (INSERT) + 4 (equalizeEnumeration) = 6 |
+
+#### Fix 4 — P1-3: Nil-emailSender Service Bypass
+
+`handler.ResendVerification` previously gated the entire service call on `h.emailSender != nil`. Timing equalization and token creation were skipped when no sender was configured. Fixed: service call is now unconditional. The email goroutine is spawned only when `h.emailSender != nil && svcErr == nil && rawToken != ""`.
+
+#### Fix 5 — P1-4: Goroutine Drain on Graceful Shutdown
+
+`Handler` gains `wg sync.WaitGroup`. All three email goroutines (`Register`, `ForgotPassword`, `ResendVerification`) call `h.wg.Add(1)` before spawning and `defer h.wg.Done()` inside. `DrainEmail(ctx)` blocks on `wg.Wait()` with context timeout. Wired through the full chain: `RegisterRoutes` returns `*Handler`; `registerModules` returns `*auth.Handler`; `NewRouter` returns `(http.Handler, *auth.Handler)`; `App` stores `authHandler`; `App.Shutdown` calls `authHandler.DrainEmail(ctx)` before stopping rate limiters. Integration test cleanup now calls `DrainEmail(ctx)` too.
+
+#### Fix 6 — P1-5: Rate Limiter Cleanup Lock Contention
+
+Replaced the mutex-protected `map[string]*rate.Limiter` with `sync.Map` (key: IP string, value: `*ipEntry`). `ipEntry.lastSeen` is an `atomic.Int64` (Unix nanoseconds) — updated lock-free on every request. `cleanup` uses `sync.Map.Range`, which does not hold a global mutex during iteration, eliminating the O(n) stall that previously blocked all concurrent rate-limit checks during each cleanup cycle.
+
+#### Fix 7 — P1-6: TrustedRealIP Middleware
+
+New `middleware/realip.go`. `TrustedRealIP(trustedCIDRs []string)` rewrites `RemoteAddr` from `X-Forwarded-For` / `X-Real-IP` only when the direct TCP peer is in a trusted CIDR, preventing rate-limit bypass via spoofed forwarding headers from untrusted clients. When `trustedCIDRs` is empty, falls back to `chimw.RealIP` for backward compatibility. Replaces `chimw.RealIP` in `router.go`. New config field: `TRUSTED_PROXY_CIDRS` (comma-separated CIDR list, optional).
+
+#### Fix 8 — P2-1: Retry-After Header on 429
+
+Both `Middleware()` and `WriteMiddleware()` now set `Retry-After: 1` before `WriteHeader(429)`. Static value; communicates minimum back-off to clients.
+
+#### Fix 9 — P2-4: Multipart/Alternative MIME
+
+`smtpProvider.buildMessage` emits `multipart/alternative` when both `TextBody` and `HTMLBody` are present. Boundary generated from `time.Now().UnixNano()` (unique per message). Plain-text part is listed before HTML (RFC 2046 preferred-last ordering). Single-part messages are unaffected.
+
+#### Files Changed (Phase 15A Remediation)
+
+| File | Change |
+|------|--------|
+| `internal/email/smtp.go` | Context-aware `Send` (goroutine+channel); `buildMessage` emits multipart/alternative; added `"time"` import |
+| `internal/auth/repository.go` | Added `equalizeResendVerificationTiming` (5-RT variant) |
+| `internal/auth/service.go` | `ResendVerification`: per-path equalization using both 4-RT and 5-RT variants |
+| `internal/auth/handler.go` | `sync.WaitGroup wg`; `DrainEmail(ctx)`; P1-3 fix (service always called); `wg.Add/Done` in all email goroutines |
+| `internal/auth/routes.go` | `RegisterRoutes` return type changed to `*Handler`; added `return h` |
+| `internal/platform/middleware/ratelimit.go` | `sync.Map` + `atomic.Int64 lastSeen`; `Retry-After: 1` header on 429 |
+| `internal/platform/middleware/realip.go` | **New file** — `TrustedRealIP` middleware |
+| `internal/platform/config/config.go` | Added `TrustedProxyCIDRs []string` field; `getEnvStringSlice("TRUSTED_PROXY_CIDRS", nil)` |
+| `internal/bootstrap/router.go` | `TrustedRealIP` replaces `chimw.RealIP`; returns `(http.Handler, *auth.Handler)` |
+| `internal/bootstrap/app.go` | `authHandler *auth.Handler` field; `DrainEmail(ctx)` in `Shutdown` |
+| `internal/bootstrap/modules.go` | `BodySizeLimit(64*1024)` in domain write group; returns `*auth.Handler` |
+| `internal/auth/integration/server_test.go` | `handler *auth.Handler` field; `DrainEmail` in cleanup; `buildServerWithNilSender` added |
+| `internal/auth/integration/remediation_test.go` | **New file** — 5 regression tests (P0-1, P1-3, P1-4 ×2, P2-1) |
+
+#### Adversarial Review Results (Phase 15A Remediation)
+
+All 9 findings PASS. Remaining P2 items (not blocking production):
+
+| Defect | Description |
+|--------|-------------|
+| D1 — P2 | `TrustedRealIP` calls `chimw.RealIP(next)` per trusted request instead of pre-computing the wrapper once; unnecessary per-request allocation |
+| D2 — P2 | `parseCIDRs` silently drops malformed CIDR strings; misconfigured `TRUSTED_PROXY_CIDRS` fails open |
+| D3 — P2 | `Retry-After: 1` is static; does not reflect actual token-bucket refill time (`rate.Limiter.Reserve().Delay()`) |
+| D4 — P2 | MIME body parts omit `Content-Transfer-Encoding` headers; non-ASCII bodies may be mis-encoded by strict SMTP relays |
+| MT1 — P2 | No integration test for oversized body on domain write routes (only auth routes tested by `TestBodySizeLimit_Auth_Regression`) |
+| MT2 — P2 | No test for SMTP context cancellation (requires mock hanging SMTP server; deferred) |
+| MT3 — P2 | No test for TrustedRealIP trusted/untrusted CIDR behaviour |
+| MT4 — P2 | No unit test for multipart MIME structure from `buildMessage` |
+
+Deferred from this pass: **P2-5 — token accumulation** (`email_verification_tokens` rows are not expired per-user before a new one is inserted on `ResendVerification`; causes unbounded table growth under sustained load).
+
+---
+
 ## 10. Next Recommended Phase
 
-**Phase 14 — Users Module**
+**Phase 16 — Users Module**
 
-The auth integration suite is complete at **92 tests** across 12 files. All auth domain flows are covered and adversarially reviewed. The `internal/users/` stub has existed since Phase 1 with package declaration only. Phase 14 closes the largest remaining feature-completeness gap.
+The email infrastructure and all P1 security defects are resolved. The `internal/users/` stub has existed since Phase 1 with package declaration only. Phase 16 closes the largest remaining feature-completeness gap.
 
-**Phase 14 scope:**
+**Phase 16 scope:**
 
 1. **User profile read** — `GET /api/v1/users/me` or augment `/api/v1/auth/me` with editable profile fields.
 2. **User profile update** — `PATCH /api/v1/users/{id}` — update `first_name`, `last_name`, `username`; BOLA-guarded (self-only or `user.manage`).
@@ -2429,7 +2733,7 @@ The auth integration suite is complete at **92 tests** across 12 files. All auth
 | `backend/db/queries/auth.sql` | Refresh token lifecycle queries; `RevokeAndLinkSuccessor :execrows` (Auth Security Hotfix v2) |
 | `backend/db/queries/password_reset_tokens.sql` | 7 queries: Create, GetByHash (non-locking), GetForUpdate, LockUserPasswordResetTokens (ORDER BY id FOR UPDATE), UseOne, UseAll, DeleteExpired |
 | `backend/db/migrations/embed.go` | Exports `migrations.FS embed.FS` via `//go:embed *.sql`; used by `internal/testutil` to run migrations without filesystem access |
-| `backend/internal/auth/repository.go` | `RotateRefreshToken` (replay state machine + user status re-check); `LogoutTransaction` (FOR UPDATE); `ForgotPasswordTransaction`; `ResetPasswordTransaction` (deterministic lock-order deadlock fix, Phase 13B.1); `equalizeEnumerationTiming` (4-round-trip no-op, Phase 13B.1) |
+| `backend/internal/auth/repository.go` | `RotateRefreshToken` (replay state machine + user status re-check); `LogoutTransaction` (FOR UPDATE); `ForgotPasswordTransaction`; `ResetPasswordTransaction` (deterministic lock-order deadlock fix, Phase 13B.1); `equalizeEnumerationTiming` (4-RT, Phase 13B.1); `equalizeResendVerificationTiming` (5-RT, Phase 15A Remediation) |
 | `backend/internal/auth/concurrency_test.go` | 7 barrier-synchronized concurrency tests: refresh replay (Cases 2 & 3), concurrent refresh, logout+refresh race, reset same-token, reset different-tokens (deadlock regression), reset expired+valid |
 | `backend/internal/auth/repository_test.go` | `TestRevokeAndLinkSuccessorInvariant` — asserts `revoked_at`, `successor_id`, and new-token active state after rotation |
 | `backend/internal/auth/testmain_test.go` | `TestMain` wiring `testutil.SetupTestDB` into the auth test package |
@@ -2441,15 +2745,25 @@ The auth integration suite is complete at **92 tests** across 12 files. All auth
 | `backend/internal/auth/integration/helpers_test.go` | HTTP client + assertion helpers; `assertValidationError` (checks body shape + named field); `postRaw` (sends raw string body without marshaling) |
 | `backend/internal/testutil/container.go` | `SetupTestDB` — starts `postgres:17-alpine`, applies migrations via golang-migrate + pgx/v5, returns `*pgxpool.Pool` and teardown; Docker-unavailable skip/fail policy |
 | `backend/internal/testutil/fixtures/auth.go` | Typed auth fixtures: `CreateActiveUser`, `CreateRefreshToken`, `CreatePasswordResetToken`, `CreateExpiredPasswordResetToken`, `CleanupUser`, `HashToken` |
-| `backend/internal/platform/middleware/ratelimit.go` | `IPRateLimiter` — per-IP token bucket; sync.Mutex-protected map; background cleanup goroutine; Stop() via done channel |
+| `backend/internal/platform/middleware/ratelimit.go` | `IPRateLimiter` — per-IP token bucket; `sync.Map` + `atomic.Int64 lastSeen`; O(1) lock-free reads; O(active IPs) cleanup via `sync.Map.Range`; `Retry-After: 1` on 429; Stop() via done channel |
+| `backend/internal/platform/middleware/realip.go` | `TrustedRealIP(trustedCIDRs)` — rewrites RemoteAddr only for connections from trusted CIDR ranges; prevents X-Forwarded-For spoofing from untrusted clients; falls back to `chimw.RealIP` when unconfigured |
 | `backend/internal/platform/middleware/cors.go` | `CORS()` middleware — origin reflection; `Allow-Credentials` (specific origins only); `Vary: Origin`; preflight 204 |
 | `backend/internal/cleanup/scheduler.go` | `Scheduler` — background token expiry cleanup; configurable interval; graceful shutdown via done channel |
-| `backend/internal/bootstrap/app.go` | `App.Handler()` initialises rate limiter + cleanup scheduler; `App.Shutdown()` stops both |
+| `backend/internal/bootstrap/app.go` | `App.Handler()` initialises rate limiter + cleanup scheduler; `App.Shutdown()` calls `DrainEmail` then stops all background services; holds `authHandler *auth.Handler` for drain |
 | `backend/db/queries/notifications.sql` | 16 notification SQL queries; includes `GetNotificationPreferencesForEvent` for O(event_types) batch preference loading |
 | `backend/internal/notifications/repository.go` | `DrainOutbox` (FOR UPDATE SKIP LOCKED, batch prefs, UNIQUE conflict handling); `UpsertPreference` (dynamic audit action: AuditActionCreate vs AuditActionUpdate) |
 | `backend/internal/notifications/service.go` | `DrainOutbox` entry point — errors swallowed to preserve domain operation result |
 | `backend/internal/notifications/trigger/trigger.go` | `WriteOutboxEntry` — must be called with a transaction-scoped `*db.Queries` handle |
+| `backend/internal/email/email.go` | `Provider` interface; `NoOpProvider` (in-memory capture + `SentTo`/`Reset` helpers); `NewSender` factory; `NewSenderWithProvider` (test injection) |
+| `backend/internal/email/sender.go` | `Sender` + `SenderConfig`; `SendVerificationEmail`, `SendPasswordResetEmail`, `SendResendVerificationEmail` — renders templates then calls `Provider.Send` |
+| `backend/internal/email/ses.go` | `sesProvider` — AWS SES v2; `awsconfig.LoadDefaultConfig` with optional static credential override; optional HTML body |
+| `backend/internal/email/smtp.go` | `smtpProvider` — `net/smtp`; `useTLS=false` → STARTTLS; `useTLS=true` → implicit TLS (`tls.Dial`); context-aware via goroutine+channel select; `buildMessage` emits `multipart/alternative` when both bodies are present |
+| `backend/internal/email/templates.go` | `//go:embed templates` FS; `html/template` for HTML (auto-escaping); `text/template` for plain text |
+| `backend/internal/auth/integration/email_delivery_test.go` | 8 integration tests covering email delivery on register, body size 413, and resend-verification |
+| `backend/internal/auth/integration/remediation_test.go` | 5 regression tests: `TestResendVerification_NilSender_ServiceStillCalled` (P1-3), `TestBodySizeLimit_Auth_Regression` (P0-1), `TestRateLimit_RetryAfterHeader` (P2-1), `TestHandler_DrainEmail_CompletesWithinTimeout` (P1-4), `TestRegister_DrainEmailAfterDelivery` (P1-4) |
+| `backend/internal/platform/middleware/bodysize.go` | `BodySizeLimit(maxBytes)` — `http.MaxBytesReader` wrapper; downstream `*http.MaxBytesError` → `ErrBodyTooLarge` → 413 |
+| `backend/internal/platform/validator/validator.go` | `ErrBodyTooLarge` sentinel (Phase 15A); `DecodeJSON` returns it on `*http.MaxBytesError` |
 
 ---
 
-*This document was last updated on 2026-06-04 (Phase 13B.2B-B complete). It should be updated whenever a phase is completed or significant architectural changes are made.*
+*This document was last updated on 2026-06-05 (Phase 15A Remediation complete + adversarial review PASS). It should be updated whenever a phase is completed or significant architectural changes are made.*

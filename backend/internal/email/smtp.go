@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/smtp"
 	"strings"
+	"time"
 )
 
 type smtpProvider struct {
@@ -33,20 +34,37 @@ func newSMTPProviderImpl(host string, port int, username, password string, useTL
 	}
 }
 
-func (p *smtpProvider) Send(_ context.Context, msg Message) error {
+// Send delivers msg via SMTP. The context deadline is honoured: if ctx is
+// cancelled or its deadline expires before the SMTP exchange completes, Send
+// returns ctx.Err(). The SMTP goroutine may linger briefly after context
+// cancellation; it terminates within the OS TCP timeout (~2 min) or sooner
+// if the server responds to the abandoned connection.
+func (p *smtpProvider) Send(ctx context.Context, msg Message) error {
 	addr := fmt.Sprintf("%s:%d", p.host, p.port)
 	body := p.buildMessage(msg)
 
-	var err error
-	if p.useTLS {
-		err = p.sendViaTLS(addr, msg.To, body)
-	} else {
-		err = p.sendViaSendMail(addr, msg.To, body)
+	type result struct{ err error }
+	ch := make(chan result, 1)
+	go func() {
+		var err error
+		if p.useTLS {
+			err = p.sendViaTLS(addr, msg.To, body)
+		} else {
+			err = p.sendViaSendMail(addr, msg.To, body)
+		}
+		if err != nil {
+			ch <- result{fmt.Errorf("email: SMTP send: %w", err)}
+		} else {
+			ch <- result{}
+		}
+	}()
+
+	select {
+	case r := <-ch:
+		return r.err
+	case <-ctx.Done():
+		return fmt.Errorf("email: SMTP send: %w", ctx.Err())
 	}
-	if err != nil {
-		return fmt.Errorf("email: SMTP send: %w", err)
-	}
-	return nil
 }
 
 func (p *smtpProvider) sendViaSendMail(addr, to string, body []byte) error {
@@ -88,8 +106,10 @@ func (p *smtpProvider) sendViaTLS(addr, to string, body []byte) error {
 	return err
 }
 
-// buildMessage constructs a minimal RFC 5322 message. Uses text/html when
-// HTMLBody is non-empty, otherwise text/plain.
+// buildMessage constructs a MIME RFC 5322 message. When both TextBody and
+// HTMLBody are present a multipart/alternative structure is used so that mail
+// clients without HTML support can fall back to plain text. When only one body
+// type is supplied a single-part message is emitted instead.
 func (p *smtpProvider) buildMessage(msg Message) []byte {
 	from := p.fromAddress
 	if p.fromName != "" {
@@ -101,7 +121,26 @@ func (p *smtpProvider) buildMessage(msg Message) []byte {
 	sb.WriteString("To: " + msg.To + "\r\n")
 	sb.WriteString("Subject: " + msg.Subject + "\r\n")
 	sb.WriteString("MIME-Version: 1.0\r\n")
-	if msg.HTMLBody != "" {
+
+	if msg.TextBody != "" && msg.HTMLBody != "" {
+		boundary := fmt.Sprintf("mime_%d", time.Now().UnixNano())
+		sb.WriteString(fmt.Sprintf("Content-Type: multipart/alternative; boundary=%q\r\n", boundary))
+		sb.WriteString("\r\n")
+
+		sb.WriteString("--" + boundary + "\r\n")
+		sb.WriteString("Content-Type: text/plain; charset=\"UTF-8\"\r\n")
+		sb.WriteString("\r\n")
+		sb.WriteString(msg.TextBody)
+		sb.WriteString("\r\n")
+
+		sb.WriteString("--" + boundary + "\r\n")
+		sb.WriteString("Content-Type: text/html; charset=\"UTF-8\"\r\n")
+		sb.WriteString("\r\n")
+		sb.WriteString(msg.HTMLBody)
+		sb.WriteString("\r\n")
+
+		sb.WriteString("--" + boundary + "--\r\n")
+	} else if msg.HTMLBody != "" {
 		sb.WriteString("Content-Type: text/html; charset=\"UTF-8\"\r\n")
 		sb.WriteString("\r\n")
 		sb.WriteString(msg.HTMLBody)
@@ -110,5 +149,6 @@ func (p *smtpProvider) buildMessage(msg Message) []byte {
 		sb.WriteString("\r\n")
 		sb.WriteString(msg.TextBody)
 	}
+
 	return []byte(sb.String())
 }

@@ -1,10 +1,12 @@
 package auth_integration_test
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
@@ -35,7 +37,8 @@ type testServer struct {
 	pool    *pgxpool.Pool
 	cfg     *config.Config
 	limiter *mw.IPRateLimiter
-	mailer  *email.NoOpProvider // inspect sent emails in tests
+	mailer  *email.NoOpProvider // inspect sent emails in tests; nil when server has no sender
+	handler *auth.Handler       // for DrainEmail in cleanup
 }
 
 // testConfig returns a Config appropriate for integration tests.
@@ -58,7 +61,8 @@ func testConfig() *config.Config {
 }
 
 // buildTestServer creates a test HTTP server with a permissive rate limiter
-// (100 RPS, burst 200). Intended for all non-rate-limit tests.
+// (100 RPS, burst 200) and a NoOpProvider email sender. Intended for all
+// non-rate-limit tests.
 func buildTestServer(t testing.TB, pool *pgxpool.Pool) *testServer {
 	t.Helper()
 	return buildServerWithLimiter(t, pool, mw.NewIPRateLimiter(rate.Limit(100), 200))
@@ -97,11 +101,14 @@ func buildServerWithLimiter(t testing.TB, pool *pgxpool.Pool, limiter *mw.IPRate
 	r.Use(chimw.Recoverer)
 	r.Use(mw.CORS(cfg.CORSAllowedOrigins))
 
-	auth.RegisterRoutes(r, pool, cfg, logger, limiter, sender)
+	authHandler := auth.RegisterRoutes(r, pool, cfg, logger, limiter, sender)
 
 	srv := httptest.NewServer(r)
 	t.Cleanup(func() {
 		srv.Close()
+		drainCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = authHandler.DrainEmail(drainCtx)
 		limiter.Stop()
 	})
 
@@ -111,5 +118,43 @@ func buildServerWithLimiter(t testing.TB, pool *pgxpool.Pool, limiter *mw.IPRate
 		cfg:     cfg,
 		limiter: limiter,
 		mailer:  noopMailer,
+		handler: authHandler,
+	}
+}
+
+// buildServerWithNilSender creates a test server with no email sender configured.
+// Use this to verify that service logic (timing equalization, token creation)
+// still executes when emailSender is nil — regression guard for P1-3.
+func buildServerWithNilSender(t testing.TB, pool *pgxpool.Pool) *testServer {
+	t.Helper()
+
+	cfg := testConfig()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	limiter := mw.NewIPRateLimiter(rate.Limit(100), 200)
+
+	r := chi.NewRouter()
+	r.Use(chimw.RequestID)
+	r.Use(chimw.RealIP)
+	r.Use(chimw.Recoverer)
+	r.Use(mw.CORS(cfg.CORSAllowedOrigins))
+
+	authHandler := auth.RegisterRoutes(r, pool, cfg, logger, limiter, nil)
+
+	srv := httptest.NewServer(r)
+	t.Cleanup(func() {
+		srv.Close()
+		drainCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = authHandler.DrainEmail(drainCtx)
+		limiter.Stop()
+	})
+
+	return &testServer{
+		url:     srv.URL,
+		pool:    pool,
+		cfg:     cfg,
+		limiter: limiter,
+		mailer:  nil, // no sender configured
+		handler: authHandler,
 	}
 }

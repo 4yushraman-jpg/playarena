@@ -38,6 +38,9 @@ import (
 // Auth + permission routes (RequireAuth + RequirePermission):
 //
 //	GET  /api/v1/auth/admin-only  — requires "role.assign" permission
+//
+// RegisterRoutes mounts all auth endpoints and returns the Handler so the
+// caller can invoke DrainEmail during graceful shutdown.
 func RegisterRoutes(
 	r chi.Router,
 	pool *pgxpool.Pool,
@@ -45,7 +48,7 @@ func RegisterRoutes(
 	log *slog.Logger,
 	limiter *middleware.IPRateLimiter,
 	emailSender *email.Sender,
-) {
+) *Handler {
 	queries := db.New(pool)
 	repo := NewRepository(queries, pool)
 	svc := NewService(repo, cfg)
@@ -87,4 +90,5 @@ func RegisterRoutes(
 			r.Get("/admin-only", h.AdminOnly)
 		})
 	})
+	return h
 }

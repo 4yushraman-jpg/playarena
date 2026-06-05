@@ -327,19 +327,22 @@ func (s *Service) ResetPassword(ctx context.Context, req ResetPasswordRequest) e
 func (s *Service) ResendVerification(ctx context.Context, email string) (string, error) {
 	user, err := s.repo.GetUserByEmail(ctx, strings.ToLower(strings.TrimSpace(email)))
 	if err != nil {
-		s.repo.equalizeEnumerationTiming(ctx)
+		// Not-found: no INSERT will occur. Use the 5-RT variant so total
+		// round-trips match the success path (1+5 = 1+1+4 = 6).
+		s.repo.equalizeResendVerificationTiming(ctx)
 		return "", nil
 	}
 
 	if user.Status != db.UserStatusPendingVerification {
-		// Account is already active, suspended, or inactive — no re-send needed
-		// or appropriate. Equalize timing and return empty to prevent enumeration.
-		s.repo.equalizeEnumerationTiming(ctx)
+		// Already-active/suspended/inactive: same as not-found — no INSERT.
+		s.repo.equalizeResendVerificationTiming(ctx)
 		return "", nil
 	}
 
 	rawToken, err := GenerateVerificationToken()
 	if err != nil {
+		// Token generation failed before the INSERT — equalize as not-found.
+		s.repo.equalizeResendVerificationTiming(ctx)
 		return "", err
 	}
 
@@ -349,15 +352,12 @@ func (s *Service) ResendVerification(ctx context.Context, email string) (string,
 		ExpiresAt: GetVerificationTokenExpiryTime(),
 	})
 	if err != nil {
-		// Mask DB errors — treat the same as not found.
+		// INSERT was attempted (1 RT consumed). Standard 4-RT equalization keeps
+		// the total at 6: 1(SELECT) + 1(INSERT) + 4(equalize) = 6.
 		s.repo.equalizeEnumerationTiming(ctx)
 		return "", nil
 	}
 
-	// Equalize timing so the success path (SELECT + INSERT) is not measurably
-	// faster than the not-found / already-active paths (SELECT + equalization).
-	// Without this a timing adversary can distinguish pending_verification
-	// accounts by observing shorter response times.
 	s.repo.equalizeEnumerationTiming(ctx)
 	return rawToken, nil
 }

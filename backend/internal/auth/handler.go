@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"sync"
 	"time"
 
 	chimw "github.com/go-chi/chi/v5/middleware"
@@ -23,12 +24,34 @@ type Handler struct {
 	config      *config.Config
 	log         *slog.Logger
 	emailSender *email.Sender // nil-safe: methods are no-ops when nil
+
+	// wg tracks in-flight email goroutines so that DrainEmail can wait for
+	// them to finish during graceful shutdown. All goroutines that call
+	// wg.Add(1) must call wg.Done() before returning.
+	wg sync.WaitGroup
 }
 
 // NewHandler constructs a Handler. emailSender may be nil in tests that do
 // not exercise email delivery paths.
 func NewHandler(svc *Service, cfg *config.Config, log *slog.Logger, emailSender *email.Sender) *Handler {
 	return &Handler{svc: svc, config: cfg, log: log, emailSender: emailSender}
+}
+
+// DrainEmail waits for all in-flight email goroutines to finish or for ctx
+// to expire, whichever comes first. It should be called during graceful
+// shutdown after the HTTP server stops accepting new connections.
+func (h *Handler) DrainEmail(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		h.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // ---- endpoints --------------------------------------------------------------
@@ -162,11 +185,13 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 		toEmail := resp.Email
 		toName := resp.Username
 		rawToken := resp.VerificationToken // captured before the production strip below
+		h.wg.Add(1)
 		go func() {
+			defer h.wg.Done()
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			if emailErr := h.emailSender.SendVerificationEmail(ctx, toEmail, toName, rawToken); emailErr != nil {
-				h.log.ErrorContext(context.Background(), "auth.register.email_failed",
+				h.log.ErrorContext(ctx, "auth.register.email_failed",
 					slog.String("error", emailErr.Error()),
 				)
 			}
@@ -248,11 +273,13 @@ func (h *Handler) ForgotPassword(w http.ResponseWriter, r *http.Request) {
 		// Capture before the strip below so the goroutine has the token value.
 		rawToken := resp.ResetToken
 		toEmail := req.Email
+		h.wg.Add(1)
 		go func() {
+			defer h.wg.Done()
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			if emailErr := h.emailSender.SendPasswordResetEmail(ctx, toEmail, toEmail, rawToken); emailErr != nil {
-				h.log.ErrorContext(context.Background(), "auth.forgot_password.email_failed",
+				h.log.ErrorContext(ctx, "auth.forgot_password.email_failed",
 					slog.String("error", emailErr.Error()),
 				)
 			}
@@ -274,8 +301,9 @@ func (h *Handler) ForgotPassword(w http.ResponseWriter, r *http.Request) {
 // user-enumeration: an attacker cannot determine account existence from the
 // response.
 //
-// If the email sender is not configured (nil), the handler still returns 200
-// but no email is dispatched.
+// The service is always called regardless of whether the email sender is
+// configured — timing equalization and token creation must always run.
+// The email goroutine is only spawned when an email sender is present.
 func (h *Handler) ResendVerification(w http.ResponseWriter, r *http.Request) {
 	var req ResendVerificationRequest
 	if err := validator.DecodeJSON(r, &req); err != nil {
@@ -283,22 +311,29 @@ func (h *Handler) ResendVerification(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if h.emailSender != nil {
-		rawToken, err := h.svc.ResendVerification(r.Context(), req.Email)
-		if err == nil && rawToken != "" {
-			toEmail := req.Email
-			go func() {
-				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				defer cancel()
-				if emailErr := h.emailSender.ResendVerificationEmail(ctx, toEmail, toEmail, rawToken); emailErr != nil {
-					h.log.ErrorContext(context.Background(), "auth.resend_verification.email_failed",
-						slog.String("error", emailErr.Error()),
-					)
-				}
-			}()
-		}
-		// All other outcomes (not found, already active, DB error) are silently
-		// ignored — the response is always 200. No information is leaked.
+	// Always call the service — it runs timing equalization and creates the
+	// token even when no email sender is configured (P1-3 fix).
+	rawToken, svcErr := h.svc.ResendVerification(r.Context(), req.Email)
+	if svcErr != nil {
+		h.log.WarnContext(r.Context(), "auth.resend_verification.service_error",
+			slog.String("error", svcErr.Error()),
+			slog.String("request_id", chimw.GetReqID(r.Context())),
+		)
+	}
+
+	if h.emailSender != nil && svcErr == nil && rawToken != "" {
+		toEmail := req.Email
+		h.wg.Add(1)
+		go func() {
+			defer h.wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if emailErr := h.emailSender.ResendVerificationEmail(ctx, toEmail, toEmail, rawToken); emailErr != nil {
+				h.log.ErrorContext(ctx, "auth.resend_verification.email_failed",
+					slog.String("error", emailErr.Error()),
+				)
+			}
+		}()
 	}
 
 	response.Write(w, http.StatusOK, struct {

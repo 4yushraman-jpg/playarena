@@ -562,6 +562,32 @@ func (r *Repository) equalizeEnumerationTiming(ctx context.Context) {
 	_ = tx.Commit(ctx)
 }
 
+// equalizeResendVerificationTiming equalises the response time for
+// ResendVerification failure paths that do not perform the INSERT step.
+//
+// Round-trip profile comparison:
+//
+//	not-found / already-active: GetUserByEmail(1) + this(5) = 6 total
+//	success:                    GetUserByEmail(1) + INSERT(1) + equalizeEnumerationTiming(4) = 6 total
+//
+// The extra SELECT 1 inside the transaction accounts for the INSERT round-trip
+// on the success path, producing equal totals across all outcomes and preventing
+// timing-based enumeration of pending-verification accounts.
+func (r *Repository) equalizeResendVerificationTiming(ctx context.Context) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	var dummy int
+	_ = tx.QueryRow(ctx, "SELECT 1").Scan(&dummy)
+	_ = tx.QueryRow(ctx, "SELECT NOW()").Scan(new(interface{}))
+	_ = tx.QueryRow(ctx, "SELECT 1").Scan(&dummy) // matches INSERT round-trip on success path
+
+	_ = tx.Commit(ctx)
+}
+
 // ---- RBAC operations --------------------------------------------------------
 
 func (r *Repository) GetUserRolesByOrganization(ctx context.Context, params db.GetUserRolesByOrganizationParams) ([]db.Role, error) {

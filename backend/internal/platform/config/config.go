@@ -142,6 +142,20 @@ type Config struct {
 
 	// RateLimitMediaBurst is the burst size for media upload endpoints. Default: 10.
 	RateLimitMediaBurst int
+
+	// ── Reverse proxy ────────────────────────────────────────────────────────
+
+	// TrustedProxyCIDRs is the list of CIDR ranges for trusted reverse proxies.
+	// When non-empty, X-Forwarded-For and X-Real-IP headers are only processed
+	// for connections originating from these addresses, preventing rate-limit
+	// bypass via spoofed forwarding headers.
+	//
+	// Parsed from TRUSTED_PROXY_CIDRS (comma-separated, e.g.
+	// "10.0.0.0/8,172.16.0.0/12"). When empty, the middleware falls back to
+	// unconditional header processing for backward compatibility. In production
+	// behind a load balancer, always set this to the load balancer's egress IP
+	// range.
+	TrustedProxyCIDRs []string
 }
 
 // Load reads configuration from environment variables and returns a validated Config.
@@ -212,6 +226,8 @@ func Load() (*Config, error) {
 		RateLimitWriteBurst: getEnvInt("RATE_LIMIT_WRITE_BURST", 60),
 		RateLimitMediaRPS:   getEnvFloat("RATE_LIMIT_MEDIA_RPS", 5.0),
 		RateLimitMediaBurst: getEnvInt("RATE_LIMIT_MEDIA_BURST", 10),
+
+		TrustedProxyCIDRs: getEnvStringSlice("TRUSTED_PROXY_CIDRS", nil),
 	}
 
 	if err := cfg.validate(); err != nil {
