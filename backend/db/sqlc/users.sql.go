@@ -11,6 +11,39 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const countActivePlatformAdmins = `-- name: CountActivePlatformAdmins :one
+SELECT COUNT(DISTINCT u.id)
+FROM   users u
+JOIN   user_organization_roles uor ON uor.user_id = u.id
+JOIN   roles r ON r.id = uor.role_id
+WHERE  r.slug              = 'platform_admin'
+  AND  r.scope             = 'platform'
+  AND  uor.organization_id IS NULL
+  AND  u.status            = 'active'
+  AND  (uor.expires_at IS NULL OR uor.expires_at > NOW())
+`
+
+// Counts distinct users who currently hold an active platform_admin grant
+// and whose account status is 'active'. Called inside DeactivateTransaction
+// after the sentinel lock is held, so the count reflects committed state.
+func (q *Queries) CountActivePlatformAdmins(ctx context.Context) (int64, error) {
+	row := q.db.QueryRow(ctx, countActivePlatformAdmins)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const countUsers = `-- name: CountUsers :one
+SELECT COUNT(*) FROM users
+`
+
+func (q *Queries) CountUsers(ctx context.Context) (int64, error) {
+	row := q.db.QueryRow(ctx, countUsers)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const createUser = `-- name: CreateUser :one
 INSERT INTO users (email, username, password_hash, first_name, last_name)
 VALUES ($1, $2, $3, $4, $5)
@@ -55,6 +88,50 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const deactivateUser = `-- name: DeactivateUser :execrows
+UPDATE users
+SET    status     = 'inactive',
+       updated_at = NOW()
+WHERE  id         = $1
+  AND  status    != 'inactive'
+`
+
+// Sets user status to inactive. Returns the number of rows affected:
+//
+//	1 → user was active/suspended and has been deactivated.
+//	0 → user was already inactive (idempotent guard).
+//
+// The caller checks the count and returns ErrUserAlreadyInactive when 0.
+func (q *Queries) DeactivateUser(ctx context.Context, id pgtype.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, deactivateUser, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const getPlatformAdminRoleForUpdate = `-- name: GetPlatformAdminRoleForUpdate :one
+SELECT id
+FROM   roles
+WHERE  slug              = 'platform_admin'
+  AND  scope             = 'platform'
+  AND  organization_id IS NULL
+LIMIT  1
+FOR UPDATE
+`
+
+// Acquires a FOR UPDATE lock on the platform_admin role row. All concurrent
+// DeactivateUser transactions that target a platform admin must acquire this
+// lock before counting — serialising the count-then-deactivate check and
+// closing the TOCTOU window where two concurrent deactivations could each
+// read a count of 2 and both proceed, leaving zero admins.
+func (q *Queries) GetPlatformAdminRoleForUpdate(ctx context.Context) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, getPlatformAdminRoleForUpdate)
+	var id pgtype.UUID
+	err := row.Scan(&id)
+	return id, err
 }
 
 const getUserByEmail = `-- name: GetUserByEmail :one
@@ -123,6 +200,40 @@ func (q *Queries) GetUserByID(ctx context.Context, id pgtype.UUID) (User, error)
 	return i, err
 }
 
+const getUserByIDForUpdate = `-- name: GetUserByIDForUpdate :one
+SELECT id, email, username, password_hash, first_name, last_name, phone, avatar_url, date_of_birth, gender, status, email_verified_at, last_login_at, last_login_ip, created_at, updated_at
+FROM   users
+WHERE  id = $1
+FOR UPDATE
+`
+
+// Acquires a FOR UPDATE row lock on the user. Used inside transactions that must
+// prevent concurrent status changes or password updates (e.g. ChangePassword,
+// DeactivateUser). Always call inside an open transaction.
+func (q *Queries) GetUserByIDForUpdate(ctx context.Context, id pgtype.UUID) (User, error) {
+	row := q.db.QueryRow(ctx, getUserByIDForUpdate, id)
+	var i User
+	err := row.Scan(
+		&i.ID,
+		&i.Email,
+		&i.Username,
+		&i.PasswordHash,
+		&i.FirstName,
+		&i.LastName,
+		&i.Phone,
+		&i.AvatarUrl,
+		&i.DateOfBirth,
+		&i.Gender,
+		&i.Status,
+		&i.EmailVerifiedAt,
+		&i.LastLoginAt,
+		&i.LastLoginIp,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const getUserByUsername = `-- name: GetUserByUsername :one
 SELECT id, email, username, password_hash, first_name, last_name, phone, avatar_url, date_of_birth, gender, status, email_verified_at, last_login_at, last_login_ip, created_at, updated_at
 FROM   users
@@ -154,6 +265,29 @@ func (q *Queries) GetUserByUsername(ctx context.Context, username string) (User,
 	return i, err
 }
 
+const isUserActivePlatformAdmin = `-- name: IsUserActivePlatformAdmin :one
+SELECT EXISTS(
+    SELECT 1
+    FROM   user_organization_roles uor
+    JOIN   roles r ON r.id = uor.role_id
+    WHERE  uor.user_id         = $1
+      AND  r.slug              = 'platform_admin'
+      AND  r.scope             = 'platform'
+      AND  uor.organization_id IS NULL
+      AND  (uor.expires_at IS NULL OR uor.expires_at > NOW())
+) AS is_platform_admin
+`
+
+// Returns true when the user holds a non-expired platform_admin grant.
+// Used inside DeactivateTransaction to decide whether the last-admin guard
+// needs to fire. Runs before the sentinel lock is acquired.
+func (q *Queries) IsUserActivePlatformAdmin(ctx context.Context, userID pgtype.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, isUserActivePlatformAdmin, userID)
+	var is_platform_admin bool
+	err := row.Scan(&is_platform_admin)
+	return is_platform_admin, err
+}
+
 const listUsers = `-- name: ListUsers :many
 SELECT id, email, username, password_hash, first_name, last_name, phone, avatar_url, date_of_birth, gender, status, email_verified_at, last_login_at, last_login_ip, created_at, updated_at
 FROM   users
@@ -162,6 +296,58 @@ ORDER  BY created_at DESC
 
 func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
 	rows, err := q.db.Query(ctx, listUsers)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []User{}
+	for rows.Next() {
+		var i User
+		if err := rows.Scan(
+			&i.ID,
+			&i.Email,
+			&i.Username,
+			&i.PasswordHash,
+			&i.FirstName,
+			&i.LastName,
+			&i.Phone,
+			&i.AvatarUrl,
+			&i.DateOfBirth,
+			&i.Gender,
+			&i.Status,
+			&i.EmailVerifiedAt,
+			&i.LastLoginAt,
+			&i.LastLoginIp,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listUsersPaginated = `-- name: ListUsersPaginated :many
+SELECT id, email, username, password_hash, first_name, last_name, phone, avatar_url, date_of_birth, gender, status, email_verified_at, last_login_at, last_login_ip, created_at, updated_at
+FROM   users
+ORDER  BY created_at DESC
+LIMIT  $2
+OFFSET $1
+`
+
+type ListUsersPaginatedParams struct {
+	OffsetCount int32 `json:"offset_count"`
+	LimitCount  int32 `json:"limit_count"`
+}
+
+// Returns a page of users ordered by creation time (newest first).
+// Limit and offset are validated and capped by the service layer before reaching here.
+func (q *Queries) ListUsersPaginated(ctx context.Context, arg ListUsersPaginatedParams) ([]User, error) {
+	rows, err := q.db.Query(ctx, listUsersPaginated, arg.OffsetCount, arg.LimitCount)
 	if err != nil {
 		return nil, err
 	}
@@ -215,6 +401,65 @@ type UpdateUserPasswordHashParams struct {
 func (q *Queries) UpdateUserPasswordHash(ctx context.Context, arg UpdateUserPasswordHashParams) error {
 	_, err := q.db.Exec(ctx, updateUserPasswordHash, arg.PasswordHash, arg.ID)
 	return err
+}
+
+const updateUserProfile = `-- name: UpdateUserProfile :one
+UPDATE users
+SET    first_name    = $2,
+       last_name     = $3,
+       username      = $4,
+       phone         = $5,
+       date_of_birth = $6,
+       gender        = $7,
+       updated_at    = NOW()
+WHERE  id = $1
+RETURNING id, email, username, password_hash, first_name, last_name, phone, avatar_url, date_of_birth, gender, status, email_verified_at, last_login_at, last_login_ip, created_at, updated_at
+`
+
+type UpdateUserProfileParams struct {
+	ID          pgtype.UUID `json:"id"`
+	FirstName   string      `json:"first_name"`
+	LastName    string      `json:"last_name"`
+	Username    string      `json:"username"`
+	Phone       *string     `json:"phone"`
+	DateOfBirth pgtype.Date `json:"date_of_birth"`
+	Gender      *Gender     `json:"gender"`
+}
+
+// Replaces all editable profile fields in a single statement. The service layer
+// reads the current row first and merges the PATCH fields, so every column is
+// always explicitly supplied — no COALESCE needed here.
+// email, password_hash, status, and verification fields are intentionally absent.
+func (q *Queries) UpdateUserProfile(ctx context.Context, arg UpdateUserProfileParams) (User, error) {
+	row := q.db.QueryRow(ctx, updateUserProfile,
+		arg.ID,
+		arg.FirstName,
+		arg.LastName,
+		arg.Username,
+		arg.Phone,
+		arg.DateOfBirth,
+		arg.Gender,
+	)
+	var i User
+	err := row.Scan(
+		&i.ID,
+		&i.Email,
+		&i.Username,
+		&i.PasswordHash,
+		&i.FirstName,
+		&i.LastName,
+		&i.Phone,
+		&i.AvatarUrl,
+		&i.DateOfBirth,
+		&i.Gender,
+		&i.Status,
+		&i.EmailVerifiedAt,
+		&i.LastLoginAt,
+		&i.LastLoginIp,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
 }
 
 const verifyUserEmail = `-- name: VerifyUserEmail :exec

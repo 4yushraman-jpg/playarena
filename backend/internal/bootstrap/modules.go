@@ -22,6 +22,7 @@ import (
 	"github.com/4yushraman-jpg/playarena/internal/teams"
 	"github.com/4yushraman-jpg/playarena/internal/tournament_registrations"
 	"github.com/4yushraman-jpg/playarena/internal/tournaments"
+	"github.com/4yushraman-jpg/playarena/internal/users"
 )
 
 // registerModules wires all domain modules into the router and returns the auth
@@ -73,6 +74,7 @@ func registerModules(
 		if writeLimiter != nil {
 			r.Use(writeLimiter.WriteMiddleware())
 		}
+		users.RegisterRoutes(r, pool, cfg, log)
 		organizations.RegisterRoutes(r, pool, cfg, log, authz)
 		players.RegisterRoutes(r, pool, cfg, log, authz)
 		teams.RegisterRoutes(r, pool, cfg, log, authz)
