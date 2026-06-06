@@ -235,9 +235,22 @@ type prefKey struct {
 	channel   db.NotificationChannel
 }
 
+// drainChannels lists the channels DrainOutbox fans out to synchronously.
+// Webhook delivery is deferred to Phase 19.
+var drainChannels = []db.NotificationChannel{
+	db.NotificationChannelInApp,
+	db.NotificationChannelEmail,
+}
+
 // DrainOutbox claims pending outbox entries for the organization using
-// FOR UPDATE SKIP LOCKED, fans out in_app notifications to all org members
-// (filtered by preferences), and marks each entry processed.
+// FOR UPDATE SKIP LOCKED, fans out in_app and email notifications to all
+// org members (filtered per-channel by preferences), and marks each entry
+// processed.
+//
+// sent_at semantics:
+//
+//	in_app: set to NOW() — delivered synchronously via the inbox API.
+//	email:  left NULL   — pending async delivery by EmailWorker (Phase 18).
 //
 // Called synchronously by domain services after their transaction commits.
 // Safe to retry: UNIQUE (outbox_id, user_id, channel) on notifications plus
@@ -245,10 +258,9 @@ type prefKey struct {
 //
 // Preference resolution complexity:
 //
-//	Before fix: O(entries × members) SQL queries
-//	After fix:  O(unique event-type/channel pairs) SQL queries — typically O(1)
-//	            because a single drain call for one domain operation contains
-//	            at most 1–2 distinct event types.
+//	O(unique event-type/channel pairs) SQL queries — typically O(2) because
+//	a single drain call for one domain operation contains at most 1–2 distinct
+//	event types and we now load preferences for both in_app and email channels.
 func (r *Repository) DrainOutbox(ctx context.Context, orgID pgtype.UUID) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -275,79 +287,84 @@ func (r *Repository) DrainOutbox(ctx context.Context, orgID pgtype.UUID) error {
 	}
 
 	// ── Batch preference loading ───────────────────────────────────────────────
-	// Collect the unique (event_type, channel) pairs across all pending entries,
-	// then issue one GetNotificationPreferencesForEvent query per unique pair.
+	// For each unique (event_type, channel) pair across all pending entries,
+	// issue one GetNotificationPreferencesForEvent query.
 	// Build an in-memory lookup: prefKey → (userID bytes → enabled).
 	//
-	// A user absent from the result set has no preference row, which is treated
-	// as enabled = TRUE (the default opt-out model). Only opted-out users appear
+	// A user absent from the result set has no preference row, treated as
+	// enabled = TRUE (default opt-out model). Only opted-out users appear
 	// in the map with enabled = false.
-	//
-	// This eliminates per-user SQL calls from the fan-out loop entirely.
 	prefCache := make(map[prefKey]map[[16]byte]bool)
 
 	for _, entry := range entries {
-		key := prefKey{entry.EventType, db.NotificationChannelInApp}
-		if _, loaded := prefCache[key]; loaded {
-			continue // already fetched for this event_type/channel pair
+		for _, ch := range drainChannels {
+			key := prefKey{entry.EventType, ch}
+			if _, loaded := prefCache[key]; loaded {
+				continue
+			}
+			rows, err := qtx.GetNotificationPreferencesForEvent(ctx, db.GetNotificationPreferencesForEventParams{
+				OrganizationID: orgID,
+				EventType:      entry.EventType,
+				Channel:        ch,
+			})
+			if err != nil {
+				return err
+			}
+			userMap := make(map[[16]byte]bool, len(rows))
+			for _, row := range rows {
+				userMap[row.UserID.Bytes] = row.Enabled
+			}
+			prefCache[key] = userMap
 		}
-		rows, err := qtx.GetNotificationPreferencesForEvent(ctx, db.GetNotificationPreferencesForEventParams{
-			OrganizationID: orgID,
-			EventType:      entry.EventType,
-			Channel:        db.NotificationChannelInApp,
-		})
-		if err != nil {
-			return err
-		}
-		userMap := make(map[[16]byte]bool, len(rows))
-		for _, row := range rows {
-			userMap[row.UserID.Bytes] = row.Enabled
-		}
-		prefCache[key] = userMap
 	}
 	// ── end batch preference loading ───────────────────────────────────────────
 
 	for _, entry := range entries {
-		key := prefKey{entry.EventType, db.NotificationChannelInApp}
-		userPrefs := prefCache[key] // always present; populated in the loop above
-
 		for _, memberUID := range members {
 			// Skip the actor — they triggered the event and don't need a notification.
 			if entry.ActorID.Valid && entry.ActorID.Bytes == memberUID.Bytes {
 				continue
 			}
 
-			// Resolve preference from memory (no SQL round-trip).
-			// Missing entry → no preference row → enabled by default.
-			shouldNotify := true
-			if enabled, exists := userPrefs[memberUID.Bytes]; exists {
-				shouldNotify = enabled
-			}
+			for _, ch := range drainChannels {
+				key := prefKey{entry.EventType, ch}
+				userPrefs := prefCache[key]
 
-			if !shouldNotify {
-				continue
-			}
-
-			// in_app: sent_at = NOW() per the sent_at contract.
-			sentAt := pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true}
-
-			insertErr := qtx.CreateNotification(ctx, db.CreateNotificationParams{
-				OrganizationID: entry.OrganizationID,
-				UserID:         memberUID,
-				OutboxID:       entry.ID,
-				Channel:        db.NotificationChannelInApp,
-				EventType:      entry.EventType,
-				EntityType:     entry.EntityType,
-				EntityID:       entry.EntityID,
-				Payload:        entry.Payload,
-				SentAt:         sentAt,
-			})
-			if insertErr != nil {
-				// Idempotency: unique constraint means this was already drained.
-				if pgutil.IsUniqueViolation(insertErr, "uq_notifications_outbox_user_channel") {
+				// Resolve per-channel preference (no SQL round-trip).
+				// Missing entry → no preference row → enabled by default.
+				shouldNotify := true
+				if enabled, exists := userPrefs[memberUID.Bytes]; exists {
+					shouldNotify = enabled
+				}
+				if !shouldNotify {
 					continue
 				}
-				return insertErr
+
+				// in_app: sent_at = NOW() (delivered synchronously via inbox API).
+				// email:  sent_at = NULL (pending async delivery by EmailWorker).
+				var sentAt pgtype.Timestamptz
+				if ch == db.NotificationChannelInApp {
+					sentAt = pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true}
+				}
+
+				insertErr := qtx.CreateNotification(ctx, db.CreateNotificationParams{
+					OrganizationID: entry.OrganizationID,
+					UserID:         memberUID,
+					OutboxID:       entry.ID,
+					Channel:        ch,
+					EventType:      entry.EventType,
+					EntityType:     entry.EntityType,
+					EntityID:       entry.EntityID,
+					Payload:        entry.Payload,
+					SentAt:         sentAt,
+				})
+				if insertErr != nil {
+					// Idempotency: unique constraint means this was already drained.
+					if pgutil.IsUniqueViolation(insertErr, "uq_notifications_outbox_user_channel") {
+						continue
+					}
+					return insertErr
+				}
 			}
 		}
 

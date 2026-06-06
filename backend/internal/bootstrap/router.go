@@ -9,12 +9,14 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/4yushraman-jpg/playarena/internal/auth"
+	"github.com/4yushraman-jpg/playarena/internal/notifworker"
 	"github.com/4yushraman-jpg/playarena/internal/platform/config"
 	"github.com/4yushraman-jpg/playarena/internal/platform/middleware"
 )
 
-// NewRouter builds and returns the fully-configured application HTTP router
-// along with the auth Handler needed for graceful shutdown (DrainEmail).
+// NewRouter builds and returns the fully-configured application HTTP router,
+// the auth Handler (needed for DrainEmail on graceful shutdown), and the
+// EmailWorker (needed for Stop/Drain on graceful shutdown).
 //
 // authLimiter — per-IP rate limiter for /api/v1/auth/* (most restrictive)
 // writeLimiter — per-IP rate limiter for domain write endpoints (POST/PATCH/DELETE)
@@ -27,7 +29,7 @@ func NewRouter(
 	authLimiter *middleware.IPRateLimiter,
 	writeLimiter *middleware.IPRateLimiter,
 	mediaLimiter *middleware.IPRateLimiter,
-) (http.Handler, *auth.Handler) {
+) (http.Handler, *auth.Handler, *notifworker.EmailWorker) {
 	r := chi.NewRouter()
 
 	r.Use(chimw.RequestID)                                 // Attaches X-Request-ID to every request/response
@@ -36,7 +38,7 @@ func NewRouter(
 	r.Use(middleware.RequestLogger(log))                   // Structured per-request logging via slog
 	r.Use(middleware.CORS(cfg.CORSAllowedOrigins))         // Cross-Origin Resource Sharing headers
 
-	authHandler := registerModules(r, db, log, cfg, authLimiter, writeLimiter, mediaLimiter)
+	authHandler, emailWorker := registerModules(r, db, log, cfg, authLimiter, writeLimiter, mediaLimiter)
 
-	return r, authHandler
+	return r, authHandler, emailWorker
 }

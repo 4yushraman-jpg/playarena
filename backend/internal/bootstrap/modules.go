@@ -2,6 +2,7 @@ package bootstrap
 
 import (
 	"log/slog"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -15,6 +16,7 @@ import (
 	"github.com/4yushraman-jpg/playarena/internal/media"
 	mediastorage "github.com/4yushraman-jpg/playarena/internal/media/storage"
 	"github.com/4yushraman-jpg/playarena/internal/notifications"
+	"github.com/4yushraman-jpg/playarena/internal/notifworker"
 	"github.com/4yushraman-jpg/playarena/internal/organizations"
 	"github.com/4yushraman-jpg/playarena/internal/platform/config"
 	"github.com/4yushraman-jpg/playarena/internal/platform/middleware"
@@ -26,7 +28,8 @@ import (
 )
 
 // registerModules wires all domain modules into the router and returns the auth
-// Handler so the bootstrap can call DrainEmail during graceful shutdown.
+// Handler and EmailWorker so the bootstrap can manage their lifecycles during
+// graceful shutdown.
 //
 // authLimiter   — per-IP limiter for /api/v1/auth/* (applied inside auth.RegisterRoutes)
 // writeLimiter  — per-IP limiter for domain write endpoints (POST/PATCH/DELETE)
@@ -40,7 +43,7 @@ func registerModules(
 	authLimiter *middleware.IPRateLimiter,
 	writeLimiter *middleware.IPRateLimiter,
 	mediaLimiter *middleware.IPRateLimiter,
-) *auth.Handler {
+) (*auth.Handler, *notifworker.EmailWorker) {
 	queries := db.New(pool)
 	authz := auth.NewAuthorizationService(queries)
 
@@ -59,6 +62,10 @@ func registerModules(
 		panic("email sender initialisation failed: " + err.Error())
 	}
 	log.Info("email sender initialised", slog.String("provider", cfg.EmailProvider))
+
+	// Email worker — delivers pending email channel notification rows async.
+	workerInterval := time.Duration(cfg.NotifWorkerIntervalSeconds) * time.Second
+	emailWorker := notifworker.NewEmailWorker(pool, emailSender, cfg.AppBaseURL, workerInterval, log)
 
 	health.RegisterRoutes(r, pool)
 	authHandler := auth.RegisterRoutes(r, pool, cfg, log, authLimiter, emailSender)
@@ -104,5 +111,5 @@ func registerModules(
 		media.RegisterRoutes(r, pool, cfg, log, authz, mediaBackend)
 	})
 
-	return authHandler
+	return authHandler, emailWorker
 }

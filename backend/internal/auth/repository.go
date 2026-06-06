@@ -97,14 +97,27 @@ func (r *Repository) GetUserByID(ctx context.Context, userID pgtype.UUID) (*db.U
 	return &user, nil
 }
 
-// CreateEmailVerificationToken inserts a new single-use verification token for
-// an existing user. Used by ResendVerification to issue a replacement token
-// when the original expired or was not delivered. The old token remains in the
-// database and is valid until it expires or is consumed — concurrent tokens
-// for the same user are allowed by the schema.
+// CreateEmailVerificationToken invalidates all existing unused verification
+// tokens for the user and inserts the new token atomically. The invalidation
+// prevents token accumulation (P2-5): without it, every resend call leaves an
+// additional valid token that could be consumed out-of-order.
 func (r *Repository) CreateEmailVerificationToken(ctx context.Context, params db.CreateEmailVerificationTokenParams) error {
-	_, err := r.queries.CreateEmailVerificationToken(ctx, params)
-	return err
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	qtx := r.queries.WithTx(tx)
+
+	if err := qtx.UseAllUserEmailVerificationTokens(ctx, params.UserID); err != nil {
+		return err
+	}
+	if _, err := qtx.CreateEmailVerificationToken(ctx, params); err != nil {
+		return err
+	}
+
+	return tx.Commit(ctx)
 }
 
 // ---- refresh token operations -----------------------------------------------

@@ -12,23 +12,26 @@ import (
 	db "github.com/4yushraman-jpg/playarena/db/sqlc"
 	"github.com/4yushraman-jpg/playarena/internal/auth"
 	"github.com/4yushraman-jpg/playarena/internal/cleanup"
+	"github.com/4yushraman-jpg/playarena/internal/notifworker"
 	"github.com/4yushraman-jpg/playarena/internal/platform/config"
 	"github.com/4yushraman-jpg/playarena/internal/platform/middleware"
 )
 
 // App is the composition root of the PlayArena backend.
 // It holds all top-level dependencies, assembles the HTTP handler, and owns
-// the lifecycle of background services (rate-limiter cleanup, token cleanup).
+// the lifecycle of background services (rate-limiter cleanup, token cleanup,
+// notification email delivery).
 type App struct {
 	Config *config.Config
 	DB     *pgxpool.Pool
 	Log    *slog.Logger
 
-	scheduler    *cleanup.Scheduler
-	authLimiter  *middleware.IPRateLimiter // /api/v1/auth/* — most restrictive
-	writeLimiter *middleware.IPRateLimiter // domain write endpoints (POST/PATCH/DELETE)
-	mediaLimiter *middleware.IPRateLimiter // media upload endpoint
-	authHandler  *auth.Handler             // for DrainEmail on graceful shutdown
+	scheduler        *cleanup.Scheduler
+	authLimiter      *middleware.IPRateLimiter // /api/v1/auth/* — most restrictive
+	writeLimiter     *middleware.IPRateLimiter // domain write endpoints (POST/PATCH/DELETE)
+	mediaLimiter     *middleware.IPRateLimiter // media upload endpoint
+	authHandler      *auth.Handler             // for DrainEmail on graceful shutdown
+	notifEmailWorker *notifworker.EmailWorker  // for Stop/Drain on graceful shutdown
 }
 
 // Handler returns the fully-wired HTTP handler for the application.
@@ -67,8 +70,13 @@ func (a *App) Handler() http.Handler {
 	a.scheduler.Start()
 	a.Log.Info("cleanup scheduler started", slog.String("interval", interval.String()))
 
-	handler, authH := NewRouter(a.DB, a.Log, a.Config, a.authLimiter, a.writeLimiter, a.mediaLimiter)
+	handler, authH, emailWorker := NewRouter(a.DB, a.Log, a.Config, a.authLimiter, a.writeLimiter, a.mediaLimiter)
 	a.authHandler = authH
+	a.notifEmailWorker = emailWorker
+	a.notifEmailWorker.Start()
+	a.Log.Info("notification email worker started",
+		slog.Int("interval_seconds", a.Config.NotifWorkerIntervalSeconds),
+	)
 	return handler
 }
 
@@ -82,6 +90,14 @@ func (a *App) Shutdown(ctx context.Context) {
 	if a.authHandler != nil {
 		if err := a.authHandler.DrainEmail(ctx); err != nil {
 			a.Log.Warn("shutdown: email drain timed out, some emails may not have been sent",
+				slog.String("error", err.Error()),
+			)
+		}
+	}
+	if a.notifEmailWorker != nil {
+		a.notifEmailWorker.Stop()
+		if err := a.notifEmailWorker.Drain(ctx); err != nil {
+			a.Log.Warn("shutdown: notification email worker drain failed",
 				slog.String("error", err.Error()),
 			)
 		}

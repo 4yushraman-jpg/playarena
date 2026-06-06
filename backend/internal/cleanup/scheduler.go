@@ -65,6 +65,8 @@ func (s *Scheduler) run() {
 	}
 }
 
+const outboxRetentionDays = 90
+
 // runOnce executes all cleanup queries with a 30-second timeout.
 // Each query is independent — a failure in one does not prevent the others.
 func (s *Scheduler) runOnce() {
@@ -83,6 +85,14 @@ func (s *Scheduler) runOnce() {
 
 	if err := s.queries.DeleteExpiredPasswordResetTokens(ctx, cutoff); err != nil {
 		s.log.Error("cleanup: delete expired password reset tokens", slog.Any("error", err))
+	}
+
+	outboxCutoff := pgtype.Timestamptz{
+		Time:  time.Now().AddDate(0, 0, -outboxRetentionDays),
+		Valid: true,
+	}
+	if err := s.queries.DeleteOldProcessedOutboxEntries(ctx, outboxCutoff); err != nil {
+		s.log.Error("cleanup: delete old processed outbox entries", slog.Any("error", err))
 	}
 
 	s.log.Info("cleanup: cycle complete",

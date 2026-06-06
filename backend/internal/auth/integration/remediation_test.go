@@ -32,10 +32,15 @@ func TestResendVerification_NilSender_ServiceStillCalled(t *testing.T) {
 	user, _ := fixtures.CreatePendingUser(ctx, t, testPool)
 	t.Cleanup(func() { fixtures.CleanupUser(ctx, t, testPool, user.ID) })
 
-	// Count verification tokens before the resend call.
+	// Count ALL verification tokens (used + unused) before the resend call.
+	// We count all tokens (not just unused) so that the P2-5 fix
+	// (UseAllUserEmailVerificationTokens + CreateEmailVerificationToken) does
+	// not mask a P1-3 regression: invalidating the old token and creating a new
+	// one always increases the total count, even though the unused count stays
+	// the same.
 	var countBefore int
 	if err := testPool.QueryRow(ctx,
-		"SELECT COUNT(*) FROM email_verification_tokens WHERE user_id = $1 AND used_at IS NULL",
+		"SELECT COUNT(*) FROM email_verification_tokens WHERE user_id = $1",
 		user.ID,
 	).Scan(&countBefore); err != nil {
 		t.Fatalf("count tokens before: %v", err)
@@ -51,7 +56,7 @@ func TestResendVerification_NilSender_ServiceStillCalled(t *testing.T) {
 
 	var countAfter int
 	if err := testPool.QueryRow(ctx,
-		"SELECT COUNT(*) FROM email_verification_tokens WHERE user_id = $1 AND used_at IS NULL",
+		"SELECT COUNT(*) FROM email_verification_tokens WHERE user_id = $1",
 		user.ID,
 	).Scan(&countAfter); err != nil {
 		t.Fatalf("count tokens after: %v", err)

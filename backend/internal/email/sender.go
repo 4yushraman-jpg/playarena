@@ -81,6 +81,27 @@ func (s *Sender) ResendVerificationEmail(ctx context.Context, toEmail, toName, r
 	}, "resend_verify_email")
 }
 
+// SendNotificationEmail renders and delivers a notification event email.
+// Called by the EmailWorker for each pending email channel notification row.
+func (s *Sender) SendNotificationEmail(ctx context.Context, toEmail, toName, eventLabel, notificationsURL string) error {
+	subject, textBody, htmlBody, err := renderNotificationEvent(notificationEventData{
+		UserName:         nameOrEmail(toName, toEmail),
+		EventLabel:       eventLabel,
+		NotificationsURL: notificationsURL,
+		AppName:          s.cfg.FromName,
+	})
+	if err != nil {
+		return fmt.Errorf("email: render notification_event template: %w", err)
+	}
+	return s.send(ctx, Message{
+		To:       toEmail,
+		ToName:   toName,
+		Subject:  subject,
+		TextBody: textBody,
+		HTMLBody: htmlBody,
+	}, "notification_event")
+}
+
 // send delivers msg via the configured provider and emits a structured log
 // entry. The template name is used for log attribution only — it is never
 // sent to the provider.

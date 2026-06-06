@@ -30,6 +30,16 @@ SET    used_at = NOW()
 WHERE  id      = $1
   AND  used_at IS NULL;
 
+-- name: UseAllUserEmailVerificationTokens :exec
+-- Invalidates all unused verification tokens for a user before a new one is
+-- issued. Prevents token accumulation (P2-5): without this, every resend
+-- call leaves an additional valid token in the table that could be consumed
+-- by a confused user or leaked in email logs.
+UPDATE email_verification_tokens
+SET    used_at = NOW()
+WHERE  user_id = $1
+  AND  used_at IS NULL;
+
 -- name: DeleteExpiredEmailVerificationTokens :exec
 -- Removes tokens that have passed their expiry. Called by the background
 -- cleanup job. Unused expired tokens are safe to delete: they can never

@@ -11,11 +11,84 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const claimEmailNotificationsForDelivery = `-- name: ClaimEmailNotificationsForDelivery :many
+
+UPDATE notifications n
+SET last_attempted_at = NOW(),
+    lease_expires_at  = NOW() + INTERVAL '5 minutes',
+    attempt_count     = n.attempt_count + 1
+WHERE n.id IN (
+    SELECT q.id
+    FROM   notifications q
+    WHERE  q.channel            = 'email'
+      AND  q.sent_at            IS NULL
+      AND  q.failed_permanently = FALSE
+      AND  q.attempt_count      < $1
+      AND  (q.lease_expires_at  IS NULL OR q.lease_expires_at < NOW())
+    ORDER  BY q.last_attempted_at ASC NULLS FIRST, q.created_at ASC
+    LIMIT  $2
+    FOR    UPDATE SKIP LOCKED
+)
+RETURNING id, organization_id, user_id, outbox_id, channel, event_type, entity_type, entity_id, payload, read_at, sent_at, deleted_at, created_at, attempt_count, last_attempted_at, lease_expires_at, failed_permanently
+`
+
+type ClaimEmailNotificationsForDeliveryParams struct {
+	MaxAttempts int32 `json:"max_attempts"`
+	BatchSize   int32 `json:"batch_size"`
+}
+
+// =============================================================================
+// EMAIL WORKER QUERIES (used by internal/notifworker)
+// =============================================================================
+// Claims up to batch_size pending email notifications using FOR UPDATE SKIP LOCKED
+// inside a subquery so the lock is held only for the duration of the UPDATE.
+// Increments attempt_count (counts claims, not confirmed deliveries) and sets a
+// 5-minute soft lease to handle worker crashes without permanent lock.
+// Only rows with attempt_count < max_attempts are eligible (e.g. max_attempts = 3).
+func (q *Queries) ClaimEmailNotificationsForDelivery(ctx context.Context, arg ClaimEmailNotificationsForDeliveryParams) ([]Notification, error) {
+	rows, err := q.db.Query(ctx, claimEmailNotificationsForDelivery, arg.MaxAttempts, arg.BatchSize)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Notification{}
+	for rows.Next() {
+		var i Notification
+		if err := rows.Scan(
+			&i.ID,
+			&i.OrganizationID,
+			&i.UserID,
+			&i.OutboxID,
+			&i.Channel,
+			&i.EventType,
+			&i.EntityType,
+			&i.EntityID,
+			&i.Payload,
+			&i.ReadAt,
+			&i.SentAt,
+			&i.DeletedAt,
+			&i.CreatedAt,
+			&i.AttemptCount,
+			&i.LastAttemptedAt,
+			&i.LeaseExpiresAt,
+			&i.FailedPermanently,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const countNotificationsByUser = `-- name: CountNotificationsByUser :one
 SELECT COUNT(*)
 FROM   notifications
 WHERE  organization_id = $1
   AND  user_id         = $2
+  AND  channel         = 'in_app'
   AND  deleted_at      IS NULL
 `
 
@@ -136,6 +209,20 @@ func (q *Queries) CreateNotificationOutboxEntry(ctx context.Context, arg CreateN
 	return i, err
 }
 
+const deleteOldProcessedOutboxEntries = `-- name: DeleteOldProcessedOutboxEntries :exec
+DELETE FROM notification_outbox
+WHERE processed_at IS NOT NULL
+  AND processed_at < $1
+`
+
+// Deletes outbox rows that were processed more than `retention` ago.
+// ON DELETE CASCADE on the notifications FK removes matching notification rows.
+// Called by the cleanup scheduler to prevent unbounded outbox table growth.
+func (q *Queries) DeleteOldProcessedOutboxEntries(ctx context.Context, olderThan pgtype.Timestamptz) error {
+	_, err := q.db.Exec(ctx, deleteOldProcessedOutboxEntries, olderThan)
+	return err
+}
+
 const drainOutboxEntries = `-- name: DrainOutboxEntries :many
 SELECT id, organization_id, event_type, actor_id, entity_type, entity_id, payload, processed_at, created_at
 FROM   notification_outbox
@@ -180,7 +267,7 @@ func (q *Queries) DrainOutboxEntries(ctx context.Context, organizationID pgtype.
 }
 
 const getNotificationByID = `-- name: GetNotificationByID :one
-SELECT id, organization_id, user_id, outbox_id, channel, event_type, entity_type, entity_id, payload, read_at, sent_at, deleted_at, created_at
+SELECT id, organization_id, user_id, outbox_id, channel, event_type, entity_type, entity_id, payload, read_at, sent_at, deleted_at, created_at, attempt_count, last_attempted_at, lease_expires_at, failed_permanently
 FROM   notifications
 WHERE  id              = $1
   AND  organization_id = $2
@@ -214,6 +301,10 @@ func (q *Queries) GetNotificationByID(ctx context.Context, arg GetNotificationBy
 		&i.SentAt,
 		&i.DeletedAt,
 		&i.CreatedAt,
+		&i.AttemptCount,
+		&i.LastAttemptedAt,
+		&i.LeaseExpiresAt,
+		&i.FailedPermanently,
 	)
 	return i, err
 }
@@ -382,10 +473,11 @@ func (q *Queries) GetUserPreferences(ctx context.Context, arg GetUserPreferences
 }
 
 const listNotificationsByUser = `-- name: ListNotificationsByUser :many
-SELECT id, organization_id, user_id, outbox_id, channel, event_type, entity_type, entity_id, payload, read_at, sent_at, deleted_at, created_at
+SELECT id, organization_id, user_id, outbox_id, channel, event_type, entity_type, entity_id, payload, read_at, sent_at, deleted_at, created_at, attempt_count, last_attempted_at, lease_expires_at, failed_permanently
 FROM   notifications
 WHERE  organization_id = $1
   AND  user_id         = $2
+  AND  channel         = 'in_app'
   AND  deleted_at      IS NULL
 ORDER  BY created_at DESC
 LIMIT  $4
@@ -399,8 +491,9 @@ type ListNotificationsByUserParams struct {
 	PageLimit      int32       `json:"page_limit"`
 }
 
-// Paginated list of undeleted notifications for a user within an org,
-// newest first.
+// Paginated list of undeleted in_app notifications for a user within an org,
+// newest first. Email channel rows are delivery-tracking only and are not
+// surfaced in the in-app inbox.
 func (q *Queries) ListNotificationsByUser(ctx context.Context, arg ListNotificationsByUserParams) ([]Notification, error) {
 	rows, err := q.db.Query(ctx, listNotificationsByUser,
 		arg.OrganizationID,
@@ -429,6 +522,10 @@ func (q *Queries) ListNotificationsByUser(ctx context.Context, arg ListNotificat
 			&i.SentAt,
 			&i.DeletedAt,
 			&i.CreatedAt,
+			&i.AttemptCount,
+			&i.LastAttemptedAt,
+			&i.LeaseExpiresAt,
+			&i.FailedPermanently,
 		); err != nil {
 			return nil, err
 		}
@@ -468,7 +565,7 @@ WHERE  id              = $1
   AND  user_id         = $3
   AND  deleted_at      IS NULL
   AND  read_at         IS NULL
-RETURNING id, organization_id, user_id, outbox_id, channel, event_type, entity_type, entity_id, payload, read_at, sent_at, deleted_at, created_at
+RETURNING id, organization_id, user_id, outbox_id, channel, event_type, entity_type, entity_id, payload, read_at, sent_at, deleted_at, created_at, attempt_count, last_attempted_at, lease_expires_at, failed_permanently
 `
 
 type MarkNotificationReadParams struct {
@@ -496,6 +593,10 @@ func (q *Queries) MarkNotificationRead(ctx context.Context, arg MarkNotification
 		&i.SentAt,
 		&i.DeletedAt,
 		&i.CreatedAt,
+		&i.AttemptCount,
+		&i.LastAttemptedAt,
+		&i.LeaseExpiresAt,
+		&i.FailedPermanently,
 	)
 	return i, err
 }
@@ -509,6 +610,47 @@ WHERE  id = $1
 // Called by DrainOutbox after all notifications for this entry have been inserted.
 func (q *Queries) MarkOutboxEntryProcessed(ctx context.Context, id pgtype.UUID) error {
 	_, err := q.db.Exec(ctx, markOutboxEntryProcessed, id)
+	return err
+}
+
+const recordEmailDeliveryFailure = `-- name: RecordEmailDeliveryFailure :exec
+UPDATE notifications
+SET failed_permanently = $1,
+    lease_expires_at   = $2
+WHERE id = $3
+`
+
+type RecordEmailDeliveryFailureParams struct {
+	FailedPermanently bool               `json:"failed_permanently"`
+	NextAttemptAt     pgtype.Timestamptz `json:"next_attempt_at"`
+	ID                pgtype.UUID        `json:"id"`
+}
+
+// Records a failed delivery attempt. The worker passes:
+//
+//	failed_permanently = attempt_count >= max_attempts (true → dead-letter)
+//	next_attempt_at    = next retry time (ignored when failed_permanently is true)
+//
+// lease_expires_at is advanced to next_attempt_at so the claim query skips
+// this row until the retry window elapses.
+func (q *Queries) RecordEmailDeliveryFailure(ctx context.Context, arg RecordEmailDeliveryFailureParams) error {
+	_, err := q.db.Exec(ctx, recordEmailDeliveryFailure, arg.FailedPermanently, arg.NextAttemptAt, arg.ID)
+	return err
+}
+
+const recordEmailDeliverySuccess = `-- name: RecordEmailDeliverySuccess :exec
+UPDATE notifications
+SET sent_at = NOW()
+WHERE id      = $1
+  AND sent_at IS NULL
+`
+
+// Marks an email notification as successfully delivered.
+// The sent_at IS NULL guard is the at-least-once safety valve: if the worker
+// crashes after sending but before recording success, the next claim attempt
+// will see sent_at IS NOT NULL and skip this row.
+func (q *Queries) RecordEmailDeliverySuccess(ctx context.Context, id pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, recordEmailDeliverySuccess, id)
 	return err
 }
 

@@ -38,6 +38,19 @@ func renderPasswordReset(data resetPasswordData) (subject, textBody, htmlBody st
 	return renderPair("templates/password_reset.txt", "templates/password_reset.html", data)
 }
 
+// notificationEventData is the template data for notification event emails.
+type notificationEventData struct {
+	UserName         string
+	EventLabel       string
+	NotificationsURL string
+	AppName          string
+}
+
+// renderNotificationEvent renders the notification event email templates.
+func renderNotificationEvent(data notificationEventData) (subject, textBody, htmlBody string, err error) {
+	return renderPair("templates/notification_event.txt", "templates/notification_event.html", data)
+}
+
 // renderPair renders a matched .txt + .html template pair.
 // The subject is the first non-empty line of the rendered text body.
 func renderPair(txtPath, htmlPath string, data any) (subject, textBody, htmlBody string, err error) {

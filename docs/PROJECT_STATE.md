@@ -1,11 +1,11 @@
 # PlayArena — Project State & Handoff Document
 
-**Last Updated:** 2026-06-05  
+**Last Updated:** 2026-06-06  
 **Build status:** `go build ./...` passing, `go vet ./...` clean, `sqlc generate` clean  
-**Migrations applied:** 000001 – 000024  
+**Migrations applied:** 000001 – 000025  
 **Go version:** 1.25.6  
 **Database:** PostgreSQL 17  
-**Phases complete:** 1 – 12, Auth Security Hotfix v2, Phase 13A, Phase 13B.1, Phase 13B.2A, Phase 13B.2B-A, Phase 13B.2B-B, Phase 14, Phase 15A, Phase 15A Remediation
+**Phases complete:** 1 – 12, Auth Security Hotfix v2, Phase 13A, Phase 13B.1, Phase 13B.2A, Phase 13B.2B-A, Phase 13B.2B-B, Phase 14, Phase 15A, Phase 15A Remediation, Phase 16, Phase 17, Phase 18
 
 ---
 

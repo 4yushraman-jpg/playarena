@@ -47,6 +47,12 @@ type Config struct {
 	// tokens (refresh, email verification, password reset). Default: 60.
 	CleanupIntervalMinutes int
 
+	// ── Notification email worker ─────────────────────────────────────────
+
+	// NotifWorkerIntervalSeconds is how often the EmailWorker polls for pending
+	// email channel notification rows. Default: 30.
+	NotifWorkerIntervalSeconds int
+
 	// ── Storage (Phase 11) ───────────────────────────────────────────────────
 
 	// StorageBackend selects the storage implementation: "local" (default for
@@ -195,7 +201,8 @@ func Load() (*Config, error) {
 		RateLimitAuthRPS:   getEnvFloat("RATE_LIMIT_AUTH_RPS", 10.0),
 		RateLimitAuthBurst: getEnvInt("RATE_LIMIT_AUTH_BURST", 20),
 
-		CleanupIntervalMinutes: getEnvInt("CLEANUP_INTERVAL_MINUTES", 60),
+		CleanupIntervalMinutes:     getEnvInt("CLEANUP_INTERVAL_MINUTES", 60),
+		NotifWorkerIntervalSeconds: getEnvInt("NOTIF_WORKER_INTERVAL_SECONDS", 30),
 
 		StorageBackend:      getEnv("STORAGE_BACKEND", "local"),
 		StorageLocalPath:    getEnv("STORAGE_LOCAL_PATH", "./uploads"),
@@ -274,6 +281,9 @@ func (c *Config) validate() error {
 	}
 	if c.CleanupIntervalMinutes <= 0 {
 		errs = append(errs, "CLEANUP_INTERVAL_MINUTES must be positive")
+	}
+	if c.NotifWorkerIntervalSeconds <= 0 {
+		errs = append(errs, "NOTIF_WORKER_INTERVAL_SECONDS must be positive")
 	}
 
 	// Email

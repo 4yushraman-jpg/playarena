@@ -1,0 +1,10 @@
+New {{.AppName}} notification: {{.EventLabel}}
+
+Hi {{.UserName}},
+
+You have a new notification on {{.AppName}}: {{.EventLabel}}.
+
+View your notifications:
+{{.NotificationsURL}}
+
+— The {{.AppName}} Team

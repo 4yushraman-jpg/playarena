@@ -447,9 +447,8 @@ func TestNotification_Preference_DisabledEventType_NoDelivery(t *testing.T) {
 
 // TestNotification_Drain_Idempotency verifies that running DrainOutbox twice on
 // the same entry (simulating a crash between drain and mark-processed) produces
-// exactly 1 notification, not 2. This exercises the UNIQUE constraint
-// (outbox_id, user_id, channel) + ON CONFLICT DO NOTHING on the notifications
-// table.
+// exactly 1 in_app + 1 email row per recipient, not 2 of each. This exercises
+// the UNIQUE constraint (outbox_id, user_id, channel) + ON CONFLICT DO NOTHING.
 func TestNotification_Drain_Idempotency(t *testing.T) {
 	ts := buildTestServer(t, testPool)
 	ctx := context.Background()
@@ -499,15 +498,116 @@ func TestNotification_Drain_Idempotency(t *testing.T) {
 	// Second drain — must not create duplicate notifications.
 	ts.notifSvc.DrainOutbox(ctx, orgUID, logger)
 
-	// Total in_app notifications for this org must be exactly 1, not 2.
+	// actorB (the only recipient) must have exactly 1 in_app + 1 email row.
+	// actorA (the actor) is excluded from fan-out entirely.
+	// Total = 2, not 4.
 	var count int64
 	if err := ts.pool.QueryRow(ctx,
 		"SELECT COUNT(*) FROM notifications WHERE organization_id = $1 AND deleted_at IS NULL",
 		orgUID).Scan(&count); err != nil {
 		t.Fatalf("count notifications: %v", err)
 	}
-	if count != 1 {
-		t.Errorf("notification count = %d, want 1 (idempotent drain)", count)
+	if count != 2 {
+		t.Errorf("notification count = %d, want 2 (1 in_app + 1 email, idempotent drain)", count)
+	}
+}
+
+// TestNotification_EmailRow_NullSentAt verifies that DrainOutbox creates email
+// channel rows with sent_at = NULL (pending async delivery) while in_app rows
+// have sent_at set to the drain timestamp.
+func TestNotification_EmailRow_NullSentAt(t *testing.T) {
+	ts := buildTestServer(t, testPool)
+	ctx := context.Background()
+
+	actorA := setupUserAndOrg(t, ts, "org_owner")
+	orgUID := mustUUID(t, actorA.orgID)
+
+	actorBUser := fixtures.CreateActiveUser(ctx, t, ts.pool)
+	fixtures.AddUserToOrg(ctx, t, ts.pool, orgUID, actorBUser.ID, "viewer")
+
+	// System outbox entry (NULL actor → actorA and actorB both receive).
+	if _, err := ts.pool.Exec(ctx, `
+		INSERT INTO notification_outbox (organization_id, event_type, entity_type, entity_id, payload)
+		VALUES ($1, 'registration_approved', 'tournament_registrations', $1, '{}')
+	`, orgUID); err != nil {
+		t.Fatalf("insert outbox: %v", err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ts.notifSvc.DrainOutbox(ctx, orgUID, logger)
+
+	// in_app rows must have sent_at IS NOT NULL.
+	var inAppNullCount int64
+	if err := ts.pool.QueryRow(ctx,
+		"SELECT COUNT(*) FROM notifications WHERE organization_id = $1 AND channel = 'in_app' AND sent_at IS NULL",
+		orgUID).Scan(&inAppNullCount); err != nil {
+		t.Fatalf("count in_app null sent_at: %v", err)
+	}
+	if inAppNullCount != 0 {
+		t.Errorf("in_app rows with NULL sent_at = %d, want 0", inAppNullCount)
+	}
+
+	// email rows must have sent_at IS NULL (pending async delivery).
+	var emailNonNullCount int64
+	if err := ts.pool.QueryRow(ctx,
+		"SELECT COUNT(*) FROM notifications WHERE organization_id = $1 AND channel = 'email' AND sent_at IS NOT NULL",
+		orgUID).Scan(&emailNonNullCount); err != nil {
+		t.Fatalf("count email non-null sent_at: %v", err)
+	}
+	if emailNonNullCount != 0 {
+		t.Errorf("email rows with non-NULL sent_at = %d, want 0 (should be pending)", emailNonNullCount)
+	}
+}
+
+// TestNotification_ChannelPreference_Independent verifies that per-channel
+// preference opt-outs are independent: opting out of email does not suppress
+// in_app delivery, and vice versa.
+func TestNotification_ChannelPreference_Independent(t *testing.T) {
+	ts := buildTestServer(t, testPool)
+	ctx := context.Background()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	actorA := setupUserAndOrg(t, ts, "org_owner")
+	orgUID := mustUUID(t, actorA.orgID)
+
+	// actorB opts out of email only; in_app should still deliver.
+	actorBUser := fixtures.CreateActiveUser(ctx, t, ts.pool)
+	fixtures.AddUserToOrg(ctx, t, ts.pool, orgUID, actorBUser.ID, "viewer")
+	actorBToken := loginAs(t, ts, actorBUser.Email, fixtures.KnownPasswordRaw, actorA.orgID)
+	rPref := put(t, ts, preferenceURL(actorA.orgSlug, "registration_approved"), map[string]any{
+		"channel": "email",
+		"enabled": false,
+	}, bearerHeader(actorBToken))
+	rPref.Body.Close()
+	assertStatus(t, rPref, http.StatusOK)
+
+	// System outbox entry.
+	if _, err := ts.pool.Exec(ctx, `
+		INSERT INTO notification_outbox (organization_id, event_type, entity_type, entity_id, payload)
+		VALUES ($1, 'registration_approved', 'tournament_registrations', $1, '{}')
+	`, orgUID); err != nil {
+		t.Fatalf("insert outbox: %v", err)
+	}
+	ts.notifSvc.DrainOutbox(ctx, orgUID, logger)
+
+	// actorB opted out of email → no email row for actorB.
+	var emailCount int64
+	if err := ts.pool.QueryRow(ctx,
+		"SELECT COUNT(*) FROM notifications WHERE organization_id = $1 AND user_id = $2 AND channel = 'email'",
+		orgUID, actorBUser.ID).Scan(&emailCount); err != nil {
+		t.Fatalf("count email rows for actorB: %v", err)
+	}
+	if emailCount != 0 {
+		t.Errorf("actorB email row count = %d, want 0 (opted out of email)", emailCount)
+	}
+
+	// actorB did NOT opt out of in_app → in_app row present (visible in inbox).
+	resp := get(t, ts, notificationsURL(actorA.orgSlug), bearerHeader(actorBToken))
+	defer resp.Body.Close()
+	assertStatus(t, resp, http.StatusOK)
+	var list notificationListResponse
+	decodeBody(t, resp, &list)
+	if list.Total != 1 {
+		t.Errorf("actorB inbox total = %d, want 1 (in_app not suppressed by email opt-out)", list.Total)
 	}
 }
 

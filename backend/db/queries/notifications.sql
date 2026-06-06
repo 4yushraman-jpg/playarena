@@ -81,12 +81,14 @@ WHERE  id              = $1
 LIMIT  1;
 
 -- name: ListNotificationsByUser :many
--- Paginated list of undeleted notifications for a user within an org,
--- newest first.
+-- Paginated list of undeleted in_app notifications for a user within an org,
+-- newest first. Email channel rows are delivery-tracking only and are not
+-- surfaced in the in-app inbox.
 SELECT *
 FROM   notifications
 WHERE  organization_id = sqlc.arg(organization_id)
   AND  user_id         = sqlc.arg(user_id)
+  AND  channel         = 'in_app'
   AND  deleted_at      IS NULL
 ORDER  BY created_at DESC
 LIMIT  sqlc.arg(page_limit)
@@ -98,6 +100,7 @@ SELECT COUNT(*)
 FROM   notifications
 WHERE  organization_id = $1
   AND  user_id         = $2
+  AND  channel         = 'in_app'
   AND  deleted_at      IS NULL;
 
 -- name: MarkNotificationRead :one
@@ -183,3 +186,61 @@ FROM   notification_preferences
 WHERE  organization_id = $1
   AND  event_type      = $2
   AND  channel         = $3;
+
+
+-- =============================================================================
+-- EMAIL WORKER QUERIES (used by internal/notifworker)
+-- =============================================================================
+
+-- name: ClaimEmailNotificationsForDelivery :many
+-- Claims up to batch_size pending email notifications using FOR UPDATE SKIP LOCKED
+-- inside a subquery so the lock is held only for the duration of the UPDATE.
+-- Increments attempt_count (counts claims, not confirmed deliveries) and sets a
+-- 5-minute soft lease to handle worker crashes without permanent lock.
+-- Only rows with attempt_count < max_attempts are eligible (e.g. max_attempts = 3).
+UPDATE notifications n
+SET last_attempted_at = NOW(),
+    lease_expires_at  = NOW() + INTERVAL '5 minutes',
+    attempt_count     = n.attempt_count + 1
+WHERE n.id IN (
+    SELECT q.id
+    FROM   notifications q
+    WHERE  q.channel            = 'email'
+      AND  q.sent_at            IS NULL
+      AND  q.failed_permanently = FALSE
+      AND  q.attempt_count      < sqlc.arg(max_attempts)
+      AND  (q.lease_expires_at  IS NULL OR q.lease_expires_at < NOW())
+    ORDER  BY q.last_attempted_at ASC NULLS FIRST, q.created_at ASC
+    LIMIT  sqlc.arg(batch_size)
+    FOR    UPDATE SKIP LOCKED
+)
+RETURNING *;
+
+-- name: RecordEmailDeliverySuccess :exec
+-- Marks an email notification as successfully delivered.
+-- The sent_at IS NULL guard is the at-least-once safety valve: if the worker
+-- crashes after sending but before recording success, the next claim attempt
+-- will see sent_at IS NOT NULL and skip this row.
+UPDATE notifications
+SET sent_at = NOW()
+WHERE id      = $1
+  AND sent_at IS NULL;
+
+-- name: RecordEmailDeliveryFailure :exec
+-- Records a failed delivery attempt. The worker passes:
+--   failed_permanently = attempt_count >= max_attempts (true → dead-letter)
+--   next_attempt_at    = next retry time (ignored when failed_permanently is true)
+-- lease_expires_at is advanced to next_attempt_at so the claim query skips
+-- this row until the retry window elapses.
+UPDATE notifications
+SET failed_permanently = sqlc.arg(failed_permanently),
+    lease_expires_at   = sqlc.arg(next_attempt_at)
+WHERE id = sqlc.arg(id);
+
+-- name: DeleteOldProcessedOutboxEntries :exec
+-- Deletes outbox rows that were processed more than `retention` ago.
+-- ON DELETE CASCADE on the notifications FK removes matching notification rows.
+-- Called by the cleanup scheduler to prevent unbounded outbox table growth.
+DELETE FROM notification_outbox
+WHERE processed_at IS NOT NULL
+  AND processed_at < sqlc.arg(older_than);

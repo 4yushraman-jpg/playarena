@@ -1084,6 +1084,14 @@ type Notification struct {
 	// Soft-delete timestamp. NULL = visible. Set by DELETE endpoint. Deleted notifications are excluded from list queries but retained for audit.
 	DeletedAt pgtype.Timestamptz `json:"deleted_at"`
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	// Number of email delivery attempts claimed by the EmailWorker. Incremented at claim time (before delivery). Capped at max_attempts (3). Applies only to channel = 'email'; unused for in_app.
+	AttemptCount int32 `json:"attempt_count"`
+	// Timestamp of the most recent delivery attempt claim. Used to order the worker claim queue (oldest-first) and calculate retry windows.
+	LastAttemptedAt pgtype.Timestamptz `json:"last_attempted_at"`
+	// Soft lease expiry set by the EmailWorker when claiming a row. Prevents concurrent workers from double-delivering the same email. On successful delivery: superseded by sent_at. On failure: reset to NOW() + retry_delay by RecordEmailDeliveryFailure. On worker crash: expires naturally so another worker can retry.
+	LeaseExpiresAt pgtype.Timestamptz `json:"lease_expires_at"`
+	// Set to TRUE after max_attempts delivery attempts all fail. Rows with failed_permanently = TRUE are never retried automatically; they require manual intervention (e.g., admin reset or investigation).
+	FailedPermanently bool `json:"failed_permanently"`
 }
 
 // Transactional outbox for domain-event notifications. Rows are written inside domain transactions (matches, tournaments, registrations). DrainOutbox reads pending rows (processed_at IS NULL) using FOR UPDATE SKIP LOCKED and fans them out into the notifications table. All rows are retained permanently for auditability.

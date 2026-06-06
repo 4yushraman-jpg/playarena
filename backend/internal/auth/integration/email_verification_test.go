@@ -2,6 +2,7 @@ package auth_integration_test
 
 import (
 	"context"
+	"net/http"
 	"sync"
 	"testing"
 
@@ -185,4 +186,30 @@ func TestConcurrentEmailVerification_HTTP(t *testing.T) {
 	if unexpected != 0 {
 		t.Errorf("concurrent verify: %d unexpected status codes (not 200 or 400)", unexpected)
 	}
+}
+
+// TestResendVerification_InvalidatesPriorToken is the P2-5 regression test.
+// It verifies that requesting a resend atomically invalidates all previously
+// issued (and unused) verification tokens so only the freshly-issued token
+// can activate the account.
+func TestResendVerification_InvalidatesPriorToken(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ts := buildTestServer(t, testPool)
+
+	// Create a pending user; rawTokenA is the initial verification token.
+	user, rawTokenA := fixtures.CreatePendingUser(ctx, t, testPool)
+	t.Cleanup(func() { fixtures.CleanupUser(ctx, t, testPool, user.ID) })
+
+	// Request a resend — this must atomically invalidate rawTokenA.
+	resp := ts.post(t, "/api/v1/auth/resend-verification", map[string]string{"email": user.Email})
+	defer resp.Body.Close()
+	assertStatus(t, resp, http.StatusOK)
+
+	// rawTokenA must now be rejected with "already been used" because the
+	// resend call set used_at on all prior tokens.
+	r2 := ts.get(t, "/api/v1/auth/verify-email?token="+rawTokenA, nil)
+	defer r2.Body.Close()
+	assertStatus(t, r2, http.StatusBadRequest)
+	assertErrorBody(t, r2, "verification token has already been used")
 }

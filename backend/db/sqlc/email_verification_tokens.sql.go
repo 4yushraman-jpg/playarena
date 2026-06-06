@@ -99,6 +99,22 @@ func (q *Queries) GetEmailVerificationTokenByHashForUpdate(ctx context.Context, 
 	return i, err
 }
 
+const useAllUserEmailVerificationTokens = `-- name: UseAllUserEmailVerificationTokens :exec
+UPDATE email_verification_tokens
+SET    used_at = NOW()
+WHERE  user_id = $1
+  AND  used_at IS NULL
+`
+
+// Invalidates all unused verification tokens for a user before a new one is
+// issued. Prevents token accumulation (P2-5): without this, every resend
+// call leaves an additional valid token in the table that could be consumed
+// by a confused user or leaked in email logs.
+func (q *Queries) UseAllUserEmailVerificationTokens(ctx context.Context, userID pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, useAllUserEmailVerificationTokens, userID)
+	return err
+}
+
 const useEmailVerificationToken = `-- name: UseEmailVerificationToken :exec
 UPDATE email_verification_tokens
 SET    used_at = NOW()
