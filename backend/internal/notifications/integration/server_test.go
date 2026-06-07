@@ -19,6 +19,7 @@ import (
 	"github.com/4yushraman-jpg/playarena/internal/notifications"
 	"github.com/4yushraman-jpg/playarena/internal/platform/config"
 	mw "github.com/4yushraman-jpg/playarena/internal/platform/middleware"
+	"github.com/4yushraman-jpg/playarena/internal/realtime"
 	tournament_registrations "github.com/4yushraman-jpg/playarena/internal/tournament_registrations"
 	"github.com/4yushraman-jpg/playarena/internal/tournaments"
 )
@@ -30,6 +31,7 @@ type testServer struct {
 	pool     *pgxpool.Pool
 	cfg      *config.Config
 	notifSvc *notifications.Service
+	hub      *realtime.Hub
 }
 
 func testConfig() *config.Config {
@@ -65,8 +67,10 @@ func buildTestServer(t testing.TB, pool *pgxpool.Pool) *testServer {
 	queries := db.New(pool)
 	authz := auth.NewAuthorizationService(queries)
 
+	hub := realtime.NewHub()
+
 	notifRepo := notifications.NewRepository(queries, pool)
-	notifSvc := notifications.NewService(notifRepo, logger)
+	notifSvc := notifications.NewService(notifRepo, hub, logger)
 
 	r := chi.NewRouter()
 	r.Use(chimw.RequestID)
@@ -76,13 +80,14 @@ func buildTestServer(t testing.TB, pool *pgxpool.Pool) *testServer {
 	authHandler := auth.RegisterRoutes(r, pool, cfg, logger, limiter, sender)
 	r.Group(func(r chi.Router) {
 		r.Use(mw.BodySizeLimit(64 * 1024))
-		notifications.RegisterRoutes(r, pool, cfg, logger, authz)
+		notifications.RegisterRoutes(r, pool, cfg, logger, authz, hub)
 		tournaments.RegisterRoutes(r, pool, cfg, logger, authz, notifSvc)
 		tournament_registrations.RegisterRoutes(r, pool, cfg, logger, authz, notifSvc)
 	})
 
 	srv := httptest.NewServer(r)
 	t.Cleanup(func() {
+		hub.Shutdown()
 		srv.Close()
 		drainCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -90,5 +95,5 @@ func buildTestServer(t testing.TB, pool *pgxpool.Pool) *testServer {
 		limiter.Stop()
 	})
 
-	return &testServer{url: srv.URL, pool: pool, cfg: cfg, notifSvc: notifSvc}
+	return &testServer{url: srv.URL, pool: pool, cfg: cfg, notifSvc: notifSvc, hub: hub}
 }

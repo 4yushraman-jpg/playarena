@@ -53,6 +53,18 @@ type Config struct {
 	// email channel notification rows. Default: 30.
 	NotifWorkerIntervalSeconds int
 
+	// ── Webhook notification worker ────────────────────────────────────────
+
+	// WebhookSecretKey is the base64-encoded 32-byte AES-256-GCM key used to
+	// encrypt webhook secrets at rest. Generate with:
+	//   openssl rand -base64 32
+	// Required in all environments.
+	WebhookSecretKey string
+
+	// WebhookWorkerIntervalSeconds is how often the WebhookWorker polls for
+	// pending webhook_deliveries rows. Default: 30.
+	WebhookWorkerIntervalSeconds int
+
 	// ── Storage (Phase 11) ───────────────────────────────────────────────────
 
 	// StorageBackend selects the storage implementation: "local" (default for
@@ -204,6 +216,9 @@ func Load() (*Config, error) {
 		CleanupIntervalMinutes:     getEnvInt("CLEANUP_INTERVAL_MINUTES", 60),
 		NotifWorkerIntervalSeconds: getEnvInt("NOTIF_WORKER_INTERVAL_SECONDS", 30),
 
+		WebhookSecretKey:             getEnv("WEBHOOK_SECRET_KEY", ""),
+		WebhookWorkerIntervalSeconds: getEnvInt("WEBHOOK_WORKER_INTERVAL_SECONDS", 30),
+
 		StorageBackend:      getEnv("STORAGE_BACKEND", "local"),
 		StorageLocalPath:    getEnv("STORAGE_LOCAL_PATH", "./uploads"),
 		StorageLocalBaseURL: getEnv("STORAGE_LOCAL_BASE_URL", ""),
@@ -284,6 +299,12 @@ func (c *Config) validate() error {
 	}
 	if c.NotifWorkerIntervalSeconds <= 0 {
 		errs = append(errs, "NOTIF_WORKER_INTERVAL_SECONDS must be positive")
+	}
+	if c.WebhookSecretKey == "" {
+		errs = append(errs, "WEBHOOK_SECRET_KEY is required")
+	}
+	if c.WebhookWorkerIntervalSeconds <= 0 {
+		errs = append(errs, "WEBHOOK_WORKER_INTERVAL_SECONDS must be positive")
 	}
 
 	// Email

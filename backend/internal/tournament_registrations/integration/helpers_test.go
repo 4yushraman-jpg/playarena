@@ -19,14 +19,14 @@ import (
 // ── response structs ──────────────────────────────────────────────────────────
 
 type registrationResponse struct {
-	ID           string  `json:"id"`
-	TournamentID string  `json:"tournament_id"`
-	OrganizationID string `json:"organization_id"`
-	TeamID       *string `json:"team_id"`
-	Status       string  `json:"status"`
-	RegisteredAt string  `json:"registered_at"`
-	CreatedAt    string  `json:"created_at"`
-	UpdatedAt    string  `json:"updated_at"`
+	ID             string  `json:"id"`
+	TournamentID   string  `json:"tournament_id"`
+	OrganizationID string  `json:"organization_id"`
+	TeamID         *string `json:"team_id"`
+	Status         string  `json:"status"`
+	RegisteredAt   string  `json:"registered_at"`
+	CreatedAt      string  `json:"created_at"`
+	UpdatedAt      string  `json:"updated_at"`
 }
 
 type registrationListResponse struct {

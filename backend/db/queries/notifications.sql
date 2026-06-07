@@ -53,9 +53,10 @@ WHERE  uor.organization_id = $1
 -- NOTIFICATION QUERIES (used by the notifications service / handler)
 -- =============================================================================
 
--- name: CreateNotification :exec
--- Written ONLY by DrainOutbox. ON CONFLICT DO NOTHING is applied at the
--- application layer to make drain retries idempotent.
+-- name: CreateNotification :one
+-- Written ONLY by DrainOutbox. ON CONFLICT DO NOTHING makes drain retries
+-- idempotent; pgx returns pgx.ErrNoRows when the conflict suppresses the insert,
+-- which the caller treats as "already drained" and skips.
 INSERT INTO notifications (
     organization_id,
     user_id,
@@ -67,7 +68,9 @@ INSERT INTO notifications (
     payload,
     sent_at
 )
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9);
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+ON CONFLICT (outbox_id, user_id, channel) DO NOTHING
+RETURNING *;
 
 -- name: GetNotificationByID :one
 -- Fetches a single notification scoped by org and user.

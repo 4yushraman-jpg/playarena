@@ -116,7 +116,7 @@ func TestEvent_Create_NotLive(t *testing.T) {
 		"event_type": "raid_attempt",
 	}, bearerHeader(actor.token))
 	defer resp.Body.Close()
-	assertStatus(t, resp, http.StatusBadRequest)
+	assertStatus(t, resp, http.StatusUnprocessableEntity)
 }
 
 // TestEvent_Create_NoAuth verifies POST /events without a token returns 401.

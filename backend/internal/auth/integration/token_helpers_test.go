@@ -1,8 +1,8 @@
 package auth_integration_test
 
 import (
+	"crypto/rand"
 	"encoding/hex"
-	"fmt"
 	"testing"
 	"time"
 
@@ -326,9 +326,12 @@ func makeWrongIssuerToken(t testing.TB, userID, orgID, role, email, secret strin
 // registration tests that call the real registration endpoint.
 func uniqueUser(t testing.TB) (email, username, fullName string) {
 	t.Helper()
-	// Use nanoseconds to guarantee uniqueness across parallel test runs.
-	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	// Use 8 random bytes (16 hex chars) — unique across parallel goroutines
+	// and short enough to satisfy the 30-char username limit.
+	var rb [8]byte
+	_, _ = rand.Read(rb[:])
+	suffix := hex.EncodeToString(rb[:])
 	return "regtest_" + suffix + "@example.com",
-		"reguser" + suffix[:12],
+		"ru" + suffix,
 		"Reg User"
 }

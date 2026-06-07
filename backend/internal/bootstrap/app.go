@@ -15,6 +15,8 @@ import (
 	"github.com/4yushraman-jpg/playarena/internal/notifworker"
 	"github.com/4yushraman-jpg/playarena/internal/platform/config"
 	"github.com/4yushraman-jpg/playarena/internal/platform/middleware"
+	"github.com/4yushraman-jpg/playarena/internal/realtime"
+	"github.com/4yushraman-jpg/playarena/internal/webhookworker"
 )
 
 // App is the composition root of the PlayArena backend.
@@ -26,12 +28,14 @@ type App struct {
 	DB     *pgxpool.Pool
 	Log    *slog.Logger
 
-	scheduler        *cleanup.Scheduler
-	authLimiter      *middleware.IPRateLimiter // /api/v1/auth/* — most restrictive
-	writeLimiter     *middleware.IPRateLimiter // domain write endpoints (POST/PATCH/DELETE)
-	mediaLimiter     *middleware.IPRateLimiter // media upload endpoint
-	authHandler      *auth.Handler             // for DrainEmail on graceful shutdown
-	notifEmailWorker *notifworker.EmailWorker  // for Stop/Drain on graceful shutdown
+	scheduler          *cleanup.Scheduler
+	authLimiter        *middleware.IPRateLimiter    // /api/v1/auth/* — most restrictive
+	writeLimiter       *middleware.IPRateLimiter    // domain write endpoints (POST/PATCH/DELETE)
+	mediaLimiter       *middleware.IPRateLimiter    // media upload endpoint
+	authHandler        *auth.Handler                // for DrainEmail on graceful shutdown
+	notifEmailWorker   *notifworker.EmailWorker     // for Stop/Drain on graceful shutdown
+	notifWebhookWorker *webhookworker.WebhookWorker // for Stop/Drain on graceful shutdown
+	realtimeHub        *realtime.Hub                // for Shutdown on graceful shutdown
 }
 
 // Handler returns the fully-wired HTTP handler for the application.
@@ -70,13 +74,20 @@ func (a *App) Handler() http.Handler {
 	a.scheduler.Start()
 	a.Log.Info("cleanup scheduler started", slog.String("interval", interval.String()))
 
-	handler, authH, emailWorker := NewRouter(a.DB, a.Log, a.Config, a.authLimiter, a.writeLimiter, a.mediaLimiter)
+	handler, authH, emailWorker, webhookWorker, hub := NewRouter(a.DB, a.Log, a.Config, a.authLimiter, a.writeLimiter, a.mediaLimiter)
 	a.authHandler = authH
+	a.realtimeHub = hub
 	a.notifEmailWorker = emailWorker
 	a.notifEmailWorker.Start()
 	a.Log.Info("notification email worker started",
 		slog.Int("interval_seconds", a.Config.NotifWorkerIntervalSeconds),
 	)
+	a.notifWebhookWorker = webhookWorker
+	a.notifWebhookWorker.Start()
+	a.Log.Info("webhook worker started",
+		slog.Int("interval_seconds", a.Config.WebhookWorkerIntervalSeconds),
+	)
+	a.Log.Info("realtime hub started")
 	return handler
 }
 
@@ -101,6 +112,17 @@ func (a *App) Shutdown(ctx context.Context) {
 				slog.String("error", err.Error()),
 			)
 		}
+	}
+	if a.notifWebhookWorker != nil {
+		a.notifWebhookWorker.Stop()
+		if err := a.notifWebhookWorker.Drain(ctx); err != nil {
+			a.Log.Warn("shutdown: webhook worker drain failed",
+				slog.String("error", err.Error()),
+			)
+		}
+	}
+	if a.realtimeHub != nil {
+		a.realtimeHub.Shutdown()
 	}
 	if a.scheduler != nil {
 		a.scheduler.Stop()

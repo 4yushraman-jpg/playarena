@@ -65,9 +65,18 @@ func loginAs(t testing.TB, ts *testServer, emailAddr, password, orgID string) st
 
 // userAndOrg holds the pre-created user+org setup used by most test cases.
 type userAndOrg struct {
-	token  string
-	orgID  string // UUID string
+	token   string
+	orgID   string // UUID string
 	orgSlug string
+}
+
+// setupPlatformAdmin creates a platform_admin user, logs them in (no org
+// context), and returns the access token.
+func setupPlatformAdmin(t testing.TB, ts *testServer) string {
+	t.Helper()
+	ctx := context.Background()
+	admin := fixtures.CreatePlatformAdmin(ctx, t, ts.pool)
+	return loginAs(t, ts, admin.Email, fixtures.KnownPasswordRaw, "")
 }
 
 // setupUserAndOrg creates an active user, grants them the given role in a new

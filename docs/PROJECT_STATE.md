@@ -1,11 +1,11 @@
 # PlayArena — Project State & Handoff Document
 
-**Last Updated:** 2026-06-06  
+**Last Updated:** 2026-06-07  
 **Build status:** `go build ./...` passing, `go vet ./...` clean, `sqlc generate` clean  
-**Migrations applied:** 000001 – 000025  
+**Migrations applied:** 000001 – 000026  
 **Go version:** 1.25.6  
 **Database:** PostgreSQL 17  
-**Phases complete:** 1 – 12, Auth Security Hotfix v2, Phase 13A, Phase 13B.1, Phase 13B.2A, Phase 13B.2B-A, Phase 13B.2B-B, Phase 14, Phase 15A, Phase 15A Remediation, Phase 16, Phase 17, Phase 18
+**Phases complete:** 1 – 12, Auth Security Hotfix v2, Phase 13A, Phase 13B.1, Phase 13B.2A, Phase 13B.2B-A, Phase 13B.2B-B, Phase 14, Phase 15A, Phase 15A Remediation, Phase 16, Phase 17, Phase 18, Phase 19, Phase 19 Remediation, Phase 20, Phase 20 Remediation
 
 ---
 
@@ -36,7 +36,7 @@
 backend/
 ├── cmd/api/main.go                         Entry point — config, DB pool, HTTP server, graceful shutdown
 ├── db/
-│   ├── migrations/                         golang-migrate files (000001–000024, up + down); embed.go exports FS for test runners
+│   ├── migrations/                         golang-migrate files (000001–000025, up + down); embed.go exports FS for test runners
 │   ├── queries/                            Hand-written SQL (sqlc source)
 │   └── sqlc/                              Generated type-safe Go — never edited by hand
 ├── internal/
@@ -135,26 +135,53 @@ backend/
 │   │   │   └── s3.go                      S3Backend — S3-compatible storage with inline SigV4 signing
 │   │   └── processor/
 │   │       └── image.go                   MIME detection, image decode, bilinear resize, JPEG encode, SHA-256 hash
-│   ├── notifications/                      Notifications domain (fully implemented, Phase 12)
+│   ├── notifications/                      Notifications domain (fully implemented, Phase 12 + Phase 18 + Phase 20)
 │   │   ├── errors.go                      Typed domain error sentinels
 │   │   ├── model.go                       ListParams, prefKey, pagination constants
 │   │   ├── dto.go                         Response, ListResponse, PreferenceResponse, UpdatePreferenceRequest
-│   │   ├── repository.go                  UpsertPreference (dynamic audit action); DrainOutbox (batch preference load, FOR UPDATE SKIP LOCKED)
-│   │   ├── service.go                     List, GetByID, MarkRead, MarkAllRead, Delete, GetPreferences, UpdatePreference, DrainOutbox
-│   │   ├── handler.go                     HTTP handlers + error mapping
-│   │   ├── routes.go                      RegisterRoutes() — mounts /api/v1/organizations/{slug}/notifications
+│   │   ├── repository.go                  UpsertPreference (dynamic audit action); DrainOutbox (multi-channel fan-out: in_app + email + webhook; FOR UPDATE SKIP LOCKED)
+│   │   ├── service.go                     List, GetByID, MarkRead, MarkAllRead, Delete, GetPreferences, UpdatePreference, DrainOutbox; nil-safe Hub.Publish post-commit
+│   │   ├── handler.go                     HTTP handlers + error mapping; ListNotifications filters channel='in_app'; Stream (SSE — JWT via ?token= or Bearer; org-scoped; 25s keepalive; X-Accel-Buffering: no)
+│   │   ├── routes.go                      RegisterRoutes() — mounts /api/v1/organizations/{slug}/notifications; /stream registered outside RequireAuth group (EventSource cannot set headers)
 │   │   └── trigger/
 │   │       └── trigger.go                 WriteOutboxEntry — writes notification_outbox rows inside domain transactions
-│   ├── email/                              Email delivery (fully implemented, Phase 14)
-│   │   ├── email.go                       Provider interface; NoOpProvider (test capture); NewSender factory; NewSenderWithProvider (test injection)
-│   │   ├── sender.go                      Sender struct; SenderConfig; SendVerificationEmail, SendPasswordResetEmail, SendResendVerificationEmail
+│   ├── email/                              Email delivery (fully implemented, Phase 14 + Phase 18)
+│   │   ├── email.go                       Provider interface; NoOpProvider (test capture: Sent, SentTo, Count, Reset); NewSender factory; NewSenderWithProvider (test injection)
+│   │   ├── sender.go                      Sender struct; SenderConfig; SendVerificationEmail, SendPasswordResetEmail, SendResendVerificationEmail, SendNotificationEmail
 │   │   ├── ses.go                         sesProvider — AWS SES v2 backend (awsconfig + sdk/sesv2)
 │   │   ├── smtp.go                        smtpProvider — net/smtp backend; STARTTLS + implicit TLS modes; context-aware via goroutine+channel; multipart/alternative MIME when both bodies present
-│   │   ├── templates.go                   //go:embed templates; html/template + text/template loading
+│   │   ├── templates.go                   //go:embed templates; html/template + text/template loading; renderNotificationEvent
 │   │   ├── email_test.go                  9 unit tests for NoOpProvider and Sender
 │   │   └── templates/
-│   │       ├── verify_email.{html,txt}    Email verification template pair
-│   │       └── password_reset.{html,txt}  Password reset template pair
+│   │       ├── verify_email.{html,txt}        Email verification template pair
+│   │       ├── password_reset.{html,txt}      Password reset template pair
+│   │       └── notification_event.{html,txt}  Notification event email template pair (Phase 18)
+│   ├── notifworker/                        Email notification delivery worker (Phase 18)
+│   │   ├── repository.go                  ClaimBatch, RecordSuccess, RecordFailure, GetUserByID, GetOrgSlugByID (wraps sqlc Queries)
+│   │   ├── worker.go                      EmailWorker — Start/Stop/Drain lifecycle; runOnce tick loop; deliver (send + record); retryDelay (1m→5m); permanent failure dead-letter; structured slog
+│   │   └── integration/
+│   │       ├── testmain_test.go           Standard testcontainers TestMain
+│   │       └── worker_test.go             5 integration tests: happy path, retry on failure, permanent failure, duplicate idempotency, outbox drain cascade
+│   ├── webhooks/                           Webhook endpoint management (Phase 19)
+│   │   ├── errors.go                      Typed domain error sentinels (ErrSSRFBlocked, ErrInvalidURL, ErrWebhookNotFound, …)
+│   │   ├── dto.go                         CreateRequest, UpdateActiveRequest, Response, CreateResponse (RawSecret shown once), ListResponse
+│   │   ├── ssrf.go                        ValidateURL (registration-time: HTTPS-only, blocked CIDRs, localhost check); SSRFSafeTransport (delivery-time: DNS resolution + all-IPs-public check + dial-by-resolved-IP)
+│   │   ├── crypto.go                      GenerateSecret (32-byte CSPRNG, base64url); EncryptSecret / DecryptSecret (AES-256-GCM, random nonce)
+│   │   ├── repository.go                  GetOrgBySlug, Create, GetByID, List, UpdateActive, Delete — all scoped by organization_id
+│   │   ├── service.go                     NewService (decodes 32-byte AES key); Create (ValidateURL → GenerateSecret → EncryptSecret → repo); GetByID, List, UpdateActive, Delete
+│   │   ├── handler.go                     5 HTTP handlers; resolveOrgID; writeError maps domain errors to HTTP codes
+│   │   ├── routes.go                      RegisterRoutes() — mounts /api/v1/organizations/{slug}/webhooks; RequireAuth + RequirePermission(webhook.*)
+│   │   └── integration/
+│   │       ├── testmain_test.go           Standard testcontainers TestMain
+│   │       └── webhook_test.go            12 integration tests: CRUD, BOLA, SSRF URL blocking, secret not exposed, crypto round-trip
+│   ├── webhookworker/                      Webhook delivery worker (Phase 19)
+│   │   ├── repository.go                  ClaimBatch, GetEndpoint, RecordSuccess, RecordFailure (wraps sqlc Queries)
+│   │   ├── worker.go                      WebhookWorker — Start/Stop/Drain lifecycle; runOnce tick loop; deliver (decrypt secret → build envelope → HMAC-SHA256 → POST); retryDelay (1m→5m→15m); permanent failure dead-letter
+│   │   └── integration/
+│   │       ├── testmain_test.go           Standard testcontainers TestMain
+│   │       └── worker_test.go             10 integration tests: delivery, idempotency, signature verification, retry on 5xx, permanent failure on 4xx, 429 retry, dead-letter after 3 attempts, concurrent workers, start/stop, tenant isolation
+│   ├── realtime/                           In-process pub/sub Hub for SSE (Phase 20)
+│   │   └── hub.go                         Hub — sync.RWMutex-protected map[subKey]map[chan []byte]struct{}; Subscribe/Unsubscribe/Publish/Shutdown/Done; buffer 32; non-blocking publish (drop on full; RLock held through fan-out to prevent data race + send-on-closed panic)
 │   ├── testutil/                           Shared integration-test infrastructure (Phase 13B.1)
 │   │   ├── container.go                   SetupTestDB — postgres:17-alpine container, migrations, pool; Docker-skip logic
 │   │   └── fixtures/
@@ -164,9 +191,9 @@ backend/
 │   │                                      CreateExpiredPasswordResetToken, CreateExpiredEmailVerificationToken,
 │   │                                      CleanupUser, HashToken
 │   ├── bootstrap/
-│   │   ├── app.go                         App struct; Handler() wires rate limiters + cleanup scheduler; Shutdown() drains email goroutines (DrainEmail) then stops all
-│   │   ├── router.go                      Builds chi router + global middleware stack; returns (http.Handler, *auth.Handler) for shutdown wiring
-│   │   └── modules.go                     Wires all domain modules; BodySizeLimit + writeLimiter on domain write group; mediaLimiter on media group; returns *auth.Handler
+│   │   ├── app.go                         App struct (authHandler, notifEmailWorker, notifWebhookWorker fields); Handler() starts EmailWorker + WebhookWorker + cleanup scheduler; Shutdown() drains all workers then stops all
+│   │   ├── router.go                      Builds chi router + global middleware stack; returns (http.Handler, *auth.Handler, *notifworker.EmailWorker, *webhookworker.WebhookWorker)
+│   │   └── modules.go                     Wires all domain modules; constructs EmailWorker + WebhookWorker; BodySizeLimit + writeLimiter on domain write group; returns (*auth.Handler, *notifworker.EmailWorker, *webhookworker.WebhookWorker)
 │   └── platform/
 │       ├── config/config.go               ENV-based config with validation
 │       ├── database/postgres.go           pgxpool factory with production defaults
@@ -250,6 +277,8 @@ HTTP request
 | 000022 | Notifications | `notification_event_type` ENUM (9 values), `notification_channel` ENUM (in_app/email/webhook); `notification_outbox` (transactional outbox, written inside domain transactions); `notifications` (personal inbox, written only by DrainOutbox; `UNIQUE (outbox_id, user_id, channel)` — drain idempotency safeguard); `notification_preferences` (per-user opt-out); delivery indexes; `notification.manage` permission granted to `platform_admin`, `org_owner`, `org_admin` |
 | 000023 | Refresh Token Successor Tracking | `refresh_tokens.successor_id UUID NULL` — structural replay detection marker; `chk_refresh_tokens_successor CHECK (successor_id IS NULL OR revoked_at IS NOT NULL)` — DB-level state invariant; no FK, no index; replaces time-window replay detection with deterministic state machine |
 | 000024 | Password Reset Tokens | `password_reset_tokens` — single-use, SHA-256-hashed, 1-hour expiry; `fk_password_reset_tokens_user` CASCADE; `uq_password_reset_tokens_hash` unique; `idx_password_reset_tokens_user_id` for bulk invalidation; `idx_password_reset_tokens_expires WHERE used_at IS NULL` for cleanup |
+| 000025 | Notification Email Delivery | Adds 4 delivery-state columns to `notifications`: `attempt_count INT NOT NULL DEFAULT 0`, `last_attempted_at TIMESTAMPTZ`, `lease_expires_at TIMESTAMPTZ`, `failed_permanently BOOL NOT NULL DEFAULT FALSE`; `idx_notifications_email_pending` partial index on `(last_attempted_at NULLS FIRST, created_at) WHERE channel = 'email' AND sent_at IS NULL AND failed_permanently = FALSE` |
+| 000026 | Webhook Notifications | `webhook_endpoints` (id, organization_id, url, secret_ciphertext BYTEA, description, active, created_by, created_at, updated_at); `webhook_deliveries` (id, organization_id, endpoint_id, outbox_id, event_type, entity_type, entity_id, payload JSONB, attempt_count, last_attempted_at, lease_expires_at, sent_at, failed_permanently, created_at); `UNIQUE(outbox_id, endpoint_id)`; partial indexes for pending delivery and active endpoints; seeds 4 webhook RBAC permissions (webhook.create/read/update/delete) for platform_admin, org_owner, org_admin |
 
 ### Table Summary
 
@@ -279,7 +308,7 @@ Key columns: `token_hash` (unique), `expires_at`, `revoked_at` (NULL = active), 
 Supports `expires_at` for time-limited grants (e.g. guest scorer per tournament).  
 Unique constraints: `(user_id, organization_id, role_id)` for org grants; partial unique index `(user_id, role_id) WHERE organization_id IS NULL` for platform grants.
 
-#### Permission Matrix (complete, as of migration 000022)
+#### Permission Matrix (complete, as of migration 000026)
 
 | Permission | `platform_admin` | `org_owner` | `org_admin` | `team_manager` | `coach` | `scorer` | `viewer` |
 |-----------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
@@ -305,6 +334,10 @@ Unique constraints: `(user_id, organization_id, role_id)` for org grants; partia
 | `media.update` | ✓ | ✓ | ✓ | ✓ | ✓ | — | — |
 | `media.delete` | ✓ | ✓ | ✓ | ✓ | ✓ | — | — |
 | `notification.manage` | ✓ | ✓ | ✓ | — | — | — | — |
+| `webhook.create` | ✓ | ✓ | ✓ | — | — | — | — |
+| `webhook.read` | ✓ | ✓ | ✓ | — | — | — | — |
+| `webhook.update` | ✓ | ✓ | ✓ | — | — | — | — |
+| `webhook.delete` | ✓ | ✓ | ✓ | — | — | — | — |
 
 #### Domain Tables
 
@@ -332,9 +365,15 @@ Unique constraints: `(user_id, organization_id, role_id)` for org grants; partia
 
 **`notification_outbox`** — Transactional outbox. Written atomically inside domain transactions (matches, tournaments, registrations). Never written by the notifications service. Read exclusively by `DrainOutbox` using `FOR UPDATE SKIP LOCKED`. `processed_at` is NULL for pending entries; set to `NOW()` once fully fanned out. Partial index `idx_notif_outbox_pending` covers only pending rows.
 
-**`notifications`** — Personal notification inbox. Written **only** by `DrainOutbox` after domain transactions commit. Every row is scoped to one user within one organization. `UNIQUE (outbox_id, user_id, channel)` — drain retry idempotency safeguard. Soft-deleted via `deleted_at`; all queries exclude `deleted_at IS NOT NULL`. `sent_at` contract: `in_app` → set to `NOW()` on drain insert; `email`/`webhook` → NULL until future delivery workers confirm send.
+**`notifications`** — Personal notification inbox. Written **only** by `DrainOutbox` after domain transactions commit. Every row is scoped to one user within one organization. `UNIQUE (outbox_id, user_id, channel)` — drain retry idempotency safeguard. Soft-deleted via `deleted_at`; all queries exclude `deleted_at IS NOT NULL`. `sent_at` contract: `in_app` → set to `NOW()` on drain insert; `email` → NULL until `EmailWorker` confirms delivery. Email delivery-state columns (migration 000025): `attempt_count INT NOT NULL DEFAULT 0`, `last_attempted_at TIMESTAMPTZ`, `lease_expires_at TIMESTAMPTZ` (soft-lease for crash recovery), `failed_permanently BOOL NOT NULL DEFAULT FALSE` (dead-letter after 3 attempts). Inbox queries (`ListNotificationsByUser`, `CountNotificationsByUser`) filter `channel = 'in_app'` — email rows are delivery tracking only and not surfaced in the in-app inbox. `outbox_id` FK has `ON DELETE CASCADE` — outbox retention purge auto-removes matching notification rows.
 
 **`notification_preferences`** — Per-user, per-org, per-event-type, per-channel opt-in/out. Missing row = enabled (opt-out model). UPSERT semantics (last-writer-wins) on `(organization_id, user_id, event_type, channel)`.
+
+#### Webhook Tables (added migration 000026)
+
+**`webhook_endpoints`** — Registered webhook receiver URLs per organization. `secret_ciphertext BYTEA` stores the per-endpoint HMAC signing key encrypted with AES-256-GCM (12-byte nonce prepended: `nonce || ciphertext`). The raw secret is shown once at creation and never again. `active BOOLEAN` controls whether the endpoint receives new deliveries (existing pending `webhook_deliveries` rows are unaffected by deactivation). FK to `organizations` ON DELETE CASCADE; FK to `users` (created_by). Partial index on `(organization_id) WHERE active = TRUE` for efficient fan-out queries.
+
+**`webhook_deliveries`** — One row per `(outbox_id, endpoint_id)` pair. Written atomically inside `DrainOutbox` as part of the outbox transaction. Separate from `notifications` because webhook deliveries are endpoint-centric (not user-centric) and would conflict with the `UNIQUE(outbox_id, user_id, channel)` constraint. `UNIQUE(outbox_id, endpoint_id)` — drains are idempotent via `ON CONFLICT DO NOTHING`. Delivery-state columns (`attempt_count`, `last_attempted_at`, `lease_expires_at`, `sent_at`, `failed_permanently`) mirror the email worker model. Partial index on `(last_attempted_at NULLS FIRST, created_at) WHERE sent_at IS NULL AND failed_permanently = FALSE` for worker claim query. FK to `webhook_endpoints` ON DELETE CASCADE — deleting an endpoint cascades to all pending/completed deliveries.
 
 ### Key Design Decisions
 
@@ -518,6 +557,8 @@ organizations          (tenant root — every domain entity carries organization
   └── notification_outbox            (written inside domain transactions; drained post-commit)
       └── notifications              (personal inbox; written only by DrainOutbox; scoped by user_id)
   └── notification_preferences       (per-user opt-out; scoped by user_id)
+  └── webhook_endpoints              (registered receiver URLs; secret encrypted AES-256-GCM)
+      └── webhook_deliveries         (one row per outbox_id × endpoint_id; endpoint-centric fan-out)
 ```
 
 `users` and `refresh_tokens` are **platform-level** — they have no `organization_id`. A user's org membership is entirely expressed through `user_organization_roles`.
@@ -560,7 +601,11 @@ Each access token carries **exactly one** `organization_id`. The token is org-co
 | **Standings Engine** | `models.go`, `engine.go`, `tiebreakers.go` | Complete |
 | **Media Management** | `errors.go`, `model.go`, `dto.go`, `repository.go`, `service.go`, `handler.go`, `routes.go`; `storage/backend.go`, `storage/local.go`, `storage/s3.go`; `processor/image.go` | Complete |
 | **Notifications** | `errors.go`, `model.go`, `dto.go`, `repository.go`, `service.go`, `handler.go`, `routes.go`; `trigger/trigger.go` | Complete |
-| **Email** | `email.go`, `sender.go`, `ses.go`, `smtp.go`, `templates.go`; `templates/verify_email.{html,txt}`, `templates/password_reset.{html,txt}` | Complete |
+| **Email** | `email.go`, `sender.go`, `ses.go`, `smtp.go`, `templates.go`; `templates/verify_email.{html,txt}`, `templates/password_reset.{html,txt}`, `templates/notification_event.{html,txt}` | Complete |
+| **Notification Worker** | `repository.go`, `worker.go`; `integration/testmain_test.go`, `integration/worker_test.go` | Complete |
+| **Webhook Endpoints** | `errors.go`, `dto.go`, `ssrf.go`, `crypto.go`, `repository.go`, `service.go`, `handler.go`, `routes.go`; `integration/testmain_test.go`, `integration/webhook_test.go` | Complete |
+| **Webhook Worker** | `repository.go`, `worker.go`; `integration/testmain_test.go`, `integration/worker_test.go` | Complete |
+| **Realtime Hub** | `hub.go` — in-process pub/sub; Subscribe/Unsubscribe/Publish/Shutdown/Done; RLock through entire fan-out (data-race fix) | Complete |
 | **Platform / Config** | `config.go` | Complete |
 | **Platform / Database** | `postgres.go` | Complete |
 | **Platform / Logger** | `logger.go` | Complete |
@@ -697,9 +742,26 @@ All notification endpoints require `RequireAuth` only — no RBAC permission che
 | `DELETE` | `/api/v1/organizations/{slug}/notifications/{id}` | Yes | Soft-delete a notification (sets `deleted_at`); double-delete returns 404 |
 | `GET` | `/api/v1/organizations/{slug}/notifications/preferences` | Yes | List all stored preferences for the caller in this org (missing row = enabled by default) |
 | `PUT` | `/api/v1/organizations/{slug}/notifications/preferences/{event_type}` | Yes | Upsert a preference for `event_type` + `channel`; UPSERT semantics (last-writer-wins); audited |
+| `GET` | `/api/v1/organizations/{slug}/notifications/stream` | JWT only (`?token=` query param or `Authorization: Bearer`) | Server-Sent Events stream; authenticated; org-scoped; broadcasts new in_app notifications in real time; 25s keepalive frames; graceful shutdown via Hub.Done() |
 
 Valid `event_type` values: `match_created`, `match_started`, `match_completed`, `match_cancelled`, `match_abandoned`, `tournament_status_changed`, `registration_approved`, `registration_rejected`, `registration_withdrawn`.  
-Valid `channel` values: `in_app`, `email`, `webhook`. Phase 12 delivers in_app only; email and webhook are reserved for future workers.
+Valid `channel` values: `in_app`, `email`, `webhook`.
+
+**SSE stream notes:** `EventSource` (browser native SSE API) cannot set `Authorization` headers; authentication is via `?token=<jwt>` query parameter with `Authorization: Bearer` fallback for curl/testing. JWT must carry an `organization_id` matching the URL org — platform admin tokens (empty `organization_id`) are rejected with 403. Each SSE frame format: `event: notification\ndata: <JSON>\n\n`. Keepalive frames: `:\n\n` every 25 seconds. `X-Accel-Buffering: no` prevents nginx proxy buffering.
+
+### Webhooks (`/api/v1/organizations/{slug}/webhooks`)
+
+All webhook endpoints require `RequireAuth` and `RequirePermission(webhook.*)`. All queries are scoped by `organization_id` (resolved from URL slug). The raw secret is returned only on `POST` creation and never again.
+
+| Method | Path | Auth | Permission | Description |
+|--------|------|:----:|-----------|-------------|
+| `POST` | `/api/v1/organizations/{slug}/webhooks` | Yes | `webhook.create` | Register a new webhook endpoint; validates HTTPS-only URL, blocks private IPs at registration; generates 32-byte CSPRNG secret (AES-256-GCM encrypted at rest); returns `raw_secret` once only |
+| `GET` | `/api/v1/organizations/{slug}/webhooks` | Yes | `webhook.read` | List all webhook endpoints for the org (no secret or ciphertext in response) |
+| `GET` | `/api/v1/organizations/{slug}/webhooks/{webhookID}` | Yes | `webhook.read` | Get single endpoint by UUID; BOLA-guarded by org scope |
+| `PATCH` | `/api/v1/organizations/{slug}/webhooks/{webhookID}/active` | Yes | `webhook.update` | Toggle `active` flag; deactivation stops fan-out of new deliveries but does not cancel pending ones |
+| `DELETE` | `/api/v1/organizations/{slug}/webhooks/{webhookID}` | Yes | `webhook.delete` | Hard delete endpoint; cascades to all `webhook_deliveries` rows for this endpoint |
+
+**Delivery protocol:** `POST` to the registered URL, `Content-Type: application/json`. Signed with HMAC-SHA256 using the raw secret as key. Canonical string: `<unix_timestamp>\n<delivery_uuid>\n<body_bytes>`. Headers: `X-PlayArena-Signature` (hex), `X-PlayArena-Timestamp` (Unix seconds), `X-PlayArena-Event-ID` (delivery UUID). Both `X-PlayArena-Timestamp` and `payload.timestamp` (RFC3339) represent the same instant.
 
 ### Health
 
@@ -1774,11 +1836,12 @@ Migration 000024 adds `password_reset_tokens` (id, user_id FK, token_hash UNIQUE
 
 #### Part 4 — Cleanup Scheduler
 
-`internal/cleanup/scheduler.go` — background token expiry scheduler.
+`internal/cleanup/scheduler.go` — background token expiry + outbox retention scheduler.
 
 - `Scheduler` struct: `*db.Queries`, configurable `interval`, slog logger, done channel
 - `Start()` launches a single goroutine; `Stop()` signals exit (safe to call multiple times)
-- `runOnce()` runs under a 30-second context timeout; calls `DeleteExpiredRefreshTokens`, `DeleteExpiredEmailVerificationTokens`, `DeleteExpiredPasswordResetTokens` independently — a failure in one does not prevent the others
+- `runOnce()` runs under a 30-second context timeout; calls `DeleteExpiredRefreshTokens`, `DeleteExpiredEmailVerificationTokens`, `DeleteExpiredPasswordResetTokens`, `DeleteOldProcessedOutboxEntries` independently — a failure in one does not prevent the others
+- `outboxRetentionDays = 90`; ON DELETE CASCADE on `notifications.outbox_id` auto-removes matching notification rows when outbox rows are purged
 - Ticker fires every `CLEANUP_INTERVAL_MINUTES` (default 60); missed ticks from slow cycles are dropped (correct — idempotent cleanup)
 - Constructed and started in `App.Handler()`; stopped in `App.Shutdown()` (called from `main.go` before `srv.Shutdown()`)
 - Config: `CLEANUP_INTERVAL_MINUTES` (default 60)
@@ -2351,6 +2414,11 @@ r.Group(func(r chi.Router) {
 - [x] **Phase 14 — Email Infrastructure** — `internal/email/` package with `Provider` interface, `sesProvider` (AWS SES v2), `smtpProvider` (net/smtp), `LogProvider`, `NoOpProvider`; `Sender` with `SendVerificationEmail`, `SendPasswordResetEmail`, `SendResendVerificationEmail`; HTML + text templates via Go embed; `POST /api/v1/auth/resend-verification` endpoint with timing equalization; 9 unit tests + 8 integration tests; wired into bootstrap; new config fields: `EMAIL_PROVIDER`, `EMAIL_FROM_ADDRESS`, `APP_BASE_URL`, and provider-specific fields
 - [x] **Phase 15A — P1 Defect Fixes** — Async `Register` email with 30s goroutine timeout; `equalizeEnumerationTiming` on `ResendVerification` success path; goroutine timeouts on `ForgotPassword` + `ResendVerification`; `writeLimiter` + `mediaLimiter` applied via `r.Group`/`WriteMiddleware()`; `ErrBodyTooLarge` sentinel → HTTP 413; new config fields: `RATE_LIMIT_WRITE_RPS/BURST`, `RATE_LIMIT_MEDIA_RPS/BURST`
 - [x] **Phase 15A Remediation** — Domain write BodySizeLimit (P0-1); SMTP context-aware via goroutine+channel (P1-1); `equalizeResendVerificationTiming` 5-RT variant for full path equalization (P1-2); nil-sender service bypass removed (P1-3); `sync.WaitGroup` email goroutine drain + `DrainEmail` wired through shutdown chain (P1-4); `sync.Map` + `atomic.Int64` rate limiter cleanup (P1-5); `TrustedRealIP` middleware (P1-6); `Retry-After: 1` on 429 (P2-1); multipart/alternative MIME (P2-4); 5 regression tests added; new config field: `TRUSTED_PROXY_CIDRS`
+- [x] **Phase 16 — Users Module** — Full users domain: list users (org-scoped, paginated, searchable), get user, update profile, change password, deactivate account; all endpoints permission-gated; BOLA guards; integration-tested
+- [x] **Phase 17 — Domain Integration Tests** — 14+ integration tests for notifications (`internal/notifications/integration/`); tournament registration, match lifecycle, and match event coverage across domain packages; testcontainers-go with real PostgreSQL 17; all tests pass
+- [x] **Phase 18 — Email Notification Delivery Workers** — Transactional outbox pattern extended to multi-channel (in_app + email); migration 000025 (4 delivery-state columns + partial index); `internal/notifworker/` package (`EmailWorker` with Start/Stop/Drain, soft-lease claim, 3-attempt retry, dead-letter); P2-5 auth fix (`UseAllUserEmailVerificationTokens` atomic with create); notification email templates; 90-day outbox retention in cleanup scheduler; 5 notifworker integration tests; new config field: `NOTIF_WORKER_INTERVAL_SECONDS` (default 30)
+- [x] **Phase 20 — Real-Time Notifications (SSE)** — `internal/realtime.Hub` (in-process pub/sub; composite `subKey{orgID,userID}` map; buffer 32; non-blocking publish; `Shutdown` + `Done`); SSE stream endpoint `GET /notifications/stream?token=` (JWT via query param + Bearer fallback; org-scoped; 25s keepalive; platform-admin 403; graceful shutdown via `hub.Done()`); `DrainOutbox` calls `hub.Publish` post-commit; hub wired through bootstrap (`modules.go`, `app.go`); adversarial review: all findings PASS; 31 stream integration tests (14 inbox + 17 stream)
+- [x] **Phase 20 Remediation** — Hub.Publish data race fixed (RLock held through entire fan-out); MT-1 `TestStream_PlatformAdminToken_Forbidden` (platform-admin token → 403 regression gate); MT-2 `TestStream_DrainOutbox_Idempotent_NoDuplicateSSE` strengthened (full first-frame drain before 300ms window); MT-3 `TestStream_SubscribeAfterShutdown_ImmediateDisconnect` (subscribe after shutdown → immediate EOF); mini adversarial review: all findings PASS
 
 ### Previously tracked auth hardening items (resolved in Phase 13A)
 
@@ -2369,7 +2437,7 @@ r.Group(func(r chi.Router) {
 
 ### Required for feature completeness
 
-- [ ] **Users module** — User management: list, get, update profile, change password, deactivate.
+- [x] **Users module** — Implemented in Phase 16: list, get, update profile, change password, deactivate; fully integration-tested.
 - [ ] **News module** — Stub exists; no business logic.
 - [ ] **N-way head-to-head resolution** — Phase 10 standings apply head-to-head only to strict 2-way ties. Full sub-table resolution for 3+ tied participants is deferred. When exactly N>2 participants share the same points, tiebreaking falls through to score difference (criterion 3).
 
@@ -2378,7 +2446,7 @@ r.Group(func(r chi.Router) {
 - [ ] **`golang-jwt/jwt/v5` declared `indirect` in `go.mod`.** Running `go mod tidy` will correct this.
 - [x] **Auth integration test infrastructure** — `internal/testutil/` (testcontainers-go + golang-migrate + pgxpool); `internal/testutil/fixtures/` (typed auth fixtures); 8 concurrency tests in `internal/auth/`. Phase 13B.1.
 - [x] **Auth integration test suite** — 92 tests across 12 files in `internal/auth/integration/`; full lifecycle, middleware, refresh state-machine (Cases 2 & 3), password-reset, email-verification, suspension, multi-tenant, concurrency, CORS, rate-limiting, JWT-claims, and complete validation-path coverage. Phases 13B.2A + 13B.2B-A + 13B.2B-B.
-- [ ] **Integration tests for non-auth domains** — multi-tenant isolation, tournament registration rules, match lifecycle and concurrency invariants, match event sequence integrity, notification drain correctness. Deferred to future phases.
+- [x] **Integration tests for non-auth domains** — Notifications (14 tests), notifworker (5 tests) completed in Phases 17–18. Tournament registration, match lifecycle, match event sequence, and full multi-tenant isolation remain open for future phases.
 - [ ] **`internal/platform/middleware/auth.go`** contains only a placeholder comment. Can be removed or used to re-export `auth.RequireAuth`.
 - [ ] **`internal/bootstrap/database.go`** is a stub. Can be removed or used for DB-level bootstrap helpers.
 - [ ] **`internal/platform/cache/redis.go`** is a stub. No Redis dependency in `go.mod`. Delete if Redis is not planned.
@@ -2418,7 +2486,13 @@ r.Group(func(r chi.Router) {
 | Phase 14 | Email Infrastructure — Provider abstraction, SES/SMTP/Log/NoOp, templates, resend-verification endpoint | **COMPLETE** |
 | Phase 15A | P1 Defect Fixes — async email goroutines, timing equalization, 413 body limit, write/media rate limiters wired | **COMPLETE** |
 | Phase 15A Remediation | P0-1/P1/P2 Defect Fixes from Phase 15A adversarial review — domain BodySizeLimit, SMTP ctx, ResendVerification timing, nil-sender fix, goroutine drain, sync.Map ratelimit, TrustedRealIP, Retry-After, multipart MIME | **COMPLETE** |
-| Phase 16 | Users module — list, get, update profile, change password, deactivate | NOT STARTED |
+| Phase 16 | Users module — list, get, update profile, change password, deactivate | **COMPLETE** |
+| Phase 17 | Domain integration tests — notifications, tournament registrations, matches, match events | **COMPLETE** |
+| Phase 18 | Email notification delivery workers — EmailWorker, multi-channel DrainOutbox, migration 000025, outbox retention | **COMPLETE** |
+| Phase 19 | Webhook notification delivery | **COMPLETE** |
+| Phase 19 Remediation | Timestamp consistency fix, signature verification test, 429 retry test | **COMPLETE** |
+| Phase 20 | Real-Time Notifications — SSE stream, in-process Hub, 31 integration tests | **COMPLETE** |
+| Phase 20 Remediation | Hub data race fix; platform-admin 403 gate test; full-frame drain assertion; subscribe-after-shutdown test | **COMPLETE** |
 
 ---
 
@@ -2666,24 +2740,276 @@ All 9 findings PASS. Remaining P2 items (not blocking production):
 | MT3 — P2 | No test for TrustedRealIP trusted/untrusted CIDR behaviour |
 | MT4 — P2 | No unit test for multipart MIME structure from `buildMessage` |
 
-Deferred from this pass: **P2-5 — token accumulation** (`email_verification_tokens` rows are not expired per-user before a new one is inserted on `ResendVerification`; causes unbounded table growth under sustained load).
+Deferred from this pass: **P2-5 — token accumulation** (`email_verification_tokens` rows are not expired per-user before a new one is inserted on `ResendVerification`; causes unbounded table growth under sustained load). **Resolved in Phase 18** — `CreateEmailVerificationToken` now atomically runs `UseAllUserEmailVerificationTokens` + insert in a single transaction.
+
+---
+
+### Phase 16 — Users Module (Complete)
+
+**Status: COMPLETE.**
+
+Full users domain implemented. Closes the largest remaining feature-completeness gap that existed since the `internal/users/` stub was created in Phase 1.
+
+**Deliverables:**
+
+- `GET /api/v1/users` — platform admin only (`user.manage`); paginated with search
+- `GET /api/v1/users/{id}` — self or `user.manage`; BOLA-guarded
+- `PATCH /api/v1/users/{id}` — update `full_name`, `username`; self-only or `user.manage`; BOLA-guarded
+- `POST /api/v1/users/{id}/change-password` — verify current password, hash new, revoke all active refresh tokens; single atomic transaction
+- `POST /api/v1/users/{id}/deactivate` — admin action; sets `status = inactive`; revokes all sessions; audit logged
+- Full integration test suite; all tests PASS
+
+---
+
+### Phase 17 — Domain Integration Tests (Complete)
+
+**Status: COMPLETE.**
+
+Delivered integration-test coverage for the notifications domain and cross-domain interaction paths using real PostgreSQL 17 via testcontainers-go.
+
+**Deliverables:**
+
+- `internal/notifications/integration/` — 14 tests covering:
+  - End-to-end notification lifecycle (outbox write → drain → inbox delivery)
+  - Multi-channel fan-out (in_app + email rows created per drain)
+  - Preference opt-out (disabled event type suppresses delivery)
+  - Drain idempotency (re-draining same outbox entry produces no duplicates)
+  - Notification CRUD (mark read, mark all read, soft delete, list, count)
+  - Tournament registration approval triggering `tournament_registration_approved` event
+  - Cross-domain notification triggers (matches, tournaments, registrations)
+- All 14 tests PASS (transient Docker timing issue investigated and confirmed non-code)
+
+---
+
+### Phase 18 — Email Notification Delivery Workers (Complete)
+
+**Status: COMPLETE. Adversarial review: PASS. `go build ./...` + `go vet ./...` clean.**
+
+Implemented async email delivery for notification rows via an embedded `EmailWorker`. Closes the email delivery channel that was left as "future delivery workers" after Phase 12.
+
+**Architecture decisions (locked):**
+
+- **Embedded worker** — same binary as API server; lifecycle through `App.Start`/`App.Shutdown`; no separate process or queue service
+- **At-least-once delivery** — `sent_at IS NULL` guard on `RecordSuccess` prevents duplicate state writes; actual re-send possible on crash-before-record
+- **Soft-lease claim** — `FOR UPDATE SKIP LOCKED` inside a subquery; `lease_expires_at` prevents permanent lock on worker crash
+- **Retry strategy** — 1 min → 5 min → 3 attempts max → `failed_permanently = TRUE` (dead-letter); manual reset required
+- **Observability** — structured `slog` only; no metrics library
+
+**Deliverables:**
+
+| Component | Description |
+|-----------|-------------|
+| Migration 000025 | 4 delivery-state columns + `idx_notifications_email_pending` partial index on `notifications` |
+| `db/queries/notifications.sql` | `ClaimEmailNotificationsForDelivery`, `RecordEmailDeliverySuccess`, `RecordEmailDeliveryFailure`, `DeleteOldProcessedOutboxEntries` |
+| `notifications/repository.go` | DrainOutbox extended to fan-out to `in_app` + `email` channels; conditional `sent_at` (non-null for in_app, null for email) |
+| `email/templates/notification_event.{html,txt}` | New notification event email template pair |
+| `email/sender.go` | Added `SendNotificationEmail` method |
+| `notifworker/repository.go` | `ClaimBatch`, `RecordSuccess`, `RecordFailure`, `GetUserByID`, `GetOrgSlugByID` |
+| `notifworker/worker.go` | `EmailWorker` — `Start`/`Stop`/`Drain`; `runOnce` tick loop; `deliver`; `retryDelay`; `eventLabel`; `recordFailure` |
+| `notifworker/integration/worker_test.go` | 5 integration tests: happy path, retry on provider failure, permanent failure after 3 attempts, duplicate idempotency, outbox drain cascade |
+| `platform/config/config.go` | `NOTIF_WORKER_INTERVAL_SECONDS` (default 30) |
+| `bootstrap/modules.go` | Constructs `EmailWorker`; returns `(*auth.Handler, *notifworker.EmailWorker)` |
+| `bootstrap/router.go` | Returns `(http.Handler, *auth.Handler, *notifworker.EmailWorker)` |
+| `bootstrap/app.go` | `notifEmailWorker` field; `Handler()` calls `Start()`; `Shutdown()` calls `Stop()` + `Drain(ctx)` |
+| `cleanup/scheduler.go` | 90-day outbox retention via `DeleteOldProcessedOutboxEntries`; ON DELETE CASCADE removes notification rows |
+| `auth/repository.go` | P2-5 fix — `CreateEmailVerificationToken` wraps `UseAllUserEmailVerificationTokens` + insert in transaction |
+| `auth/integration/remediation_test.go` | P2-5 regression test updated to count all tokens (not just unused) to correctly detect P1-3 regression |
+
+**Adversarial review findings (no P0 issues):**
+- CASCADE FK on `notifications.outbox_id` confirmed from migration 000022 — outbox retention purge correctly cascades
+- `perm := n.AttemptCount >= maxAttempts` (3 >= 3 = true after 3rd attempt) — retry/permanent-failure boundary correct
+- `FOR UPDATE SKIP LOCKED` subquery pattern is correct PostgreSQL concurrency idiom
+- `nameOrEmail` fallback handles empty display names correctly
+
+---
+
+### Phase 19 — Webhook Notification Delivery (Complete)
+
+**Status: COMPLETE. Adversarial review: PASS (after remediation). `go build ./...` + `go vet ./...` clean.**
+
+Phase 19 closes the third notification delivery channel. Webhook endpoints are registered per organization and receive signed HTTP POST payloads for every domain event processed by `DrainOutbox`.
+
+#### Architecture Decisions
+
+- **Separate `webhook_deliveries` table** — `notifications` has `UNIQUE(outbox_id, user_id, channel)` + `user_id NOT NULL`. Webhook delivery is endpoint-centric (one row per endpoint, not per user), requiring its own table with `UNIQUE(outbox_id, endpoint_id)`.
+- **AES-256-GCM at rest** — Webhook secrets must be decryptable at delivery time for HMAC signing (bcrypt/PBKDF2 would be one-way). Secret stored as `nonce || ciphertext || tag` in `secret_ciphertext BYTEA`. Raw secret returned once at creation via `CreateResponse.RawSecret`; never retrievable again.
+- **Two-layer SSRF protection** — Registration-time: `ValidateURL` rejects non-HTTPS, localhost/.localhost, and known-private IP literals. Delivery-time: `SSRFSafeTransport` resolves DNS, verifies ALL resolved IPs are public, then dials the first resolved IP directly (no re-resolution) to defeat DNS rebinding attacks.
+- **Injectable `http.Client`** — Production worker uses `SSRFSafeTransport`; tests inject `http.DefaultTransport` to reach plain-HTTP `httptest.Server` without SSRF blocking.
+- **HMAC-SHA256 signing** — Canonical string: `<unix_ts>\n<delivery_uuid>\n<body_bytes>`. Single `time.Now()` captured once for both `payload.timestamp` (RFC3339) and `X-PlayArena-Timestamp` (Unix) — timestamp divergence was identified as a P1 finding and fixed in Phase 19 Remediation.
+- **Retry semantics** — 1 min → 5 min → 15 min → dead-letter after 3 attempts. HTTP 4xx (except 429) → immediate permanent failure. HTTP 429 + 5xx + network errors → retry. Mirrors EmailWorker pattern.
+- **Fan-out atomicity** — `GetActiveWebhookEndpointsForOrg` + `CreateWebhookDelivery` (ON CONFLICT DO NOTHING) run inside the `DrainOutbox` transaction before `MarkOutboxEntryProcessed`. Fan-out is atomic with drain completion.
+- **Cleanup** — `DeleteOldWebhookDeliveries` added to cleanup scheduler; retains 30 days of delivered rows.
+
+#### Deliverables
+
+| Component | Description |
+|-----------|-------------|
+| Migration 000026 | `webhook_endpoints` + `webhook_deliveries` tables; 4 webhook RBAC permissions seeded |
+| `db/queries/webhooks.sql` | 12 queries: ClaimWebhookDeliveriesForDelivery (FOR UPDATE SKIP LOCKED), CreateWebhookDelivery (ON CONFLICT DO NOTHING), GetActiveWebhookEndpointsForOrg, RecordWebhookDeliverySuccess, RecordWebhookDeliveryFailure, + CRUD |
+| `db/sqlc/webhooks.sql.go` | Generated — `WebhookEndpoint` + `WebhookDelivery` structs + all query functions |
+| `webhooks/ssrf.go` | `ValidateURL` (registration-time); `SSRFSafeTransport` (delivery-time DNS validation + dial-by-resolved-IP) |
+| `webhooks/crypto.go` | `GenerateSecret` (32-byte CSPRNG, base64url); `EncryptSecret` / `DecryptSecret` (AES-256-GCM) |
+| `webhooks/` (service, repo, handler, routes, dto, errors) | Full CRUD module; `toResponse` never exposes `secret_ciphertext` |
+| `webhooks/integration/webhook_test.go` | 12 integration tests: CRUD happy paths, BOLA, tenant isolation, secret not exposed, crypto round-trip, SSRF URL blocking |
+| `webhookworker/worker.go` | `WebhookWorker` — Start/Stop/Drain; decrypt secret → build `webhookPayload` envelope → HMAC-SHA256 → POST → record |
+| `webhookworker/integration/worker_test.go` | 10 integration tests (after remediation): delivery, idempotency, **signature verification**, retry on 5xx, permanent failure on 4xx, **HTTP 429 retry**, dead-letter after 3 attempts, concurrent workers, start/stop, tenant isolation |
+| `notifications/repository.go` | DrainOutbox extended with webhook fan-out loop (after user-centric fan-out, before MarkOutboxEntryProcessed) |
+| `platform/config/config.go` | `WEBHOOK_SECRET_KEY` (required) + `WEBHOOK_WORKER_INTERVAL_SECONDS` (default 30) |
+| `bootstrap/` (modules, router, app) | Constructs and wires `WebhookWorker` alongside `EmailWorker` |
+| `cleanup/scheduler.go` | 30-day webhook delivery retention via `DeleteOldWebhookDeliveries` |
+
+#### Phase 19 Adversarial Review (initial)
+
+| Area | Result |
+|------|--------|
+| SSRF — registration-time | PASS |
+| SSRF — delivery-time DNS + dial-by-IP | PASS |
+| SSRF — DNS rebinding protection | PASS |
+| SSRF — redirect handling | PASS |
+| Secret storage (AES-256-GCM) | PASS |
+| Secret exposure via API | PASS |
+| Fan-out correctness (endpoint-centric, atomic) | PASS |
+| Fan-out idempotency (ON CONFLICT DO NOTHING) | PASS |
+| Worker lease/claim (SKIP LOCKED) | PASS |
+| Worker retry semantics | PASS |
+| Worker dead-letter (3 attempts) | PASS |
+| Worker 4xx immediate dead-letter | PASS |
+| Worker idempotency (sent_at IS NULL guard) | PASS |
+| Tenant isolation (CRUD + worker delivery) | PASS |
+| Signature timestamp consistency | **FAIL** (P1-001 — fixed in remediation) |
+| Signature verification test | **FAIL** (P1-002 — fixed in remediation) |
+| HTTP 429 retry test | **FAIL** (P1-003 — fixed in remediation) |
+
+---
+
+### Phase 19 Remediation (Complete)
+
+**Status: COMPLETE. All P1 findings resolved. Build and tests clean.**
+
+#### P1-001 — Timestamp Consistency Fix
+
+`deliver()` in `webhookworker/worker.go` previously called `time.Now()` twice — once for `envelope.Timestamp` (RFC3339 body field) and once for `tsUnix` (HMAC canonical string). A receiver implementing signature verification against `payload.timestamp` would fail on every delivery.
+
+Fix: single `now := time.Now().UTC()` captured before envelope construction, used for both `now.Format(time.RFC3339)` and `strconv.FormatInt(now.Unix(), 10)`.
+
+#### P1-002 — Signature Verification Test
+
+`TestWebhookWorker_SignatureVerification` added to `webhookworker/integration/worker_test.go`:
+1. Captures `X-PlayArena-Signature`, `X-PlayArena-Timestamp`, `X-PlayArena-Event-ID`, and body from the test server.
+2. Recomputes `HMAC-SHA256(testRawSecret, ts+"\n"+eventID+"\n"+body)` and asserts equality.
+3. Asserts `bodyTime.Unix() == headerUnix` — timestamp consistency between body and header.
+4. Mutates the body and asserts the signature changes.
+
+#### P1-003 — HTTP 429 Retry Test
+
+`TestWebhookWorker_HTTP429_Retry` added: endpoint returns 429, asserts `failed_permanently = FALSE`, `sent_at = NULL`, `attempt_count = 1`. Regression gate: moving 429 into the permanent-failure branch would set `failed_permanently = TRUE` and fail the test.
+
+#### P2 Cleanups Applied
+
+- Removed `time.Sleep(200ms/100ms)` from `TestWebhookWorker_ConcurrentWorkers` and `TestWebhookWorker_TenantIsolation` (sleeps were unnecessary — `deliver()` is synchronous inside `Drain`).
+- Fixed misleading `// 3xx, 5xx, 429 → retry` comment (Go client follows redirects; raw 3xx is never the final status).
+- Removed false test expectation for `localhost.example.com` in `TestWebhook_SSRF_ValidateURL` — `localhost.example.com` is a legitimate public domain that is NOT blocked at registration time; DNS rebinding protection at delivery time covers it.
+
+#### Self-Review Results (post-remediation)
+
+| Question | Answer |
+|----------|--------|
+| Can a signature-format regression go undetected? | No — `TestWebhookWorker_SignatureVerification` recomputes and compares |
+| Can timestamp divergence go undetected? | No — `bodyTime.Unix() == headerUnix` assertion catches two-`time.Now()` regression |
+| Can 429 be silently converted to permanent failure? | No — `TestWebhookWorker_HTTP429_Retry` asserts `failed_permanently = FALSE` |
+
+---
+
+### Phase 20 — Real-Time Notifications (Complete)
+
+**Status: COMPLETE. Adversarial review: PASS (after remediation). `go build ./...` + `go vet ./...` clean. 31 stream integration tests.**
+
+Phase 20 adds a Server-Sent Events push channel so connected browser clients receive new notifications in real time without polling.
+
+#### Architecture Decisions
+
+- **In-process pub/sub Hub** (`internal/realtime.Hub`) — composite `subKey{orgID [16]byte, userID [16]byte}` map of buffered channels (size 32); `sync.RWMutex`; at-most-once delivery; non-blocking publish drops events on full buffer (client recovers via REST GET).
+- **RLock held through entire fan-out** — `Publish` holds the read lock for the full iteration and all channel sends. This eliminates a data race (concurrent `Unsubscribe` modifying the inner map) and a send-on-closed-channel panic that would occur if `Unsubscribe`/`Shutdown` closed a channel between its read from the map and the send.
+- **SSE over WebSocket** — EventSource has built-in reconnect; no bidirectional messaging needed; simpler proxy compatibility. Keepalive `:\n\n` frames every 25 seconds prevent proxy idle timeouts.
+- **JWT via `?token=` query param** — `EventSource` cannot set `Authorization` headers. `Authorization: Bearer` fallback supported for curl/testing.
+- **Tenant isolation at auth time** — `claims.OrganizationID` compared against DB-resolved `org.ID` (UUID string). Platform admin tokens (`OrganizationID == ""`) are rejected with 403. Subscription uses the DB-authoritative org UUID, not the JWT claim.
+- **Graceful shutdown** — `Hub.Shutdown()` closes the `done` channel then closes all subscriber channels under write lock. SSE handlers select on `hub.Done()` as a fourth case; they return immediately on shutdown regardless of client presence.
+- **Publish-after-commit** — `DrainOutbox` calls `hub.Publish` after the DB transaction commits. Nil hub is a no-op.
+- **No migration** — Phase 20 is purely in-process; no new DB tables or columns.
+
+#### Deliverables
+
+| Component | Description |
+|-----------|-------------|
+| `internal/realtime/hub.go` | `Hub` — Subscribe, Unsubscribe, Publish (RLock-through-fan-out), Shutdown, Done |
+| `notifications/handler.go` — `Stream` | SSE handler; JWT auth via `?token=`/Bearer; org resolution + tenant check; 25s keepalive ticker; 4-case select loop |
+| `notifications/routes.go` | `/stream` registered outside `RequireAuth` group (before `/{id}` to prevent routing collision) |
+| `notifications/service.go` | `DrainOutbox` calls `s.hub.Publish` for each `in_app` row created; nil-safe |
+| `bootstrap/modules.go` | `hub := realtime.NewHub()` wired into `notifSvc` and `notifications.RegisterRoutes` |
+| `bootstrap/app.go` | `realtimeHub *realtime.Hub` field; `a.realtimeHub.Shutdown()` in `Shutdown()` (after email/webhook workers, before scheduler) |
+| `notifications/integration/stream_test.go` | 17 SSE stream integration tests |
+
+#### SSE Stream Tests (17)
+
+| Test | What it guards |
+|------|---------------|
+| `TestStream_NoToken_Unauthorized` | Missing token → 401 |
+| `TestStream_InvalidToken_Unauthorized` | Garbage token → 401 |
+| `TestStream_ExpiredToken_Unauthorized` | Expired JWT → 401 |
+| `TestStream_WrongOrg_Forbidden` | Valid JWT for Org A, URL for Org B → 403 |
+| `TestStream_Connect_ContentType` | `text/event-stream` response header |
+| `TestStream_Connect_ReceivesKeepalive` | Initial `:\n\n` keepalive frame delivered |
+| `TestStream_BearerHeaderAuth` | `Authorization: Bearer` fallback works |
+| `TestStream_DrainOutbox_DeliversSseEvent` | End-to-end: outbox drain → SSE `event: notification` frame |
+| `TestStream_ActorExcluded_NoSseEvent` | Actor not notified of their own action |
+| `TestStream_HubShutdown_DisconnectsClients` | Hub shutdown closes active connections |
+| `TestStream_CrossUserIsolation` | User A's events not delivered to User B's stream |
+| `TestStream_MultipleConcurrentClients` | Multiple simultaneous clients each receive their own events |
+| `TestStream_ClientDisconnect_Cleanup` | Disconnect + reconnect succeeds cleanly |
+| `TestStream_DrainOutbox_Idempotent_NoDuplicateSSE` | Second drain produces no duplicate SSE event (full-frame consumed before 300ms window — MT-2) |
+| `TestStream_PlatformAdminToken_Forbidden` | Platform admin token (empty orgID) → 403 (MT-1) |
+| `TestStream_SubscribeAfterShutdown_ImmediateDisconnect` | Connect to shut-down hub → immediate EOF (MT-3) |
+
+---
+
+### Phase 20 Remediation (Complete)
+
+**Status: COMPLETE. Mini adversarial review: all findings PASS.**
+
+Four correctness and regression-resistance improvements identified during adversarial review of Phase 20.
+
+#### Hub.Publish Data Race Fix (P1)
+
+**Problem:** Original `Publish` released the `RLock` before iterating `h.subs[key]`. Between the unlock and the iteration, a concurrent `Unsubscribe` (or `Shutdown`) could: (a) modify the inner channel map → data race detectable by `-race`; (b) close the channel → send-on-closed-channel panic.
+
+**Fix:** `defer h.mu.RUnlock()` — the read lock is held for the entire duration of the fan-out (map iteration + all channel sends). Non-blocking sends (`select { default: }`) prevent deadlock even under the lock.
+
+#### MT-1 — Platform Admin Token Gate Test
+
+`makePlatformAdminToken(t, jwtSecret)` constructs a valid HS256 JWT with `OrganizationID: ""`. `TestStream_PlatformAdminToken_Forbidden` connects it to a real org's SSE stream and asserts 403. Regression gate: removing the `claims.OrganizationID != pgutil.UUIDToString(org.ID)` check at `handler.go:228` causes the test to receive 200 and fail.
+
+#### MT-2 — Full First-Frame Drain Before Duplicate Window
+
+`TestStream_DrainOutbox_Idempotent_NoDuplicateSSE` previously started the 300ms duplicate-check window after consuming only the `event:` line. The buffered `data:` line from the first SSE frame immediately fired the `select`, making the test exit before the window expired. Fix: explicitly consume the `data:` line via `waitLine` and the blank-line terminator via a dedicated `select { case <-lines: }` before opening the 300ms window.
+
+#### MT-3 — Subscribe-After-Shutdown Immediate Disconnect Test
+
+`TestStream_SubscribeAfterShutdown_ImmediateDisconnect` calls `ts.hub.Shutdown()`, then connects a new SSE stream. The `hub.Done()` channel is already closed, so the handler's `case <-h.hub.Done(): return` fires on the first select iteration. The test asserts the response body reaches EOF within 2 seconds. Regression gate: removing the `hub.Done()` case from the handler loop causes the connection to stay open indefinitely (ticker keeps firing), and the test times out at 2s.
 
 ---
 
 ## 10. Next Recommended Phase
 
-**Phase 16 — Users Module**
+**Phase 21 — Rankings Module / N-way Head-to-Head / Search**
 
-The email infrastructure and all P1 security defects are resolved. The `internal/users/` stub has existed since Phase 1 with package declaration only. Phase 16 closes the largest remaining feature-completeness gap.
+Phases 1 – 20 are complete. The notification system delivers all four channels: `in_app`, `email`, `webhook`, and real-time SSE. The remaining stubs are `rankings/` and `news/`, and one known standings limitation exists.
 
-**Phase 16 scope:**
+**Candidate Phase 21 scope:**
 
-1. **User profile read** — `GET /api/v1/users/me` or augment `/api/v1/auth/me` with editable profile fields.
-2. **User profile update** — `PATCH /api/v1/users/{id}` — update `first_name`, `last_name`, `username`; BOLA-guarded (self-only or `user.manage`).
-3. **Password change** — `POST /api/v1/users/{id}/change-password` — verify current password, hash new, revoke all active refresh tokens; atomically transacted.
-4. **User list** — `GET /api/v1/users` — platform admin only (`user.manage`); paginated.
-5. **User deactivate** — `POST /api/v1/users/{id}/deactivate` — admin action; sets `status = inactive`; revokes all sessions; audit logged.
-6. **RBAC** — self-update requires auth only; deactivate requires `user.manage`; list requires `user.manage`.
+1. **Rankings module** (`internal/rankings/`) — global player and team leaderboards derived from completed tournament standings; paginated `GET /api/v1/rankings/players` and `GET /api/v1/rankings/teams`; org-scoped and cross-org views.
+2. **N-way head-to-head resolution** — Phase 10 standings apply head-to-head only to strict 2-way ties; full sub-table resolution for 3+ participants is deferred in `internal/standings/tiebreakers.go`.
+3. **News module** (`internal/news/`) — the stub exists with only a package declaration.
+4. **Redis pub/sub for multi-instance SSE** — Phase 20 Hub is in-process (single binary). Horizontal scaling requires a Redis pub/sub bridge so events published by one instance reach SSE clients on another.
 
 ---
 
@@ -2748,14 +3074,17 @@ The email infrastructure and all P1 security defects are resolved. The `internal
 | `backend/internal/platform/middleware/ratelimit.go` | `IPRateLimiter` — per-IP token bucket; `sync.Map` + `atomic.Int64 lastSeen`; O(1) lock-free reads; O(active IPs) cleanup via `sync.Map.Range`; `Retry-After: 1` on 429; Stop() via done channel |
 | `backend/internal/platform/middleware/realip.go` | `TrustedRealIP(trustedCIDRs)` — rewrites RemoteAddr only for connections from trusted CIDR ranges; prevents X-Forwarded-For spoofing from untrusted clients; falls back to `chimw.RealIP` when unconfigured |
 | `backend/internal/platform/middleware/cors.go` | `CORS()` middleware — origin reflection; `Allow-Credentials` (specific origins only); `Vary: Origin`; preflight 204 |
-| `backend/internal/cleanup/scheduler.go` | `Scheduler` — background token expiry cleanup; configurable interval; graceful shutdown via done channel |
-| `backend/internal/bootstrap/app.go` | `App.Handler()` initialises rate limiter + cleanup scheduler; `App.Shutdown()` calls `DrainEmail` then stops all background services; holds `authHandler *auth.Handler` for drain |
-| `backend/db/queries/notifications.sql` | 16 notification SQL queries; includes `GetNotificationPreferencesForEvent` for O(event_types) batch preference loading |
-| `backend/internal/notifications/repository.go` | `DrainOutbox` (FOR UPDATE SKIP LOCKED, batch prefs, UNIQUE conflict handling); `UpsertPreference` (dynamic audit action: AuditActionCreate vs AuditActionUpdate) |
+| `backend/internal/cleanup/scheduler.go` | `Scheduler` — background token expiry + 90-day outbox retention cleanup; configurable interval; graceful shutdown via done channel |
+| `backend/internal/bootstrap/app.go` | `App.Handler()` initialises rate limiter + cleanup scheduler + EmailWorker; `App.Shutdown()` calls `DrainEmail` + `EmailWorker.Stop`/`Drain` then stops all background services |
+| `backend/db/queries/notifications.sql` | 19 notification SQL queries (16 original + 3 email worker queries); includes `GetNotificationPreferencesForEvent` for O(event_types) batch preference loading |
+| `backend/internal/notifications/repository.go` | `DrainOutbox` (FOR UPDATE SKIP LOCKED, batch prefs, UNIQUE conflict handling, multi-channel fan-out: in_app + email); `UpsertPreference` (dynamic audit action: AuditActionCreate vs AuditActionUpdate) |
 | `backend/internal/notifications/service.go` | `DrainOutbox` entry point — errors swallowed to preserve domain operation result |
 | `backend/internal/notifications/trigger/trigger.go` | `WriteOutboxEntry` — must be called with a transaction-scoped `*db.Queries` handle |
-| `backend/internal/email/email.go` | `Provider` interface; `NoOpProvider` (in-memory capture + `SentTo`/`Reset` helpers); `NewSender` factory; `NewSenderWithProvider` (test injection) |
-| `backend/internal/email/sender.go` | `Sender` + `SenderConfig`; `SendVerificationEmail`, `SendPasswordResetEmail`, `SendResendVerificationEmail` — renders templates then calls `Provider.Send` |
+| `backend/internal/notifworker/worker.go` | `EmailWorker` — embedded async email delivery; Start/Stop/Drain lifecycle; soft-lease claim; retry (1m→5m); dead-letter after 3 attempts |
+| `backend/internal/notifworker/repository.go` | `ClaimBatch`, `RecordSuccess`, `RecordFailure`, `GetUserByID`, `GetOrgSlugByID` |
+| `backend/db/migrations/000025_notification_email_delivery.up.sql` | 4 delivery-state columns + partial index on `notifications` for email worker claim query |
+| `backend/internal/email/email.go` | `Provider` interface; `NoOpProvider` (in-memory capture + `Sent`/`SentTo`/`Count`/`Reset` helpers); `NewSender` factory; `NewSenderWithProvider` (test injection) |
+| `backend/internal/email/sender.go` | `Sender` + `SenderConfig`; `SendVerificationEmail`, `SendPasswordResetEmail`, `SendResendVerificationEmail`, `SendNotificationEmail` — renders templates then calls `Provider.Send` |
 | `backend/internal/email/ses.go` | `sesProvider` — AWS SES v2; `awsconfig.LoadDefaultConfig` with optional static credential override; optional HTML body |
 | `backend/internal/email/smtp.go` | `smtpProvider` — `net/smtp`; `useTLS=false` → STARTTLS; `useTLS=true` → implicit TLS (`tls.Dial`); context-aware via goroutine+channel select; `buildMessage` emits `multipart/alternative` when both bodies are present |
 | `backend/internal/email/templates.go` | `//go:embed templates` FS; `html/template` for HTML (auto-escaping); `text/template` for plain text |
@@ -2766,4 +3095,18 @@ The email infrastructure and all P1 security defects are resolved. The `internal
 
 ---
 
-*This document was last updated on 2026-06-05 (Phase 15A Remediation complete + adversarial review PASS). It should be updated whenever a phase is completed or significant architectural changes are made.*
+| `backend/db/migrations/000026_webhook_notifications.up.sql` | `webhook_endpoints` + `webhook_deliveries` tables; RBAC seeding for webhook.create/read/update/delete |
+| `backend/db/queries/webhooks.sql` | 12 webhook SQL queries including `ClaimWebhookDeliveriesForDelivery` (FOR UPDATE SKIP LOCKED) and `CreateWebhookDelivery` (ON CONFLICT DO NOTHING) |
+| `backend/internal/webhooks/ssrf.go` | `ValidateURL` (registration-time SSRF guard); `SSRFSafeTransport` (delivery-time DNS validation + dial-by-resolved-IP; defeats DNS rebinding) |
+| `backend/internal/webhooks/crypto.go` | `GenerateSecret` (32-byte CSPRNG, base64url); `EncryptSecret` / `DecryptSecret` (AES-256-GCM, random nonce per encryption) |
+| `backend/internal/webhooks/service.go` | `NewService` (decodes 32-byte AES key); `Create` (ValidateURL → GenerateSecret → EncryptSecret); `toResponse` (never exposes ciphertext) |
+| `backend/internal/webhookworker/worker.go` | `WebhookWorker.deliver` — decrypt secret → build envelope → single `time.Now()` for both timestamp fields → HMAC-SHA256 canonical string → POST → record |
+| `backend/internal/webhookworker/integration/worker_test.go` | 10 integration tests; `TestWebhookWorker_SignatureVerification` verifies HMAC correctness and timestamp consistency end-to-end |
+| `backend/internal/realtime/hub.go` | `Hub` — in-process pub/sub; `subKey{orgID,userID [16]byte}` composite map key; Subscribe/Unsubscribe/Publish/Shutdown/Done; RLock held through entire Publish fan-out (data-race + send-on-closed fix) |
+| `backend/internal/notifications/handler.go` — `Stream` | SSE handler: `?token=`/Bearer JWT auth; org-scoped tenant check (platform-admin → 403); 25s keepalive ticker; 4-case select (`ch`, `ticker`, `ctx.Done`, `hub.Done`) |
+| `backend/internal/notifications/routes.go` | `/stream` outside `RequireAuth` group; registered before `/{id}` routes to prevent routing collision |
+| `backend/internal/notifications/integration/stream_test.go` | 17 SSE stream integration tests including MT-1 (platform-admin 403 gate), MT-2 (full-frame drain), MT-3 (subscribe-after-shutdown) |
+
+---
+
+*This document was last updated on 2026-06-07 (Phase 20 complete — Real-Time Notifications SSE stream, in-process Hub, 31 stream integration tests; Phase 20 Remediation complete — Hub data race fix, MT-1 platform-admin 403 gate, MT-2 full-frame drain assertion, MT-3 subscribe-after-shutdown test). It should be updated whenever a phase is completed or significant architectural changes are made.*

@@ -60,7 +60,7 @@ func TestTournament_Create_InvalidCountry(t *testing.T) {
 }
 
 // TestTournament_Create_InvalidStatusTransition verifies advancing from draft to ongoing
-// (skipping registration_open) returns 400.
+// (skipping registration_open) returns 422.
 func TestTournament_Create_InvalidStatusTransition(t *testing.T) {
 	ts := buildTestServer(t, testPool)
 	actor := setupUserAndOrg(t, ts, "org_owner")
@@ -78,7 +78,7 @@ func TestTournament_Create_InvalidStatusTransition(t *testing.T) {
 		"status": "ongoing",
 	}, bearerHeader(actor.token))
 	defer resp.Body.Close()
-	assertStatus(t, resp, http.StatusBadRequest)
+	assertStatus(t, resp, http.StatusUnprocessableEntity)
 }
 
 // TestTournament_Create_MalformedJSON verifies syntactically invalid body returns 400.

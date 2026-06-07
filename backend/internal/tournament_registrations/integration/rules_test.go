@@ -214,5 +214,5 @@ func TestRegistration_Rule_InvalidStatusTransition(t *testing.T) {
 		map[string]any{"status": "approved"},
 		bearerHeader(actor.token))
 	defer resp.Body.Close()
-	assertStatus(t, resp, http.StatusBadRequest)
+	assertStatus(t, resp, http.StatusUnprocessableEntity)
 }

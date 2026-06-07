@@ -65,7 +65,7 @@ func buildTestServer(t testing.TB, pool *pgxpool.Pool) *testServer {
 	authz := auth.NewAuthorizationService(queries)
 
 	notifRepo := notifications.NewRepository(queries, pool)
-	notifSvc := notifications.NewService(notifRepo, logger)
+	notifSvc := notifications.NewService(notifRepo, nil, logger)
 
 	r := chi.NewRouter()
 	r.Use(chimw.RequestID)

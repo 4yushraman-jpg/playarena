@@ -43,7 +43,7 @@ func TestMatch_Create_MalformedJSON(t *testing.T) {
 }
 
 // TestMatch_Create_TournamentNotOngoing verifies creating a match for a non-ongoing
-// tournament returns 400.
+// tournament returns 422.
 func TestMatch_Create_TournamentNotOngoing(t *testing.T) {
 	ts := buildTestServer(t, testPool)
 	actor := setupUserAndOrg(t, ts, "org_owner")
@@ -67,11 +67,11 @@ func TestMatch_Create_TournamentNotOngoing(t *testing.T) {
 		"scheduled_at":  scheduledAt(),
 	}, bearerHeader(actor.token))
 	defer resp.Body.Close()
-	assertStatus(t, resp, http.StatusBadRequest)
+	assertStatus(t, resp, http.StatusUnprocessableEntity)
 }
 
 // TestMatch_StatusTransition_Invalid verifies an invalid transition (scheduled→completed)
-// returns 400.
+// returns 422.
 func TestMatch_StatusTransition_Invalid(t *testing.T) {
 	ts := buildTestServer(t, testPool)
 	actor := setupUserAndOrg(t, ts, "org_owner")
@@ -87,5 +87,5 @@ func TestMatch_StatusTransition_Invalid(t *testing.T) {
 		"status": "completed",
 	}, bearerHeader(actor.token))
 	defer resp.Body.Close()
-	assertStatus(t, resp, http.StatusBadRequest)
+	assertStatus(t, resp, http.StatusUnprocessableEntity)
 }

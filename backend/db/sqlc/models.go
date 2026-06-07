@@ -1371,3 +1371,35 @@ type UserOrganizationRole struct {
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
 }
+
+// Endpoint-centric delivery queue for webhook notifications. One row per (outbox_id, endpoint_id). Fan-out performed by DrainOutbox.
+type WebhookDelivery struct {
+	ID                pgtype.UUID           `json:"id"`
+	OrganizationID    pgtype.UUID           `json:"organization_id"`
+	EndpointID        pgtype.UUID           `json:"endpoint_id"`
+	OutboxID          pgtype.UUID           `json:"outbox_id"`
+	EventType         NotificationEventType `json:"event_type"`
+	EntityType        string                `json:"entity_type"`
+	EntityID          pgtype.UUID           `json:"entity_id"`
+	Payload           []byte                `json:"payload"`
+	AttemptCount      int32                 `json:"attempt_count"`
+	LastAttemptedAt   pgtype.Timestamptz    `json:"last_attempted_at"`
+	LeaseExpiresAt    pgtype.Timestamptz    `json:"lease_expires_at"`
+	SentAt            pgtype.Timestamptz    `json:"sent_at"`
+	FailedPermanently bool                  `json:"failed_permanently"`
+	CreatedAt         pgtype.Timestamptz    `json:"created_at"`
+}
+
+// Registered webhook endpoints per organization. SSRF-safe: URL is validated at registration time and re-validated at delivery.
+type WebhookEndpoint struct {
+	ID             pgtype.UUID `json:"id"`
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	Url            string      `json:"url"`
+	// AES-256-GCM encrypted webhook secret (nonce prepended). Raw secret is returned once on creation, stored encrypted, never exposed again.
+	SecretCiphertext []byte             `json:"secret_ciphertext"`
+	Description      *string            `json:"description"`
+	Active           bool               `json:"active"`
+	CreatedBy        pgtype.UUID        `json:"created_by"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
+}

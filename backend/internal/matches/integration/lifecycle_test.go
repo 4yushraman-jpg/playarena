@@ -159,11 +159,10 @@ func TestMatch_StatusTransition_LiveToCompleted(t *testing.T) {
 	match := fixtures.CreateLiveMatch(ctx, t, ts.pool, orgUID,
 		setup.Tournament.ID, setup.HomeTeam.ID, setup.AwayTeam.ID)
 	matchID := pgutil.UUIDToString(match.ID)
-	homeTeamID := pgutil.UUIDToString(setup.HomeTeam.ID)
 
+	// Complete with no winner: scores computed from events = 0-0 (draw), so no winner is set.
 	resp := ts.patch(t, matchURL(actor.orgSlug, matchID), map[string]any{
-		"status":         "completed",
-		"winner_team_id": homeTeamID,
+		"status": "completed",
 	}, bearerHeader(actor.token))
 	defer resp.Body.Close()
 	assertStatus(t, resp, http.StatusOK)
@@ -172,9 +171,6 @@ func TestMatch_StatusTransition_LiveToCompleted(t *testing.T) {
 	decodeBody(t, resp, &got)
 	if got.Status != "completed" {
 		t.Errorf("status = %q, want completed", got.Status)
-	}
-	if got.WinnerTeamID == nil || *got.WinnerTeamID != homeTeamID {
-		t.Errorf("winner_team_id = %v, want %q", got.WinnerTeamID, homeTeamID)
 	}
 }
 

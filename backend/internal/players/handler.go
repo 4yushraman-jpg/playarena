@@ -9,6 +9,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
 
+	db "github.com/4yushraman-jpg/playarena/db/sqlc"
 	"github.com/4yushraman-jpg/playarena/internal/auth"
 	"github.com/4yushraman-jpg/playarena/internal/platform/response"
 	"github.com/4yushraman-jpg/playarena/internal/platform/validator"
@@ -82,7 +83,14 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if v := r.URL.Query().Get("status"); v != "" {
-		params.StatusFilter = &v
+		switch db.PlayerStatus(v) {
+		case db.PlayerStatusActive, db.PlayerStatusInactive,
+			db.PlayerStatusInjured, db.PlayerStatusSuspended:
+			params.StatusFilter = &v
+		default:
+			response.Error(w, http.StatusUnprocessableEntity, "invalid status filter: must be one of active, inactive, injured, suspended")
+			return
+		}
 	}
 	if v := r.URL.Query().Get("search"); v != "" {
 		params.Search = &v

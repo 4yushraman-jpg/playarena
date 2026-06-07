@@ -236,7 +236,6 @@ type prefKey struct {
 }
 
 // drainChannels lists the channels DrainOutbox fans out to synchronously.
-// Webhook delivery is deferred to Phase 19.
 var drainChannels = []db.NotificationChannel{
 	db.NotificationChannelInApp,
 	db.NotificationChannelEmail,
@@ -247,24 +246,26 @@ var drainChannels = []db.NotificationChannel{
 // org members (filtered per-channel by preferences), and marks each entry
 // processed.
 //
+// Returns all newly-created in_app notification rows so the caller can publish
+// SSE events after the transaction commits (publish-after-commit).
+//
 // sent_at semantics:
 //
 //	in_app: set to NOW() — delivered synchronously via the inbox API.
-//	email:  left NULL   — pending async delivery by EmailWorker (Phase 18).
+//	email:  left NULL   — pending async delivery by EmailWorker.
 //
 // Called synchronously by domain services after their transaction commits.
-// Safe to retry: UNIQUE (outbox_id, user_id, channel) on notifications plus
-// ON CONFLICT DO NOTHING makes every drain idempotent.
+// Safe to retry: ON CONFLICT (outbox_id, user_id, channel) DO NOTHING in the
+// INSERT makes every drain idempotent; pgx returns pgx.ErrNoRows on conflict,
+// which DrainOutbox treats as "already drained" and skips.
 //
 // Preference resolution complexity:
 //
-//	O(unique event-type/channel pairs) SQL queries — typically O(2) because
-//	a single drain call for one domain operation contains at most 1–2 distinct
-//	event types and we now load preferences for both in_app and email channels.
-func (r *Repository) DrainOutbox(ctx context.Context, orgID pgtype.UUID) error {
+//	O(unique event-type/channel pairs) SQL queries — typically O(2).
+func (r *Repository) DrainOutbox(ctx context.Context, orgID pgtype.UUID) ([]db.Notification, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
@@ -273,17 +274,17 @@ func (r *Repository) DrainOutbox(ctx context.Context, orgID pgtype.UUID) error {
 	// Claim pending entries (SKIP LOCKED: concurrent drains on same org skip).
 	entries, err := qtx.DrainOutboxEntries(ctx, orgID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if len(entries) == 0 {
-		return tx.Commit(ctx)
+		return nil, tx.Commit(ctx)
 	}
 
 	// Get all current org members for fan-out.
 	// members is []pgtype.UUID — one element per distinct user with a role in the org.
 	members, err := qtx.GetOrgMembersForNotification(ctx, orgID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// ── Batch preference loading ───────────────────────────────────────────────
@@ -308,7 +309,7 @@ func (r *Repository) DrainOutbox(ctx context.Context, orgID pgtype.UUID) error {
 				Channel:        ch,
 			})
 			if err != nil {
-				return err
+				return nil, err
 			}
 			userMap := make(map[[16]byte]bool, len(rows))
 			for _, row := range rows {
@@ -318,6 +319,8 @@ func (r *Repository) DrainOutbox(ctx context.Context, orgID pgtype.UUID) error {
 		}
 	}
 	// ── end batch preference loading ───────────────────────────────────────────
+
+	var created []db.Notification
 
 	for _, entry := range entries {
 		for _, memberUID := range members {
@@ -347,7 +350,7 @@ func (r *Repository) DrainOutbox(ctx context.Context, orgID pgtype.UUID) error {
 					sentAt = pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true}
 				}
 
-				insertErr := qtx.CreateNotification(ctx, db.CreateNotificationParams{
+				n, insertErr := qtx.CreateNotification(ctx, db.CreateNotificationParams{
 					OrganizationID: entry.OrganizationID,
 					UserID:         memberUID,
 					OutboxID:       entry.ID,
@@ -359,22 +362,54 @@ func (r *Repository) DrainOutbox(ctx context.Context, orgID pgtype.UUID) error {
 					SentAt:         sentAt,
 				})
 				if insertErr != nil {
-					// Idempotency: unique constraint means this was already drained.
-					if pgutil.IsUniqueViolation(insertErr, "uq_notifications_outbox_user_channel") {
+					// ON CONFLICT DO NOTHING → already drained (idempotent path).
+					if insertErr == pgx.ErrNoRows {
 						continue
 					}
-					return insertErr
+					return nil, insertErr
+				}
+				// Collect newly-created in_app rows for SSE publishing after commit.
+				if ch == db.NotificationChannelInApp {
+					created = append(created, n)
 				}
 			}
 		}
 
+		// ── webhook fan-out ───────────────────────────────────────────────────
+		// Insert one webhook_deliveries row per active endpoint in the org.
+		// ON CONFLICT DO NOTHING in CreateWebhookDelivery makes retries idempotent.
+		endpoints, err := qtx.GetActiveWebhookEndpointsForOrg(ctx, orgID)
+		if err != nil {
+			return nil, err
+		}
+		for _, ep := range endpoints {
+			_, createErr := qtx.CreateWebhookDelivery(ctx, db.CreateWebhookDeliveryParams{
+				OrganizationID: entry.OrganizationID,
+				EndpointID:     ep.ID,
+				OutboxID:       entry.ID,
+				EventType:      entry.EventType,
+				EntityType:     entry.EntityType,
+				EntityID:       entry.EntityID,
+				Payload:        entry.Payload,
+			})
+			// ON CONFLICT DO NOTHING returns pgx.ErrNoRows when the row already exists.
+			// This is the idempotency path — not an error.
+			if createErr != nil && createErr != pgx.ErrNoRows {
+				return nil, createErr
+			}
+		}
+		// ── end webhook fan-out ───────────────────────────────────────────────
+
 		// Mark outbox entry processed.
 		if err := qtx.MarkOutboxEntryProcessed(ctx, entry.ID); err != nil {
-			return err
+			return nil, err
 		}
 	}
 
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return created, nil
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────

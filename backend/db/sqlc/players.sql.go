@@ -15,8 +15,8 @@ const countPlayersByOrganization = `-- name: CountPlayersByOrganization :one
 SELECT COUNT(*)
 FROM   players
 WHERE  organization_id = $1
-  AND  status            != 'inactive'
-  AND  ($2::text IS NULL OR status::text = $2)
+  AND  ($2::text IS NOT NULL OR status != 'inactive')
+  AND  ($2::text IS NULL     OR status::text = $2)
   AND  ($3::text  IS NULL OR display_name ILIKE '%' || $3 || '%')
 `
 
@@ -193,8 +193,8 @@ const listPlayersPaginated = `-- name: ListPlayersPaginated :many
 SELECT id, organization_id, user_id, display_name, jersey_number, position, height_cm, weight_kg, dominant_hand, nationality, date_of_birth, status, bio, metadata, created_at, updated_at
 FROM   players
 WHERE  organization_id = $1
-  AND  status            != 'inactive'
-  AND  ($2::text IS NULL OR status::text = $2)
+  AND  ($2::text IS NOT NULL OR status != 'inactive')
+  AND  ($2::text IS NULL     OR status::text = $2)
   AND  ($3::text  IS NULL OR display_name ILIKE '%' || $3 || '%')
 ORDER  BY display_name ASC
 LIMIT  $5

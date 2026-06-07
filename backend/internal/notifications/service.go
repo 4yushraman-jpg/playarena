@@ -11,17 +11,19 @@ import (
 
 	db "github.com/4yushraman-jpg/playarena/db/sqlc"
 	"github.com/4yushraman-jpg/playarena/internal/platform/pgutil"
+	"github.com/4yushraman-jpg/playarena/internal/realtime"
 )
 
 // Service implements the notifications use-cases.
 type Service struct {
 	repo *Repository
+	hub  *realtime.Hub
 	log  *slog.Logger
 }
 
-// NewService constructs a Service.
-func NewService(repo *Repository, log *slog.Logger) *Service {
-	return &Service{repo: repo, log: log}
+// NewService constructs a Service. hub may be nil (SSE publishing is a no-op).
+func NewService(repo *Repository, hub *realtime.Hub, log *slog.Logger) *Service {
+	return &Service{repo: repo, hub: hub, log: log}
 }
 
 // ── public API methods ────────────────────────────────────────────────────────
@@ -223,17 +225,26 @@ func (s *Service) UpdatePreference(
 
 // ── DrainOutbox (called by domain services post-commit) ───────────────────────
 
-// DrainOutbox fans out pending outbox entries for the org into in_app notifications.
-// Called synchronously by domain services (matches, tournaments, registrations)
-// immediately after their domain transactions commit.
+// DrainOutbox fans out pending outbox entries for the org into in_app and email
+// notifications, then publishes SSE events for newly-created in_app rows.
+// Called synchronously by domain services immediately after their commit.
 // Errors are logged but not propagated: drain failure must not fail the domain
-// operation that already committed.
+// operation that already committed. SSE publish is best-effort (at-most-once).
 func (s *Service) DrainOutbox(ctx context.Context, orgID pgtype.UUID, log *slog.Logger) {
-	if err := s.repo.DrainOutbox(ctx, orgID); err != nil {
+	created, err := s.repo.DrainOutbox(ctx, orgID)
+	if err != nil {
 		log.Error("notifications: DrainOutbox failed",
 			slog.String("org_id", pgutil.UUIDToString(orgID)),
 			slog.Any("error", err),
 		)
+		return
+	}
+	if s.hub == nil || len(created) == 0 {
+		return
+	}
+	for i := range created {
+		n := &created[i]
+		s.hub.Publish(n.OrganizationID, n.UserID, notificationToResponse(n))
 	}
 }
 

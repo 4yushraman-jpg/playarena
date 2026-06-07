@@ -9,12 +9,12 @@ import (
 // payload returns 201 and a body containing id, name, slug, type, and status.
 func TestOrg_Create_Success(t *testing.T) {
 	ts := buildTestServer(t, testPool)
-	actor := setupUserAndOrg(t, ts, "org_owner")
+	adminToken := setupPlatformAdmin(t, ts)
 
 	resp := ts.postWithHeaders(t, "/api/v1/organizations", map[string]any{
 		"name": "Kabaddi Warriors",
 		"type": "club",
-	}, bearerHeader(actor.token))
+	}, bearerHeader(adminToken))
 	defer resp.Body.Close()
 	assertStatus(t, resp, http.StatusCreated)
 
@@ -38,13 +38,13 @@ func TestOrg_Create_Success(t *testing.T) {
 // name receive unique slugs (name-2 suffix appended).
 func TestOrg_Create_SlugCollision(t *testing.T) {
 	ts := buildTestServer(t, testPool)
-	actor := setupUserAndOrg(t, ts, "org_owner")
+	adminToken := setupPlatformAdmin(t, ts)
 
 	createOrg := func() orgResponse {
 		resp := ts.postWithHeaders(t, "/api/v1/organizations", map[string]any{
 			"name": "Slug Collision Test Org",
 			"type": "club",
-		}, bearerHeader(actor.token))
+		}, bearerHeader(adminToken))
 		defer resp.Body.Close()
 		assertStatus(t, resp, http.StatusCreated)
 		var body orgResponse
@@ -65,13 +65,14 @@ func TestOrg_Create_SlugCollision(t *testing.T) {
 func TestOrg_List_ReturnsPaginated(t *testing.T) {
 	ts := buildTestServer(t, testPool)
 	actor := setupUserAndOrg(t, ts, "org_owner")
+	adminToken := setupPlatformAdmin(t, ts)
 
 	// Create two additional orgs beyond the one already created in setup.
 	for range 2 {
 		resp := ts.postWithHeaders(t, "/api/v1/organizations", map[string]any{
 			"name": "List Test Org",
 			"type": "federation",
-		}, bearerHeader(actor.token))
+		}, bearerHeader(adminToken))
 		resp.Body.Close()
 	}
 

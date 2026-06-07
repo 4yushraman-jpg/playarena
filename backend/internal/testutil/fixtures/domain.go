@@ -300,8 +300,8 @@ func CreateApprovedRegistration(ctx context.Context, t testing.TB, pool *pgxpool
 
 	var reg db.TournamentRegistration
 	err := pool.QueryRow(ctx, `
-		INSERT INTO tournament_registrations (id, tournament_id, organization_id, team_id, status, registered_by, registered_at)
-		VALUES ($1, $2, $3, $4, 'approved', $3, NOW())
+		INSERT INTO tournament_registrations (id, tournament_id, organization_id, team_id, status, registered_at)
+		VALUES ($1, $2, $3, $4, 'approved', NOW())
 		RETURNING id, tournament_id, organization_id, team_id, player_id, seed_number, status,
 		          registered_by, registered_at, approved_by, approved_at, notes, metadata, created_at, updated_at`,
 		uid, tournamentID, orgID, teamID,

@@ -12,11 +12,13 @@ import (
 	"github.com/4yushraman-jpg/playarena/internal/notifworker"
 	"github.com/4yushraman-jpg/playarena/internal/platform/config"
 	"github.com/4yushraman-jpg/playarena/internal/platform/middleware"
+	"github.com/4yushraman-jpg/playarena/internal/realtime"
+	"github.com/4yushraman-jpg/playarena/internal/webhookworker"
 )
 
 // NewRouter builds and returns the fully-configured application HTTP router,
-// the auth Handler (needed for DrainEmail on graceful shutdown), and the
-// EmailWorker (needed for Stop/Drain on graceful shutdown).
+// the auth Handler (needed for DrainEmail on graceful shutdown), the
+// EmailWorker, WebhookWorker, and realtime Hub (all needed for graceful shutdown).
 //
 // authLimiter — per-IP rate limiter for /api/v1/auth/* (most restrictive)
 // writeLimiter — per-IP rate limiter for domain write endpoints (POST/PATCH/DELETE)
@@ -29,7 +31,7 @@ func NewRouter(
 	authLimiter *middleware.IPRateLimiter,
 	writeLimiter *middleware.IPRateLimiter,
 	mediaLimiter *middleware.IPRateLimiter,
-) (http.Handler, *auth.Handler, *notifworker.EmailWorker) {
+) (http.Handler, *auth.Handler, *notifworker.EmailWorker, *webhookworker.WebhookWorker, *realtime.Hub) {
 	r := chi.NewRouter()
 
 	r.Use(chimw.RequestID)                                 // Attaches X-Request-ID to every request/response
@@ -38,7 +40,7 @@ func NewRouter(
 	r.Use(middleware.RequestLogger(log))                   // Structured per-request logging via slog
 	r.Use(middleware.CORS(cfg.CORSAllowedOrigins))         // Cross-Origin Resource Sharing headers
 
-	authHandler, emailWorker := registerModules(r, db, log, cfg, authLimiter, writeLimiter, mediaLimiter)
+	authHandler, emailWorker, webhookWorker, hub := registerModules(r, db, log, cfg, authLimiter, writeLimiter, mediaLimiter)
 
-	return r, authHandler, emailWorker
+	return r, authHandler, emailWorker, webhookWorker, hub
 }

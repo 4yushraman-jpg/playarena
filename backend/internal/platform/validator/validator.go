@@ -99,6 +99,11 @@ func validateStruct(v any) error {
 			jsonName = sf.Name
 		}
 
+		// Nil pointer fields have no value — skip all validation rules for them.
+		if fv.Kind() == reflect.Ptr && fv.IsNil() {
+			continue
+		}
+
 		val := fmt.Sprintf("%v", fv.Interface())
 		rules := strings.Split(tag, ",")
 

@@ -105,7 +105,7 @@ func (q *Queries) CountNotificationsByUser(ctx context.Context, arg CountNotific
 	return count, err
 }
 
-const createNotification = `-- name: CreateNotification :exec
+const createNotification = `-- name: CreateNotification :one
 
 INSERT INTO notifications (
     organization_id,
@@ -119,6 +119,8 @@ INSERT INTO notifications (
     sent_at
 )
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+ON CONFLICT (outbox_id, user_id, channel) DO NOTHING
+RETURNING id, organization_id, user_id, outbox_id, channel, event_type, entity_type, entity_id, payload, read_at, sent_at, deleted_at, created_at, attempt_count, last_attempted_at, lease_expires_at, failed_permanently
 `
 
 type CreateNotificationParams struct {
@@ -136,10 +138,11 @@ type CreateNotificationParams struct {
 // =============================================================================
 // NOTIFICATION QUERIES (used by the notifications service / handler)
 // =============================================================================
-// Written ONLY by DrainOutbox. ON CONFLICT DO NOTHING is applied at the
-// application layer to make drain retries idempotent.
-func (q *Queries) CreateNotification(ctx context.Context, arg CreateNotificationParams) error {
-	_, err := q.db.Exec(ctx, createNotification,
+// Written ONLY by DrainOutbox. ON CONFLICT DO NOTHING makes drain retries
+// idempotent; pgx returns pgx.ErrNoRows when the conflict suppresses the insert,
+// which the caller treats as "already drained" and skips.
+func (q *Queries) CreateNotification(ctx context.Context, arg CreateNotificationParams) (Notification, error) {
+	row := q.db.QueryRow(ctx, createNotification,
 		arg.OrganizationID,
 		arg.UserID,
 		arg.OutboxID,
@@ -150,7 +153,27 @@ func (q *Queries) CreateNotification(ctx context.Context, arg CreateNotification
 		arg.Payload,
 		arg.SentAt,
 	)
-	return err
+	var i Notification
+	err := row.Scan(
+		&i.ID,
+		&i.OrganizationID,
+		&i.UserID,
+		&i.OutboxID,
+		&i.Channel,
+		&i.EventType,
+		&i.EntityType,
+		&i.EntityID,
+		&i.Payload,
+		&i.ReadAt,
+		&i.SentAt,
+		&i.DeletedAt,
+		&i.CreatedAt,
+		&i.AttemptCount,
+		&i.LastAttemptedAt,
+		&i.LeaseExpiresAt,
+		&i.FailedPermanently,
+	)
+	return i, err
 }
 
 const createNotificationOutboxEntry = `-- name: CreateNotificationOutboxEntry :one

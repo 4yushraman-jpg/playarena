@@ -64,13 +64,15 @@ WHERE  id              = $1
 RETURNING *;
 
 -- name: ListPlayersPaginated :many
--- Returns non-inactive players for an org with optional status and name
--- search filters. Soft-deleted (inactive) players are excluded by default.
+-- Returns players for an org with optional status and name search filters.
+-- When no status_filter is given, inactive (soft-deleted) players are excluded.
+-- When status_filter is provided, it overrides the default exclusion so callers
+-- can explicitly request inactive players.
 SELECT *
 FROM   players
 WHERE  organization_id = sqlc.arg(organization_id)
-  AND  status            != 'inactive'
-  AND  (sqlc.narg(status_filter)::text IS NULL OR status::text = sqlc.narg(status_filter))
+  AND  (sqlc.narg(status_filter)::text IS NOT NULL OR status != 'inactive')
+  AND  (sqlc.narg(status_filter)::text IS NULL     OR status::text = sqlc.narg(status_filter))
   AND  (sqlc.narg(search_query)::text  IS NULL OR display_name ILIKE '%' || sqlc.narg(search_query) || '%')
 ORDER  BY display_name ASC
 LIMIT  sqlc.arg(page_limit)
@@ -82,6 +84,6 @@ OFFSET sqlc.arg(page_offset);
 SELECT COUNT(*)
 FROM   players
 WHERE  organization_id = sqlc.arg(organization_id)
-  AND  status            != 'inactive'
-  AND  (sqlc.narg(status_filter)::text IS NULL OR status::text = sqlc.narg(status_filter))
+  AND  (sqlc.narg(status_filter)::text IS NOT NULL OR status != 'inactive')
+  AND  (sqlc.narg(status_filter)::text IS NULL     OR status::text = sqlc.narg(status_filter))
   AND  (sqlc.narg(search_query)::text  IS NULL OR display_name ILIKE '%' || sqlc.narg(search_query) || '%');

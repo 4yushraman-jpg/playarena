@@ -65,7 +65,10 @@ func (s *Scheduler) run() {
 	}
 }
 
-const outboxRetentionDays = 90
+const (
+	outboxRetentionDays          = 90
+	webhookDeliveryRetentionDays = 30
+)
 
 // runOnce executes all cleanup queries with a 30-second timeout.
 // Each query is independent — a failure in one does not prevent the others.
@@ -93,6 +96,14 @@ func (s *Scheduler) runOnce() {
 	}
 	if err := s.queries.DeleteOldProcessedOutboxEntries(ctx, outboxCutoff); err != nil {
 		s.log.Error("cleanup: delete old processed outbox entries", slog.Any("error", err))
+	}
+
+	webhookCutoff := pgtype.Timestamptz{
+		Time:  time.Now().AddDate(0, 0, -webhookDeliveryRetentionDays),
+		Valid: true,
+	}
+	if err := s.queries.DeleteOldWebhookDeliveries(ctx, webhookCutoff); err != nil {
+		s.log.Error("cleanup: delete old webhook deliveries", slog.Any("error", err))
 	}
 
 	s.log.Info("cleanup: cycle complete",
