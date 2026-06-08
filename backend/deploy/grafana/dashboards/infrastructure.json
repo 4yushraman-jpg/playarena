@@ -1,0 +1,80 @@
+{
+  "uid": "playarena-infrastructure",
+  "title": "PlayArena — Infrastructure",
+  "tags": ["playarena"],
+  "timezone": "browser",
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "panels": [
+    {
+      "id": 1,
+      "title": "DB Pool — Open / Acquired / Idle",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "targets": [
+        {"expr": "playarena_db_pool_open_connections", "legendFormat": "open"},
+        {"expr": "playarena_db_pool_acquired_connections", "legendFormat": "acquired"},
+        {"expr": "playarena_db_pool_idle_connections", "legendFormat": "idle"},
+        {"expr": "playarena_db_pool_constructing_connections", "legendFormat": "constructing"}
+      ]
+    },
+    {
+      "id": 2,
+      "title": "DB Pool Utilization %",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "targets": [{
+        "expr": "playarena_db_pool_acquired_connections / playarena_db_pool_max_connections",
+        "legendFormat": "utilization"
+      }]
+    },
+    {
+      "id": 3,
+      "title": "DB Pool Empty Acquire Rate",
+      "type": "timeseries",
+      "gridPos": {"h": 6, "w": 12, "x": 0, "y": 8},
+      "targets": [{
+        "expr": "rate(playarena_db_pool_empty_acquire_total[1m])",
+        "legendFormat": "empty acquires/s"
+      }]
+    },
+    {
+      "id": 4,
+      "title": "Go Goroutines",
+      "type": "timeseries",
+      "gridPos": {"h": 6, "w": 12, "x": 12, "y": 8},
+      "targets": [{"expr": "go_goroutines", "legendFormat": "goroutines"}]
+    },
+    {
+      "id": 5,
+      "title": "Go Heap In-Use (bytes)",
+      "type": "timeseries",
+      "gridPos": {"h": 6, "w": 12, "x": 0, "y": 14},
+      "targets": [{"expr": "go_memstats_heap_inuse_bytes", "legendFormat": "heap in-use"}]
+    },
+    {
+      "id": 6,
+      "title": "GC Pause Duration (p99)",
+      "type": "timeseries",
+      "gridPos": {"h": 6, "w": 12, "x": 12, "y": 14},
+      "targets": [{
+        "expr": "histogram_quantile(0.99, sum by (le) (rate(go_gc_duration_seconds_bucket[5m])))",
+        "legendFormat": "p99 gc pause"
+      }]
+    },
+    {
+      "id": 7,
+      "title": "Process CPU Seconds / sec",
+      "type": "timeseries",
+      "gridPos": {"h": 6, "w": 12, "x": 0, "y": 20},
+      "targets": [{"expr": "rate(process_cpu_seconds_total[1m])", "legendFormat": "cpu"}]
+    },
+    {
+      "id": 8,
+      "title": "Process Resident Memory",
+      "type": "timeseries",
+      "gridPos": {"h": 6, "w": 12, "x": 12, "y": 20},
+      "targets": [{"expr": "process_resident_memory_bytes", "legendFormat": "rss"}]
+    }
+  ]
+}

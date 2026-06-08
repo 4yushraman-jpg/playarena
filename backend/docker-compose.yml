@@ -18,6 +18,111 @@ services:
       start_period: 10s
     restart: unless-stopped
 
+  migrations:
+    image: migrate/migrate:v4
+    container_name: playarena-migrations
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./db/migrations:/migrations
+    command:
+      - -path=/migrations
+      - -database=postgres://postgres:postgres@postgres:5432/playarena?sslmode=disable
+      - up
+    restart: on-failure
+
+  mailhog:
+    image: mailhog/mailhog:v1.0.1
+    container_name: playarena-mailhog
+    ports:
+      - "1025:1025"  # SMTP
+      - "8025:8025"  # Web UI
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: playarena-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrations:
+        condition: service_completed_successfully
+    environment:
+      APP_ENV: development
+      APP_PORT: "8080"
+      APP_INTERNAL_PORT: "9090"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/playarena?sslmode=disable
+      JWT_SECRET: dev-jwt-secret-change-in-production-min-32-chars
+      CORS_ALLOWED_ORIGINS: "http://localhost:3000,http://localhost:5173"
+      RATE_LIMIT_ENABLED: "true"
+      EMAIL_PROVIDER: smtp
+      EMAIL_FROM_ADDRESS: noreply@playarena.dev
+      EMAIL_FROM_NAME: PlayArena
+      EMAIL_SMTP_HOST: mailhog
+      EMAIL_SMTP_PORT: "1025"
+      APP_BASE_URL: http://localhost:8080
+      WEBHOOK_SECRET_KEY: dev-webhook-key-32bytes-padded===
+      STORAGE_BACKEND: local
+      STORAGE_LOCAL_PATH: /app/uploads
+      STORAGE_LOCAL_BASE_URL: http://localhost:8080/media/files
+      PPROF_ENABLED: "true"
+    ports:
+      - "8080:8080"  # Public API
+      - "9090:9090"  # Internal observability (never expose via load balancer in production)
+    volumes:
+      - uploads_data:/app/uploads
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/live"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.0.0
+    container_name: playarena-prometheus
+    depends_on:
+      - api
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/prometheus/alerts.yaml:/etc/prometheus/alerts.yaml:ro
+      - prometheus_data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.console.libraries=/usr/share/prometheus/console_libraries
+      - --web.console.templates=/usr/share/prometheus/consoles
+      - --web.enable-lifecycle
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: playarena-grafana
+    depends_on:
+      - prometheus
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    restart: unless-stopped
+
 volumes:
   postgres_data:
+    driver: local
+  uploads_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
     driver: local

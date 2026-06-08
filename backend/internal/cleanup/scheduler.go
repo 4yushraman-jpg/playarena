@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	db "github.com/4yushraman-jpg/playarena/db/sqlc"
 )
@@ -18,19 +19,24 @@ import (
 // Start() launches the background goroutine; Stop() signals it to exit.
 // Stop() is safe to call multiple times; only the first call has effect.
 type Scheduler struct {
-	queries  *db.Queries
-	interval time.Duration
-	log      *slog.Logger
-	done     chan struct{}
+	queries               *db.Queries
+	pool                  *pgxpool.Pool
+	interval              time.Duration
+	auditLogRetentionDays int
+	log                   *slog.Logger
+	done                  chan struct{}
 }
 
 // New creates a Scheduler. Call Start() to begin cleanup cycles.
-func New(queries *db.Queries, interval time.Duration, log *slog.Logger) *Scheduler {
+// auditLogRetentionDays controls how long audit_logs rows are retained (days).
+func New(queries *db.Queries, pool *pgxpool.Pool, interval time.Duration, auditLogRetentionDays int, log *slog.Logger) *Scheduler {
 	return &Scheduler{
-		queries:  queries,
-		interval: interval,
-		log:      log,
-		done:     make(chan struct{}),
+		queries:               queries,
+		pool:                  pool,
+		interval:              interval,
+		auditLogRetentionDays: auditLogRetentionDays,
+		log:                   log,
+		done:                  make(chan struct{}),
 	}
 }
 
@@ -104,6 +110,15 @@ func (s *Scheduler) runOnce() {
 	}
 	if err := s.queries.DeleteOldWebhookDeliveries(ctx, webhookCutoff); err != nil {
 		s.log.Error("cleanup: delete old webhook deliveries", slog.Any("error", err))
+	}
+
+	auditCutoff := time.Now().AddDate(0, 0, -s.auditLogRetentionDays)
+	_, err := s.pool.Exec(ctx,
+		`DELETE FROM audit_logs WHERE created_at < $1`,
+		auditCutoff,
+	)
+	if err != nil {
+		s.log.Error("cleanup: delete old audit logs", slog.Any("error", err))
 	}
 
 	s.log.Info("cleanup: cycle complete",

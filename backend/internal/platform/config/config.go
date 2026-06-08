@@ -174,6 +174,28 @@ type Config struct {
 	// behind a load balancer, always set this to the load balancer's egress IP
 	// range.
 	TrustedProxyCIDRs []string
+
+	// ── Observability ────────────────────────────────────────────────────────
+
+	// AppInternalPort is the TCP port for the internal observability server that
+	// serves /metrics, /ready, and /live. Must not equal AppPort.
+	// Default: 9090. Never expose this port via the public load balancer.
+	AppInternalPort int
+
+	// AuditLogRetentionDays is the number of days to retain audit_log rows.
+	// Rows older than this are deleted by the cleanup scheduler.
+	// Default: 730 (2 years).
+	AuditLogRetentionDays int
+
+	// DrainTimeoutSeconds is the maximum wall-clock time allowed for a single
+	// DrainOutbox call. The context deadline prevents a slow drain from blocking
+	// the request goroutine indefinitely. Default: 5.
+	DrainTimeoutSeconds int
+
+	// PprofEnabled controls whether the /debug/pprof/* endpoints are mounted on
+	// the internal observability server. Defaults to true in non-production
+	// environments.
+	PprofEnabled bool
 }
 
 // Load reads configuration from environment variables and returns a validated Config.
@@ -250,6 +272,11 @@ func Load() (*Config, error) {
 		RateLimitMediaBurst: getEnvInt("RATE_LIMIT_MEDIA_BURST", 10),
 
 		TrustedProxyCIDRs: getEnvStringSlice("TRUSTED_PROXY_CIDRS", nil),
+
+		AppInternalPort:       getEnvInt("APP_INTERNAL_PORT", 9090),
+		AuditLogRetentionDays: getEnvInt("AUDIT_LOG_RETENTION_DAYS", 730),
+		DrainTimeoutSeconds:   getEnvInt("DRAIN_TIMEOUT_SECONDS", 5),
+		PprofEnabled:          getEnvBool("PPROF_ENABLED", true),
 	}
 
 	if err := cfg.validate(); err != nil {
@@ -335,6 +362,16 @@ func (c *Config) validate() error {
 	}
 	if c.RateLimitMediaBurst <= 0 {
 		errs = append(errs, "RATE_LIMIT_MEDIA_BURST must be positive")
+	}
+
+	if c.AppInternalPort == c.AppPort {
+		errs = append(errs, "APP_INTERNAL_PORT must differ from APP_PORT")
+	}
+	if c.AuditLogRetentionDays <= 0 {
+		errs = append(errs, "AUDIT_LOG_RETENTION_DAYS must be positive")
+	}
+	if c.DrainTimeoutSeconds <= 0 {
+		errs = append(errs, "DRAIN_TIMEOUT_SECONDS must be positive")
 	}
 
 	if len(errs) > 0 {

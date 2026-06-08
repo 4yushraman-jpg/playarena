@@ -41,7 +41,7 @@ const testRawSecret = "test-webhook-secret-32-bytes-val"
 
 func newWorker(t testing.TB, client *http.Client) *webhookworker.WebhookWorker {
 	t.Helper()
-	w, err := webhookworker.NewWebhookWorker(testPool, testSecretKeyB64, client, time.Minute, discardLog())
+	w, err := webhookworker.NewWebhookWorker(testPool, testSecretKeyB64, client, time.Minute, discardLog(), nil)
 	if err != nil {
 		t.Fatalf("NewWebhookWorker: %v", err)
 	}

@@ -12,11 +12,12 @@ import (
 // Repository provides the data-access layer for the WebhookWorker.
 type Repository struct {
 	queries *db.Queries
+	pool    *pgxpool.Pool
 }
 
 // NewRepository constructs a Repository.
 func NewRepository(pool *pgxpool.Pool) *Repository {
-	return &Repository{queries: db.New(pool)}
+	return &Repository{queries: db.New(pool), pool: pool}
 }
 
 // ClaimBatch claims up to batchSize pending webhook deliveries for delivery.
@@ -48,4 +49,14 @@ func (r *Repository) RecordFailure(ctx context.Context, id pgtype.UUID, failedPe
 		FailedPermanently: failedPermanently,
 		NextAttemptAt:     nextAttemptAt,
 	})
+}
+
+// CountDeadLetters returns the number of webhook delivery rows with
+// failed_permanently = TRUE. Used by the background metrics scraper.
+func (r *Repository) CountDeadLetters(ctx context.Context) (int64, error) {
+	var n int64
+	err := r.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM webhook_deliveries WHERE failed_permanently = TRUE`,
+	).Scan(&n)
+	return n, err
 }

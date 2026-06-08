@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"golang.org/x/time/rate"
+
+	"github.com/4yushraman-jpg/playarena/internal/platform/metrics"
 )
 
 // ipTTL is the idle period after which a per-IP entry is pruned from the map.
@@ -38,6 +40,10 @@ type IPRateLimiter struct {
 	r        rate.Limit
 	b        int
 	done     chan struct{}
+	// name is the limiter type label used in the rate-limit rejection counter.
+	// Set by WithName; empty means no metrics are recorded.
+	name string
+	reg  *metrics.Registry
 }
 
 // NewIPRateLimiter creates a rate limiter allowing r sustained requests per
@@ -50,6 +56,16 @@ func NewIPRateLimiter(r rate.Limit, b int) *IPRateLimiter {
 		done: make(chan struct{}),
 	}
 	go l.cleanup(5 * time.Minute)
+	return l
+}
+
+// WithMetrics attaches a metrics registry and a named label to the limiter so
+// that rejected requests are recorded in playarena_rate_limit_rejections_total.
+// name is the value used for the "limiter" label (e.g. "auth", "write", "media").
+// Returns the receiver for fluent construction.
+func (l *IPRateLimiter) WithMetrics(reg *metrics.Registry, name string) *IPRateLimiter {
+	l.reg = reg
+	l.name = name
 	return l
 }
 
@@ -119,6 +135,7 @@ func (l *IPRateLimiter) Middleware() func(http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			ip := clientIP(r)
 			if !l.get(ip).Allow() {
+				l.recordRejection()
 				w.Header().Set("Content-Type", "application/json")
 				w.Header().Set("Retry-After", "1")
 				w.WriteHeader(http.StatusTooManyRequests)
@@ -143,6 +160,7 @@ func (l *IPRateLimiter) WriteMiddleware() func(http.Handler) http.Handler {
 			case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
 				ip := clientIP(r)
 				if !l.get(ip).Allow() {
+					l.recordRejection()
 					w.Header().Set("Content-Type", "application/json")
 					w.Header().Set("Retry-After", "1")
 					w.WriteHeader(http.StatusTooManyRequests)
@@ -152,6 +170,14 @@ func (l *IPRateLimiter) WriteMiddleware() func(http.Handler) http.Handler {
 			}
 			next.ServeHTTP(w, r)
 		})
+	}
+}
+
+// recordRejection increments the rate-limit rejection counter when a metrics
+// registry is attached. Nil-safe: no-op when the registry or name is absent.
+func (l *IPRateLimiter) recordRejection() {
+	if l.reg != nil && l.name != "" {
+		l.reg.RateLimitRejections.WithLabelValues(l.name).Inc()
 	}
 }
 

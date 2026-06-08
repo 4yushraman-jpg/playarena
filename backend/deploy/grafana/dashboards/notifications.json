@@ -1,0 +1,97 @@
+{
+  "uid": "playarena-notifications",
+  "title": "PlayArena — Notifications",
+  "tags": ["playarena"],
+  "timezone": "browser",
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "panels": [
+    {
+      "id": 1,
+      "title": "Outbox Pending Rows",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+      "targets": [{"expr": "playarena_notification_outbox_pending_rows", "legendFormat": "pending"}]
+    },
+    {
+      "id": 2,
+      "title": "Email Dead Letters",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+      "targets": [{"expr": "playarena_email_dead_letters_total", "legendFormat": "dead letters"}]
+    },
+    {
+      "id": 3,
+      "title": "Webhook Dead Letters",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+      "targets": [{"expr": "playarena_webhook_dead_letters_total", "legendFormat": "dead letters"}]
+    },
+    {
+      "id": 4,
+      "title": "Drain Duration (histogram)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(playarena_notification_drain_duration_seconds_bucket[5m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(playarena_notification_drain_duration_seconds_bucket[5m])))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Drain Success/Error Rate",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+      "targets": [{
+        "expr": "sum by (result) (rate(playarena_notification_drain_total[1m]))",
+        "legendFormat": "{{result}}"
+      }]
+    },
+    {
+      "id": 6,
+      "title": "Email Worker Deliveries / sec",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12},
+      "targets": [{
+        "expr": "sum by (status) (rate(playarena_email_worker_deliveries_total[1m]))",
+        "legendFormat": "{{status}}"
+      }]
+    },
+    {
+      "id": 7,
+      "title": "Webhook Worker Deliveries / sec",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12},
+      "targets": [{
+        "expr": "sum by (status) (rate(playarena_webhook_worker_deliveries_total[1m]))",
+        "legendFormat": "{{status}}"
+      }]
+    },
+    {
+      "id": 8,
+      "title": "Email Batch Size (p95)",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 20},
+      "targets": [{
+        "expr": "histogram_quantile(0.95, sum by (le) (rate(playarena_email_worker_batch_size_bucket[5m])))",
+        "legendFormat": "p95 batch size"
+      }]
+    },
+    {
+      "id": 9,
+      "title": "Webhook Batch Size (p95)",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 20},
+      "targets": [{
+        "expr": "histogram_quantile(0.95, sum by (le) (rate(playarena_webhook_worker_batch_size_bucket[5m])))",
+        "legendFormat": "p95 batch size"
+      }]
+    }
+  ]
+}

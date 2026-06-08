@@ -15,8 +15,11 @@ package realtime
 import (
 	"encoding/json"
 	"sync"
+	"sync/atomic"
 
 	"github.com/jackc/pgx/v5/pgtype"
+
+	"github.com/4yushraman-jpg/playarena/internal/platform/metrics"
 )
 
 // subKey identifies a single user's subscription within an org.
@@ -33,6 +36,16 @@ type Hub struct {
 	mu   sync.RWMutex
 	subs map[subKey]map[chan []byte]struct{}
 	done chan struct{}
+
+	// Atomic counters updated on every Subscribe/Unsubscribe/Publish/drop.
+	// Read by the Prometheus collector without holding mu.
+	subscriberCount atomic.Int64
+	subscribeTotal  atomic.Int64
+	unsubTotal      atomic.Int64
+	publishTotal    atomic.Int64
+	droppedTotal    atomic.Int64
+
+	reg *metrics.Registry
 }
 
 // NewHub constructs an idle Hub ready to accept subscriptions.
@@ -41,6 +54,14 @@ func NewHub() *Hub {
 		subs: make(map[subKey]map[chan []byte]struct{}),
 		done: make(chan struct{}),
 	}
+}
+
+// WithMetrics attaches a metrics registry to the Hub.
+// When set, Subscribe/Unsubscribe/Publish update the corresponding gauges and
+// counters. Safe to call before any subscriptions are established.
+func (h *Hub) WithMetrics(reg *metrics.Registry) *Hub {
+	h.reg = reg
+	return h
 }
 
 // Subscribe registers a new SSE client channel for the given (orgID, userID).
@@ -55,6 +76,13 @@ func (h *Hub) Subscribe(orgID, userID pgtype.UUID) chan []byte {
 	}
 	h.subs[key][ch] = struct{}{}
 	h.mu.Unlock()
+
+	h.subscriberCount.Add(1)
+	h.subscribeTotal.Add(1)
+	if h.reg != nil {
+		h.reg.RealtimeSubscribers.Inc()
+		h.reg.RealtimeSubscribeTotal.Inc()
+	}
 	return ch
 }
 
@@ -78,6 +106,12 @@ func (h *Hub) Unsubscribe(orgID, userID pgtype.UUID, ch chan []byte) {
 	h.mu.Unlock()
 	if found {
 		close(ch)
+		h.subscriberCount.Add(-1)
+		h.unsubTotal.Add(1)
+		if h.reg != nil {
+			h.reg.RealtimeSubscribers.Dec()
+			h.reg.RealtimeUnsubTotal.Inc()
+		}
 	}
 }
 
@@ -97,11 +131,21 @@ func (h *Hub) Publish(orgID, userID pgtype.UUID, event any) {
 	key := subKey{orgID: orgID.Bytes, userID: userID.Bytes}
 	h.mu.RLock()
 	defer h.mu.RUnlock()
+
+	h.publishTotal.Add(1)
+	if h.reg != nil {
+		h.reg.RealtimePublishTotal.Inc()
+	}
+
 	for ch := range h.subs[key] {
 		select {
 		case ch <- data:
 		default:
 			// Buffer full — drop. Client recovers via REST polling.
+			h.droppedTotal.Add(1)
+			if h.reg != nil {
+				h.reg.RealtimeDroppedTotal.Inc()
+			}
 		}
 	}
 }
@@ -130,6 +174,12 @@ func (h *Hub) Shutdown() {
 	h.mu.Unlock()
 	for _, ch := range toClose {
 		close(ch)
+	}
+	if n := int64(len(toClose)); n > 0 {
+		h.subscriberCount.Add(-n)
+		if h.reg != nil {
+			h.reg.RealtimeSubscribers.Add(-float64(n))
+		}
 	}
 }
 

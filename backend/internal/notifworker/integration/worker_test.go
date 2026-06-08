@@ -98,7 +98,7 @@ func TestEmailWorker_Deliver_Success(t *testing.T) {
 
 	_ = seedEmailNotification(t, ctx, testPool, org.ID, user.ID)
 
-	worker := notifworker.NewEmailWorker(testPool, sender, cfg.AppBaseURL, time.Minute, discardLog())
+	worker := notifworker.NewEmailWorker(testPool, sender, cfg.AppBaseURL, time.Minute, discardLog(), nil)
 	if err := worker.Drain(ctx); err != nil {
 		t.Fatalf("Drain: %v", err)
 	}
@@ -140,7 +140,7 @@ func TestEmailWorker_Deliver_Idempotent(t *testing.T) {
 
 	_ = seedEmailNotification(t, ctx, testPool, org.ID, user.ID)
 
-	worker := notifworker.NewEmailWorker(testPool, sender, cfg.AppBaseURL, time.Minute, discardLog())
+	worker := notifworker.NewEmailWorker(testPool, sender, cfg.AppBaseURL, time.Minute, discardLog(), nil)
 
 	// First drain delivers.
 	if err := worker.Drain(ctx); err != nil {
@@ -178,7 +178,7 @@ func TestEmailWorker_RetryOnFailure(t *testing.T) {
 
 	_ = seedEmailNotification(t, ctx, testPool, org.ID, user.ID)
 
-	worker := notifworker.NewEmailWorker(testPool, sender, cfg.AppBaseURL, time.Minute, discardLog())
+	worker := notifworker.NewEmailWorker(testPool, sender, cfg.AppBaseURL, time.Minute, discardLog(), nil)
 
 	// First drain: delivery fails. Claim increments attempt_count to 1.
 	// RecordFailure sets next_attempt_at = NOW() + 1 min.
@@ -250,7 +250,7 @@ func TestEmailWorker_PermanentFailure(t *testing.T) {
 
 	_ = seedEmailNotification(t, ctx, testPool, org.ID, user.ID)
 
-	worker := notifworker.NewEmailWorker(testPool, sender, cfg.AppBaseURL, time.Minute, discardLog())
+	worker := notifworker.NewEmailWorker(testPool, sender, cfg.AppBaseURL, time.Minute, discardLog(), nil)
 
 	// Run 3 drain cycles (each one claims and fails; advance lease between runs).
 	for i := 0; i < 3; i++ {
@@ -341,7 +341,7 @@ func TestEmailWorker_SkipInApp(t *testing.T) {
 		t.Fatalf("insert email row: %v", err)
 	}
 
-	worker := notifworker.NewEmailWorker(testPool, sender, cfg.AppBaseURL, time.Minute, discardLog())
+	worker := notifworker.NewEmailWorker(testPool, sender, cfg.AppBaseURL, time.Minute, discardLog(), nil)
 	if err := worker.Drain(ctx); err != nil {
 		t.Fatalf("Drain: %v", err)
 	}

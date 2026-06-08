@@ -101,7 +101,7 @@ func buildServerWithLimiter(t testing.TB, pool *pgxpool.Pool, limiter *mw.IPRate
 	r.Use(chimw.Recoverer)
 	r.Use(mw.CORS(cfg.CORSAllowedOrigins))
 
-	authHandler := auth.RegisterRoutes(r, pool, cfg, logger, limiter, sender)
+	authHandler := auth.RegisterRoutes(r, pool, cfg, logger, limiter, sender, nil)
 
 	srv := httptest.NewServer(r)
 	t.Cleanup(func() {
@@ -138,7 +138,7 @@ func buildServerWithNilSender(t testing.TB, pool *pgxpool.Pool) *testServer {
 	r.Use(chimw.Recoverer)
 	r.Use(mw.CORS(cfg.CORSAllowedOrigins))
 
-	authHandler := auth.RegisterRoutes(r, pool, cfg, logger, limiter, nil)
+	authHandler := auth.RegisterRoutes(r, pool, cfg, logger, limiter, nil, nil)
 
 	srv := httptest.NewServer(r)
 	t.Cleanup(func() {

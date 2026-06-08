@@ -86,6 +86,7 @@ func run() int {
 	// Stop background services (rate-limiter cleanup goroutine, token cleanup
 	// scheduler) before draining in-flight HTTP requests.
 	app.Shutdown(shutdownCtx)
+	app.ShutdownInternal(shutdownCtx)
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error("graceful shutdown failed", slog.Any("error", err))

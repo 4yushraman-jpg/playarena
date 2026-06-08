@@ -9,6 +9,7 @@ import (
 	db "github.com/4yushraman-jpg/playarena/db/sqlc"
 	"github.com/4yushraman-jpg/playarena/internal/email"
 	"github.com/4yushraman-jpg/playarena/internal/platform/config"
+	"github.com/4yushraman-jpg/playarena/internal/platform/metrics"
 	"github.com/4yushraman-jpg/playarena/internal/platform/middleware"
 )
 
@@ -48,10 +49,11 @@ func RegisterRoutes(
 	log *slog.Logger,
 	limiter *middleware.IPRateLimiter,
 	emailSender *email.Sender,
+	reg *metrics.Registry,
 ) *Handler {
 	queries := db.New(pool)
 	repo := NewRepository(queries, pool)
-	svc := NewService(repo, cfg)
+	svc := NewService(repo, cfg, reg)
 	authz := NewAuthorizationService(queries)
 	h := NewHandler(svc, cfg, log, emailSender)
 

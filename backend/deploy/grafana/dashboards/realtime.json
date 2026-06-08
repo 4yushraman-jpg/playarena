@@ -1,0 +1,63 @@
+{
+  "uid": "playarena-realtime",
+  "title": "PlayArena — Realtime (SSE)",
+  "tags": ["playarena"],
+  "timezone": "browser",
+  "refresh": "15s",
+  "schemaVersion": 38,
+  "panels": [
+    {
+      "id": 1,
+      "title": "Active Subscribers",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+      "targets": [{"expr": "playarena_realtime_active_subscribers", "legendFormat": "subscribers"}]
+    },
+    {
+      "id": 2,
+      "title": "Subscribe / Unsubscribe Rate",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+      "targets": [
+        {
+          "expr": "rate(playarena_realtime_subscribe_total[1m])",
+          "legendFormat": "subscribes/s"
+        },
+        {
+          "expr": "rate(playarena_realtime_unsubscribe_total[1m])",
+          "legendFormat": "unsubscribes/s"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Publish Rate",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+      "targets": [{
+        "expr": "rate(playarena_realtime_publish_total[1m])",
+        "legendFormat": "publishes/s"
+      }]
+    },
+    {
+      "id": 4,
+      "title": "Dropped Events Rate",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12},
+      "targets": [{
+        "expr": "rate(playarena_realtime_dropped_events_total[1m])",
+        "legendFormat": "dropped/s"
+      }]
+    },
+    {
+      "id": 5,
+      "title": "Drop Rate %",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 12},
+      "targets": [{
+        "expr": "rate(playarena_realtime_dropped_events_total[5m]) / rate(playarena_realtime_publish_total[5m])",
+        "legendFormat": "drop rate"
+      }]
+    }
+  ]
+}

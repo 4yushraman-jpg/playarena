@@ -10,20 +10,30 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	db "github.com/4yushraman-jpg/playarena/db/sqlc"
+	"github.com/4yushraman-jpg/playarena/internal/platform/metrics"
 	"github.com/4yushraman-jpg/playarena/internal/platform/pgutil"
 	"github.com/4yushraman-jpg/playarena/internal/realtime"
 )
 
 // Service implements the notifications use-cases.
 type Service struct {
-	repo *Repository
-	hub  *realtime.Hub
-	log  *slog.Logger
+	repo            *Repository
+	hub             *realtime.Hub
+	log             *slog.Logger
+	reg             *metrics.Registry // nil means no metrics
+	drainTimeoutSec int               // 0 means no deadline (tests)
 }
 
 // NewService constructs a Service. hub may be nil (SSE publishing is a no-op).
 func NewService(repo *Repository, hub *realtime.Hub, log *slog.Logger) *Service {
 	return &Service{repo: repo, hub: hub, log: log}
+}
+
+// WithMetrics attaches a metrics registry and drain timeout to the service.
+func (s *Service) WithMetrics(reg *metrics.Registry, drainTimeoutSec int) *Service {
+	s.reg = reg
+	s.drainTimeoutSec = drainTimeoutSec
+	return s
 }
 
 // ── public API methods ────────────────────────────────────────────────────────
@@ -230,8 +240,31 @@ func (s *Service) UpdatePreference(
 // Called synchronously by domain services immediately after their commit.
 // Errors are logged but not propagated: drain failure must not fail the domain
 // operation that already committed. SSE publish is best-effort (at-most-once).
+//
+// A configurable context deadline prevents slow drains from blocking the
+// request goroutine indefinitely. The deadline is applied only when
+// drainTimeoutSec > 0 (set via WithMetrics); integration tests leave it at 0.
 func (s *Service) DrainOutbox(ctx context.Context, orgID pgtype.UUID, log *slog.Logger) {
-	created, err := s.repo.DrainOutbox(ctx, orgID)
+	drainCtx := ctx
+	if s.drainTimeoutSec > 0 {
+		var cancel context.CancelFunc
+		drainCtx, cancel = context.WithTimeout(ctx, time.Duration(s.drainTimeoutSec)*time.Second)
+		defer cancel()
+	}
+
+	start := time.Now()
+	created, err := s.repo.DrainOutbox(drainCtx, orgID)
+	elapsed := time.Since(start).Seconds()
+
+	if s.reg != nil {
+		s.reg.NotifDrainDuration.Observe(elapsed)
+		result := "success"
+		if err != nil {
+			result = "error"
+		}
+		s.reg.NotifDrainTotal.WithLabelValues(result).Inc()
+	}
+
 	if err != nil {
 		log.Error("notifications: DrainOutbox failed",
 			slog.String("org_id", pgutil.UUIDToString(orgID)),

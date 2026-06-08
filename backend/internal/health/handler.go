@@ -1,6 +1,7 @@
 package health
 
 import (
+	"encoding/json"
 	"net/http"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -43,4 +44,28 @@ func (h *Handler) Check(w http.ResponseWriter, r *http.Request) {
 		Status:   appStatus,
 		Database: dbStatus,
 	})
+}
+
+// Ready is the Kubernetes/Docker readiness probe handler.
+// It checks that the database is reachable (required for meaningful work).
+// Served on the internal observability port — never the public API port.
+func (h *Handler) Ready(w http.ResponseWriter, r *http.Request) {
+	if err := database.Health(r.Context(), h.db); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"status": "not_ready", "reason": "database_unavailable"}) //nolint:errcheck
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "ready"}) //nolint:errcheck
+}
+
+// Live is the Kubernetes/Docker liveness probe handler.
+// It always returns 200 — if the process can respond to HTTP it is alive.
+// Served on the internal observability port — never the public API port.
+func (h *Handler) Live(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "alive"}) //nolint:errcheck
 }

@@ -1,0 +1,133 @@
+groups:
+  - name: playarena_critical
+    interval: 30s
+    rules:
+      - alert: DatabaseUnavailable
+        expr: |
+          playarena_db_pool_open_connections == 0
+          OR
+          sum(rate(playarena_http_requests_total{status_code="503"}[2m])) > 0.5
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Database unavailable (pool empty or 503 surge)"
+          description: "Either the DB connection pool is empty or >0.5 req/s are returning 503. API is likely down."
+
+      - alert: HighErrorRate5xx
+        expr: |
+          sum(rate(playarena_http_requests_total{status_class="5xx"}[5m]))
+          /
+          sum(rate(playarena_http_requests_total[5m])) > 0.05
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High 5xx error rate (>5%)"
+          description: "{{ $value | humanizePercentage }} of requests are returning 5xx over the last 5 minutes."
+
+      - alert: EmailWorkerStuck
+        expr: |
+          absent(playarena_email_worker_tick_total)
+          OR
+          increase(playarena_email_worker_tick_total[10m]) == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Email worker has stopped ticking"
+          description: "No email worker ticks recorded in the last 10 minutes, or the metric series is absent."
+
+      - alert: WebhookWorkerStuck
+        expr: |
+          absent(playarena_webhook_worker_tick_total)
+          OR
+          increase(playarena_webhook_worker_tick_total[10m]) == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Webhook worker has stopped ticking"
+          description: "No webhook worker ticks recorded in the last 10 minutes, or the metric series is absent."
+
+      - alert: EmailDeadLetterBurst
+        expr: playarena_email_dead_letters_total > 50
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Large email dead-letter count"
+          description: "{{ $value }} permanently failed email deliveries in the outbox. Manual intervention required."
+
+      - alert: WebhookDeadLetterBurst
+        expr: playarena_webhook_dead_letters_total > 50
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Large webhook dead-letter count"
+          description: "{{ $value }} permanently failed webhook deliveries in the queue. Manual intervention required."
+
+  - name: playarena_warning
+    interval: 60s
+    rules:
+      - alert: HighP99Latency
+        expr: |
+          histogram_quantile(0.99,
+            sum by (route, le) (rate(playarena_http_request_duration_seconds_bucket[5m]))
+          ) > 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "P99 latency above 2 seconds"
+          description: "Route {{ $labels.route }} has P99 latency of {{ $value | humanizeDuration }}."
+
+      - alert: DBPoolNearSaturation
+        expr: |
+          playarena_db_pool_acquired_connections / playarena_db_pool_max_connections > 0.85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DB pool near saturation (>85%)"
+          description: "{{ $value | humanizePercentage }} of max connections are in use."
+
+      - alert: AuthLoginAnomalySpike
+        expr: |
+          sum(rate(playarena_auth_login_attempts_total{result!="success"}[5m]))
+          /
+          sum(rate(playarena_auth_login_attempts_total[5m])) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High auth failure rate (>50%)"
+          description: "{{ $value | humanizePercentage }} of login attempts are failing."
+
+      - alert: TokenReplayDetected
+        expr: increase(playarena_auth_token_replay_detections_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Token replay attack detected"
+          description: "{{ $value }} replay detection(s) in the last 15 minutes. Possible token theft."
+
+      - alert: OutboxBacklogHigh
+        expr: playarena_notification_outbox_pending_rows > 1000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Notification outbox backlog is high (>1000 rows)"
+          description: "{{ $value }} unprocessed outbox rows. Drain may be falling behind."
+
+      - alert: RealtimeDroppedEvents
+        expr: rate(playarena_realtime_dropped_events_total[5m]) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "SSE events are being dropped"
+          description: "{{ $value | humanize }} events/sec are being dropped due to full subscriber buffers."

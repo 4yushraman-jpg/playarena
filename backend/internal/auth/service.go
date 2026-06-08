@@ -12,6 +12,7 @@ import (
 
 	db "github.com/4yushraman-jpg/playarena/db/sqlc"
 	"github.com/4yushraman-jpg/playarena/internal/platform/config"
+	"github.com/4yushraman-jpg/playarena/internal/platform/metrics"
 	"github.com/4yushraman-jpg/playarena/internal/platform/pgutil"
 )
 
@@ -19,10 +20,11 @@ import (
 type Service struct {
 	repo   *Repository
 	config *config.Config
+	reg    *metrics.Registry // nil means no metrics (integration tests)
 }
 
-func NewService(repo *Repository, cfg *config.Config) *Service {
-	return &Service{repo: repo, config: cfg}
+func NewService(repo *Repository, cfg *config.Config, reg *metrics.Registry) *Service {
+	return &Service{repo: repo, config: cfg, reg: reg}
 }
 
 // Login authenticates a user and returns a token pair.
@@ -40,6 +42,12 @@ func NewService(repo *Repository, cfg *config.Config) *Service {
 // not found, so the response time is indistinguishable from a wrong-password
 // failure. This prevents timing-based email enumeration.
 func (s *Service) Login(ctx context.Context, req LoginRequest, ipAddress *netip.Addr, userAgent *string) (*LoginResponse, error) {
+	resp, err := s.login(ctx, req, ipAddress, userAgent)
+	s.recordLoginResult(err)
+	return resp, err
+}
+
+func (s *Service) login(ctx context.Context, req LoginRequest, ipAddress *netip.Addr, userAgent *string) (*LoginResponse, error) {
 	user, err := s.repo.GetUserByEmail(ctx, req.Email)
 	if err != nil {
 		_ = VerifyPassword(req.Password, dummyBcryptHash)
@@ -94,6 +102,55 @@ func (s *Service) Login(ctx context.Context, req LoginRequest, ipAddress *netip.
 	}, nil
 }
 
+func (s *Service) recordLoginResult(err error) {
+	if s.reg == nil {
+		return
+	}
+	label := loginResultLabel(err)
+	s.reg.AuthLoginTotal.WithLabelValues(label).Inc()
+}
+
+func loginResultLabel(err error) string {
+	if err == nil {
+		return "success"
+	}
+	switch {
+	case errors.Is(err, ErrInvalidCredentials):
+		return "invalid_credentials"
+	case errors.Is(err, ErrUserSuspended):
+		return "suspended"
+	case errors.Is(err, ErrUserInactive):
+		return "inactive"
+	case errors.Is(err, ErrUserPendingVerification):
+		return "pending_verification"
+	default:
+		// Covers ErrOrganizationRequired, ErrOrganizationNotFound, and internal errors.
+		return "error"
+	}
+}
+
+func refreshResultLabel(err error) string {
+	if err == nil {
+		return "success"
+	}
+	switch {
+	case errors.Is(err, ErrInvalidToken):
+		return "invalid"
+	case errors.Is(err, ErrExpiredToken):
+		return "expired"
+	case errors.Is(err, ErrTokenReuse):
+		return "replay"
+	case errors.Is(err, ErrUserSuspended):
+		return "suspended"
+	case errors.Is(err, ErrUserInactive):
+		return "inactive"
+	case errors.Is(err, ErrUserPendingVerification):
+		return "pending_verification"
+	default:
+		return "error"
+	}
+}
+
 // Refresh validates a refresh token, rotates it, re-validates user status,
 // and issues a new access token + refresh token pair.
 //
@@ -101,6 +158,18 @@ func (s *Service) Login(ctx context.Context, req LoginRequest, ipAddress *netip.
 // a new one. Replayed (already-revoked) tokens trigger deterministic replay
 // detection based on successor_id state — no time windows.
 func (s *Service) Refresh(ctx context.Context, req RefreshRequest, ipAddress *netip.Addr, userAgent *string) (*RefreshResponse, error) {
+	resp, err := s.refresh(ctx, req, ipAddress, userAgent)
+	if s.reg != nil {
+		label := refreshResultLabel(err)
+		s.reg.AuthRefreshTotal.WithLabelValues(label).Inc()
+		if errors.Is(err, ErrTokenReuse) {
+			s.reg.AuthReplayTotal.Inc()
+		}
+	}
+	return resp, err
+}
+
+func (s *Service) refresh(ctx context.Context, req RefreshRequest, ipAddress *netip.Addr, userAgent *string) (*RefreshResponse, error) {
 	if req.RefreshToken == "" {
 		return nil, ErrInvalidToken
 	}
@@ -263,6 +332,9 @@ func (s *Service) VerifyEmail(ctx context.Context, rawToken string) error {
 // can test the reset flow without an email transport configured. The handler
 // strips it in production.
 func (s *Service) ForgotPassword(ctx context.Context, req ForgotPasswordRequest) (*ForgotPasswordResponse, error) {
+	if s.reg != nil {
+		s.reg.AuthPasswordResetTotal.Inc()
+	}
 	genericResp := &ForgotPasswordResponse{
 		Message: "if the email is registered, a password reset link has been sent",
 	}

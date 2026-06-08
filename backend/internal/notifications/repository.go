@@ -412,6 +412,29 @@ func (r *Repository) DrainOutbox(ctx context.Context, orgID pgtype.UUID) ([]db.N
 	return created, nil
 }
 
+// ── observability queries ─────────────────────────────────────────────────────
+
+// CountPendingOutboxRows returns the total number of unprocessed outbox rows
+// across all organizations. Used by the background metrics scraper; does not
+// use FOR UPDATE SKIP LOCKED so it reflects a point-in-time snapshot.
+func (r *Repository) CountPendingOutboxRows(ctx context.Context) (int64, error) {
+	var n int64
+	err := r.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM notification_outbox WHERE processed_at IS NULL`,
+	).Scan(&n)
+	return n, err
+}
+
+// CountEmailDeadLetters returns the number of notifications that have
+// failed_permanently = TRUE on the email channel. Used by the metrics scraper.
+func (r *Repository) CountEmailDeadLetters(ctx context.Context) (int64, error) {
+	var n int64
+	err := r.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM notifications WHERE channel = 'email' AND failed_permanently = TRUE`,
+	).Scan(&n)
+	return n, err
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 func prefToAuditJSON(p *db.NotificationPreference) ([]byte, error) {

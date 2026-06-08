@@ -1,0 +1,77 @@
+{
+  "uid": "playarena-api",
+  "title": "PlayArena — API Overview",
+  "tags": ["playarena"],
+  "timezone": "browser",
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "panels": [
+    {
+      "id": 1,
+      "title": "Requests per Second",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "targets": [{
+        "expr": "sum(rate(playarena_http_requests_total[1m]))",
+        "legendFormat": "rps"
+      }]
+    },
+    {
+      "id": 2,
+      "title": "5xx Error Rate",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "targets": [{
+        "expr": "sum(rate(playarena_http_requests_total{status_class=\"5xx\"}[1m]))",
+        "legendFormat": "5xx/s"
+      }]
+    },
+    {
+      "id": 3,
+      "title": "P50 / P95 / P99 Latency",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(playarena_http_request_duration_seconds_bucket[1m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(playarena_http_request_duration_seconds_bucket[1m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(playarena_http_request_duration_seconds_bucket[1m])))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "In-Flight Requests",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 12, "y": 8},
+      "targets": [{"expr": "playarena_http_requests_in_flight", "legendFormat": "in-flight"}]
+    },
+    {
+      "id": 5,
+      "title": "Rate Limit Rejections / sec",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 8},
+      "targets": [{
+        "expr": "sum by (limiter) (rate(playarena_rate_limit_rejections_total[1m]))",
+        "legendFormat": "{{limiter}}"
+      }]
+    },
+    {
+      "id": 6,
+      "title": "Top Routes by Request Rate",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 16},
+      "targets": [{
+        "expr": "topk(10, sum by (route, method) (rate(playarena_http_requests_total[1m])))",
+        "legendFormat": "{{method}} {{route}}"
+      }]
+    }
+  ]
+}

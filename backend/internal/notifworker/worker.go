@@ -30,6 +30,7 @@ import (
 
 	db "github.com/4yushraman-jpg/playarena/db/sqlc"
 	"github.com/4yushraman-jpg/playarena/internal/email"
+	"github.com/4yushraman-jpg/playarena/internal/platform/metrics"
 	"github.com/4yushraman-jpg/playarena/internal/platform/pgutil"
 )
 
@@ -47,18 +48,21 @@ type EmailWorker struct {
 	appBaseURL string
 	interval   time.Duration
 	log        *slog.Logger
+	reg        *metrics.Registry // nil means no metrics
 	done       chan struct{}
 }
 
 // NewEmailWorker constructs an EmailWorker. interval controls the polling
 // frequency (e.g., 30 * time.Second). appBaseURL is used to construct
 // deep-links in notification emails (e.g., "https://app.playarena.com").
+// reg may be nil; metrics recording is skipped when nil.
 func NewEmailWorker(
 	pool *pgxpool.Pool,
 	sender *email.Sender,
 	appBaseURL string,
 	interval time.Duration,
 	log *slog.Logger,
+	reg *metrics.Registry,
 ) *EmailWorker {
 	return &EmailWorker{
 		repo:       NewRepository(db.New(pool), pool),
@@ -66,6 +70,7 @@ func NewEmailWorker(
 		appBaseURL: appBaseURL,
 		interval:   interval,
 		log:        log,
+		reg:        reg,
 		done:       make(chan struct{}),
 	}
 }
@@ -113,7 +118,14 @@ func (w *EmailWorker) run() {
 func (w *EmailWorker) runOnce(ctx context.Context) error {
 	rows, err := w.repo.ClaimBatch(ctx, maxAttempts, batchSize)
 	if err != nil {
+		if w.reg != nil {
+			w.reg.EmailWorkerTickTotal.WithLabelValues("error").Inc()
+		}
 		return err
+	}
+	if w.reg != nil {
+		w.reg.EmailWorkerBatchSize.Observe(float64(len(rows)))
+		w.reg.EmailWorkerTickTotal.WithLabelValues("success").Inc()
 	}
 	for _, row := range rows {
 		w.deliver(ctx, row)
@@ -167,6 +179,10 @@ func (w *EmailWorker) deliver(ctx context.Context, n db.Notification) {
 		return
 	}
 
+	if w.reg != nil {
+		w.reg.EmailWorkerDeliveryTotal.WithLabelValues("success").Inc()
+	}
+
 	w.log.Info("notifworker: delivered",
 		slog.String("notification_id", nid),
 		slog.String("to", user.Email),
@@ -189,6 +205,13 @@ func (w *EmailWorker) recordFailure(ctx context.Context, n db.Notification) {
 			slog.String("notification_id", pgutil.UUIDToString(n.ID)),
 			slog.Any("error", err),
 		)
+	}
+	if w.reg != nil {
+		status := "failure"
+		if perm {
+			status = "permanent_failure"
+		}
+		w.reg.EmailWorkerDeliveryTotal.WithLabelValues(status).Inc()
 	}
 	if perm {
 		w.log.Warn("notifworker: permanently failed",

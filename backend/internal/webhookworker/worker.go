@@ -40,6 +40,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	db "github.com/4yushraman-jpg/playarena/db/sqlc"
+	"github.com/4yushraman-jpg/playarena/internal/platform/metrics"
 	"github.com/4yushraman-jpg/playarena/internal/platform/pgutil"
 	"github.com/4yushraman-jpg/playarena/internal/webhooks"
 )
@@ -59,18 +60,21 @@ type WebhookWorker struct {
 	client    *http.Client
 	interval  time.Duration
 	log       *slog.Logger
+	reg       *metrics.Registry // nil means no metrics
 	done      chan struct{}
 }
 
 // NewWebhookWorker constructs a WebhookWorker.
 // secretKeyB64 must be the base64-encoded 32-byte AES key used to encrypt secrets.
 // client may be nil, in which case a production SSRF-safe client is used.
+// reg may be nil; metrics recording is skipped when nil.
 func NewWebhookWorker(
 	pool *pgxpool.Pool,
 	secretKeyB64 string,
 	client *http.Client,
 	interval time.Duration,
 	log *slog.Logger,
+	reg *metrics.Registry,
 ) (*WebhookWorker, error) {
 	key, err := base64.StdEncoding.DecodeString(secretKeyB64)
 	if err != nil {
@@ -96,6 +100,7 @@ func NewWebhookWorker(
 		client:    client,
 		interval:  interval,
 		log:       log,
+		reg:       reg,
 		done:      make(chan struct{}),
 	}, nil
 }
@@ -138,7 +143,14 @@ func (w *WebhookWorker) run() {
 func (w *WebhookWorker) runOnce(ctx context.Context) error {
 	rows, err := w.repo.ClaimBatch(ctx, maxAttempts, batchSize)
 	if err != nil {
+		if w.reg != nil {
+			w.reg.WebhookWorkerTickTotal.WithLabelValues("error").Inc()
+		}
 		return err
+	}
+	if w.reg != nil {
+		w.reg.WebhookWorkerBatchSize.Observe(float64(len(rows)))
+		w.reg.WebhookWorkerTickTotal.WithLabelValues("success").Inc()
 	}
 	for _, row := range rows {
 		w.deliver(ctx, row)
@@ -256,6 +268,9 @@ func (w *WebhookWorker) deliver(ctx context.Context, d db.WebhookDelivery) {
 				slog.Any("error", err),
 			)
 		}
+		if w.reg != nil {
+			w.reg.WebhookWorkerDeliveryTotal.WithLabelValues("permanent_failure").Inc()
+		}
 		return
 	}
 
@@ -267,6 +282,9 @@ func (w *WebhookWorker) deliver(ctx context.Context, d db.WebhookDelivery) {
 				slog.Any("error", err),
 			)
 		} else {
+			if w.reg != nil {
+				w.reg.WebhookWorkerDeliveryTotal.WithLabelValues("success").Inc()
+			}
 			w.log.Info("webhookworker: delivered",
 				slog.String("delivery_id", did),
 				slog.String("url", ep.Url),
@@ -300,6 +318,13 @@ func (w *WebhookWorker) recordFailure(ctx context.Context, d db.WebhookDelivery)
 			slog.String("delivery_id", pgutil.UUIDToString(d.ID)),
 			slog.Any("error", err),
 		)
+	}
+	if w.reg != nil {
+		status := "failure"
+		if perm {
+			status = "permanent_failure"
+		}
+		w.reg.WebhookWorkerDeliveryTotal.WithLabelValues(status).Inc()
 	}
 	if perm {
 		w.log.Warn("webhookworker: permanently failed",

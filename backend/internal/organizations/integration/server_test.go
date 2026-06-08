@@ -67,7 +67,7 @@ func buildTestServer(t testing.TB, pool *pgxpool.Pool) *testServer {
 	r.Use(chimw.RealIP)
 	r.Use(chimw.Recoverer)
 
-	authHandler := auth.RegisterRoutes(r, pool, cfg, logger, limiter, sender)
+	authHandler := auth.RegisterRoutes(r, pool, cfg, logger, limiter, sender, nil)
 	r.Group(func(r chi.Router) {
 		r.Use(mw.BodySizeLimit(64 * 1024))
 		organizations.RegisterRoutes(r, pool, cfg, logger, authz)

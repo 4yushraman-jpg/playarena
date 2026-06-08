@@ -19,6 +19,7 @@ import (
 	"github.com/4yushraman-jpg/playarena/internal/notifworker"
 	"github.com/4yushraman-jpg/playarena/internal/organizations"
 	"github.com/4yushraman-jpg/playarena/internal/platform/config"
+	"github.com/4yushraman-jpg/playarena/internal/platform/metrics"
 	"github.com/4yushraman-jpg/playarena/internal/platform/middleware"
 	"github.com/4yushraman-jpg/playarena/internal/players"
 	"github.com/4yushraman-jpg/playarena/internal/realtime"
@@ -31,8 +32,8 @@ import (
 )
 
 // registerModules wires all domain modules into the router and returns the auth
-// Handler, EmailWorker, WebhookWorker, and realtime Hub so the bootstrap can
-// manage their lifecycles during graceful shutdown.
+// Handler, EmailWorker, WebhookWorker, realtime Hub, and the notification and
+// webhook repositories (used by the background metrics scrapers).
 //
 // authLimiter   — per-IP limiter for /api/v1/auth/* (applied inside auth.RegisterRoutes)
 // writeLimiter  — per-IP limiter for domain write endpoints (POST/PATCH/DELETE)
@@ -43,17 +44,18 @@ func registerModules(
 	pool *pgxpool.Pool,
 	log *slog.Logger,
 	cfg *config.Config,
+	reg *metrics.Registry,
 	authLimiter *middleware.IPRateLimiter,
 	writeLimiter *middleware.IPRateLimiter,
 	mediaLimiter *middleware.IPRateLimiter,
-) (*auth.Handler, *notifworker.EmailWorker, *webhookworker.WebhookWorker, *realtime.Hub) {
+) (*auth.Handler, *notifworker.EmailWorker, *webhookworker.WebhookWorker, *realtime.Hub, *notifications.Repository, *webhookworker.Repository) {
 	queries := db.New(pool)
 	authz := auth.NewAuthorizationService(queries)
 
-	hub := realtime.NewHub()
+	hub := realtime.NewHub().WithMetrics(reg)
 
 	notifRepo := notifications.NewRepository(queries, pool)
-	notifSvc := notifications.NewService(notifRepo, hub, log)
+	notifSvc := notifications.NewService(notifRepo, hub, log).WithMetrics(reg, cfg.DrainTimeoutSeconds)
 
 	// Email sender — constructed once and shared with the auth module.
 	// Failure here is fatal: a misconfigured email provider is a deployment
@@ -70,20 +72,21 @@ func registerModules(
 
 	// Email worker — delivers pending email channel notification rows async.
 	workerInterval := time.Duration(cfg.NotifWorkerIntervalSeconds) * time.Second
-	emailWorker := notifworker.NewEmailWorker(pool, emailSender, cfg.AppBaseURL, workerInterval, log)
+	emailWorker := notifworker.NewEmailWorker(pool, emailSender, cfg.AppBaseURL, workerInterval, log, reg)
 
 	// Webhook worker — delivers pending webhook_deliveries rows async.
 	webhookInterval := time.Duration(cfg.WebhookWorkerIntervalSeconds) * time.Second
-	webhookWorker, err := webhookworker.NewWebhookWorker(pool, cfg.WebhookSecretKey, nil, webhookInterval, log)
+	webhookWorker, err := webhookworker.NewWebhookWorker(pool, cfg.WebhookSecretKey, nil, webhookInterval, log, reg)
 	if err != nil {
 		log.Error("bootstrap: failed to initialise webhook worker",
 			slog.Any("error", err),
 		)
 		panic("webhook worker initialisation failed: " + err.Error())
 	}
+	webhookRepo := webhookworker.NewRepository(pool)
 
 	health.RegisterRoutes(r, pool)
-	authHandler := auth.RegisterRoutes(r, pool, cfg, log, authLimiter, emailSender)
+	authHandler := auth.RegisterRoutes(r, pool, cfg, log, authLimiter, emailSender, reg)
 
 	// Domain write endpoints — writeLimiter applied to POST/PUT/PATCH/DELETE.
 	// GET requests pass through without consuming tokens.
@@ -127,5 +130,5 @@ func registerModules(
 		media.RegisterRoutes(r, pool, cfg, log, authz, mediaBackend)
 	})
 
-	return authHandler, emailWorker, webhookWorker, hub
+	return authHandler, emailWorker, webhookWorker, hub, notifRepo, webhookRepo
 }

@@ -66,3 +66,13 @@ func (r *Repository) GetOrgSlugByID(ctx context.Context, id pgtype.UUID) (string
 	}
 	return org.Slug, nil
 }
+
+// CountDeadLetters returns the number of email notification rows with
+// failed_permanently = TRUE. Used by the background metrics scraper.
+func (r *Repository) CountDeadLetters(ctx context.Context) (int64, error) {
+	var n int64
+	err := r.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM notifications WHERE channel = 'email' AND failed_permanently = TRUE`,
+	).Scan(&n)
+	return n, err
+}
