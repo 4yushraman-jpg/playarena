@@ -366,7 +366,7 @@ type UpdateRegistrationParams struct {
 	SeedNumber   *int16             `json:"seed_number"`
 	Notes        *string            `json:"notes"`
 	ApprovedBy   pgtype.UUID        `json:"approved_by"`
-	ApprovedAt   pgtype.Timestamptz `json:"approved_at"`
+	Column7      pgtype.Timestamptz `json:"column_7"`
 }
 
 // Updates mutable fields. Service layer applies partial request over
@@ -379,7 +379,7 @@ func (q *Queries) UpdateRegistration(ctx context.Context, arg UpdateRegistration
 		arg.SeedNumber,
 		arg.Notes,
 		arg.ApprovedBy,
-		arg.ApprovedAt,
+		arg.Column7,
 	)
 	var i TournamentRegistration
 	err := row.Scan(

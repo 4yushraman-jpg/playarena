@@ -507,7 +507,7 @@ type UpdateMatchParams struct {
 	Venue          *string            `json:"venue"`
 	ScheduledAt    pgtype.Timestamptz `json:"scheduled_at"`
 	StartedAt      pgtype.Timestamptz `json:"started_at"`
-	EndedAt        pgtype.Timestamptz `json:"ended_at"`
+	Column13       pgtype.Timestamptz `json:"column_13"`
 	Status         MatchStatus        `json:"status"`
 	WinnerTeamID   pgtype.UUID        `json:"winner_team_id"`
 	WinnerPlayerID pgtype.UUID        `json:"winner_player_id"`
@@ -543,7 +543,7 @@ func (q *Queries) UpdateMatch(ctx context.Context, arg UpdateMatchParams) (Match
 		arg.Venue,
 		arg.ScheduledAt,
 		arg.StartedAt,
-		arg.EndedAt,
+		arg.Column13,
 		arg.Status,
 		arg.WinnerTeamID,
 		arg.WinnerPlayerID,

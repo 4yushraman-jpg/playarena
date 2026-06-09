@@ -285,8 +285,8 @@ func (s *Service) Update(
 		Status:       current.Status,
 		SeedNumber:   current.SeedNumber,
 		Notes:        current.Notes,
-		ApprovedBy:   current.ApprovedBy,
-		ApprovedAt:   current.ApprovedAt,
+		ApprovedBy: current.ApprovedBy,
+		Column7:    current.ApprovedAt,
 	}
 
 	if req.SeedNumber != nil {
@@ -308,7 +308,7 @@ func (s *Service) Update(
 		// Stamp approval fields when transitioning to approved.
 		if newStatus == db.RegistrationStatusApproved {
 			params.ApprovedBy = actorUID
-			params.ApprovedAt = pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true}
+			params.Column7 = pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true}
 		}
 	}
 

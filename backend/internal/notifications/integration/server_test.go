@@ -81,7 +81,7 @@ func buildTestServer(t testing.TB, pool *pgxpool.Pool) *testServer {
 	r.Group(func(r chi.Router) {
 		r.Use(mw.BodySizeLimit(64 * 1024))
 		notifications.RegisterRoutes(r, pool, cfg, logger, authz, hub)
-		tournaments.RegisterRoutes(r, pool, cfg, logger, authz, notifSvc)
+		tournaments.RegisterRoutes(r, pool, cfg, logger, authz, notifSvc, nil)
 		tournament_registrations.RegisterRoutes(r, pool, cfg, logger, authz, notifSvc)
 	})
 

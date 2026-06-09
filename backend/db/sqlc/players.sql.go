@@ -209,8 +209,10 @@ type ListPlayersPaginatedParams struct {
 	PageLimit      int32       `json:"page_limit"`
 }
 
-// Returns non-inactive players for an org with optional status and name
-// search filters. Soft-deleted (inactive) players are excluded by default.
+// Returns players for an org with optional status and name search filters.
+// When no status_filter is given, inactive (soft-deleted) players are excluded.
+// When status_filter is provided, it overrides the default exclusion so callers
+// can explicitly request inactive players.
 func (q *Queries) ListPlayersPaginated(ctx context.Context, arg ListPlayersPaginatedParams) ([]Player, error) {
 	rows, err := q.db.Query(ctx, listPlayersPaginated,
 		arg.OrganizationID,

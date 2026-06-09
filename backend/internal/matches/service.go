@@ -291,7 +291,7 @@ func (s *Service) Update(
 		Venue:          current.Venue,
 		ScheduledAt:    current.ScheduledAt,
 		StartedAt:      current.StartedAt,
-		EndedAt:        current.EndedAt,
+		Column13:       current.EndedAt,
 		Status:         current.Status,
 		WinnerTeamID:   current.WinnerTeamID,
 		WinnerPlayerID: current.WinnerPlayerID,
@@ -382,8 +382,8 @@ func (s *Service) Update(
 			params.StartedAt = pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true}
 		}
 		if (newStatus == db.MatchStatusCompleted || newStatus == db.MatchStatusAbandoned) &&
-			!params.EndedAt.Valid {
-			params.EndedAt = pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true}
+			!params.Column13.Valid {
+			params.Column13 = pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true}
 		}
 
 		// Tournament status must be ongoing when advancing a match's lifecycle.

@@ -75,7 +75,7 @@ func buildTestServer(t testing.TB, pool *pgxpool.Pool) *testServer {
 	authHandler := auth.RegisterRoutes(r, pool, cfg, logger, limiter, sender, nil)
 	r.Group(func(r chi.Router) {
 		r.Use(mw.BodySizeLimit(64 * 1024))
-		tournaments.RegisterRoutes(r, pool, cfg, logger, authz, notifSvc)
+		tournaments.RegisterRoutes(r, pool, cfg, logger, authz, notifSvc, nil)
 		tournament_registrations.RegisterRoutes(r, pool, cfg, logger, authz, notifSvc)
 	})
 

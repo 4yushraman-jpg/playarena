@@ -15,6 +15,7 @@ import (
 	db "github.com/4yushraman-jpg/playarena/db/sqlc"
 	"github.com/4yushraman-jpg/playarena/internal/notifications"
 	"github.com/4yushraman-jpg/playarena/internal/platform/pgutil"
+	"github.com/4yushraman-jpg/playarena/internal/rankings"
 	"github.com/4yushraman-jpg/playarena/internal/standings"
 )
 
@@ -52,14 +53,15 @@ var (
 
 // Service implements tournament use-cases.
 type Service struct {
-	repo     *Repository
-	log      *slog.Logger
-	notifSvc *notifications.Service
+	repo         *Repository
+	log          *slog.Logger
+	notifSvc     *notifications.Service
+	rankingsRepo *rankings.Repository // nil is valid: snapshot is skipped
 }
 
 // NewService constructs a Service.
-func NewService(repo *Repository, log *slog.Logger, notifSvc *notifications.Service) *Service {
-	return &Service{repo: repo, log: log, notifSvc: notifSvc}
+func NewService(repo *Repository, log *slog.Logger, notifSvc *notifications.Service, rankingsRepo *rankings.Repository) *Service {
+	return &Service{repo: repo, log: log, notifSvc: notifSvc, rankingsRepo: rankingsRepo}
 }
 
 // ── tournament CRUD ───────────────────────────────────────────────────────────
@@ -414,6 +416,10 @@ func (s *Service) Update(ctx context.Context, orgSlug, tournamentID string, req 
 		return nil, err
 	}
 
+	if updated.Status == db.TournamentStatusCompleted && s.rankingsRepo != nil {
+		s.snapshotTournamentStats(ctx, updated, org.ID)
+	}
+
 	// Synchronous post-commit drain.
 	s.notifSvc.DrainOutbox(ctx, org.ID, s.log)
 
@@ -470,6 +476,90 @@ func (s *Service) Delete(ctx context.Context, orgSlug, tournamentID string, acto
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
+
+// snapshotTournamentStats upserts final standings into the rankings tables.
+// Called synchronously after a tournament transitions to completed.
+// Errors are logged but do not fail the PATCH response.
+func (s *Service) snapshotTournamentStats(ctx context.Context, t *db.Tournament, orgID pgtype.UUID) {
+	rawMatches, err := s.repo.GetCompletedMatchesForStandings(ctx, t.ID, orgID)
+	if err != nil {
+		s.log.ErrorContext(ctx, "rankings.snapshot: fetch matches failed",
+			slog.String("tournament_id", pgutil.UUIDToString(t.ID)),
+			slog.Any("error", err),
+		)
+		return
+	}
+
+	rawRegs, err := s.repo.GetRegistrationsForStandings(ctx, t.ID)
+	if err != nil {
+		s.log.ErrorContext(ctx, "rankings.snapshot: fetch registrations failed",
+			slog.String("tournament_id", pgutil.UUIDToString(t.ID)),
+			slog.Any("error", err),
+		)
+		return
+	}
+
+	settings := parseStandingsSettings(t.Settings)
+
+	matches := make([]standings.CompletedMatch, 0, len(rawMatches))
+	for _, m := range rawMatches {
+		cm := standings.CompletedMatch{
+			HomeParticipantID: participantID(m.HomeTeamID, m.HomePlayerID),
+			AwayParticipantID: participantID(m.AwayTeamID, m.AwayPlayerID),
+			HomeScore:         int(m.HomeScore),
+			AwayScore:         int(m.AwayScore),
+			WinnerID:          participantID(m.WinnerTeamID, m.WinnerPlayerID),
+			IsWalkover:        m.IsWalkover,
+		}
+		if cm.HomeParticipantID == "" || cm.AwayParticipantID == "" {
+			continue
+		}
+		matches = append(matches, cm)
+	}
+
+	regs := make([]standings.RegistrationInfo, 0, len(rawRegs))
+	for _, reg := range rawRegs {
+		pid := participantID(reg.TeamID, reg.PlayerID)
+		if pid == "" {
+			continue
+		}
+		regs = append(regs, standings.RegistrationInfo{
+			ParticipantID: pid,
+			SeedNumber:    reg.SeedNumber,
+			RegisteredAt:  reg.RegisteredAt.Time.UTC(),
+		})
+	}
+
+	rows := standings.Compute(matches, regs, settings)
+
+	statsRows := make([]rankings.StatsRow, len(rows))
+	for i, row := range rows {
+		statsRows[i] = rankings.StatsRow{
+			ParticipantID: row.ParticipantID,
+			Position:      row.Position,
+			Played:        row.Played,
+			Wins:          row.Wins,
+			Draws:         row.Draws,
+			Losses:        row.Losses,
+			Points:        row.Points,
+			ScoreFor:      row.ScoreFor,
+			ScoreAgainst:  row.ScoreAgainst,
+		}
+	}
+
+	var snapErr error
+	if t.ParticipantType == db.ParticipantTypeIndividual {
+		snapErr = s.rankingsRepo.SnapshotPlayerStats(ctx, orgID, t.ID, statsRows)
+	} else {
+		snapErr = s.rankingsRepo.SnapshotTeamStats(ctx, orgID, t.ID, statsRows)
+	}
+	if snapErr != nil {
+		s.log.ErrorContext(ctx, "rankings.snapshot: upsert failed",
+			slog.String("tournament_id", pgutil.UUIDToString(t.ID)),
+			slog.Any("error", snapErr),
+		)
+	}
+}
 
 func assertOrgOwnership(actorOrgID, targetOrgID string) error {
 	if actorOrgID == "" {

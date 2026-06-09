@@ -10,6 +10,7 @@ import (
 	"github.com/4yushraman-jpg/playarena/internal/auth"
 	"github.com/4yushraman-jpg/playarena/internal/notifications"
 	"github.com/4yushraman-jpg/playarena/internal/platform/config"
+	"github.com/4yushraman-jpg/playarena/internal/rankings"
 )
 
 // RegisterRoutes mounts all tournament endpoints under
@@ -30,10 +31,11 @@ func RegisterRoutes(
 	log *slog.Logger,
 	authz *auth.AuthorizationService,
 	notifSvc *notifications.Service,
+	rankingsRepo *rankings.Repository,
 ) {
 	queries := db.New(pool)
 	repo := NewRepository(queries, pool)
-	svc := NewService(repo, log, notifSvc)
+	svc := NewService(repo, log, notifSvc, rankingsRepo)
 	h := NewHandler(svc, log)
 
 	r.Route("/api/v1/organizations/{slug}/tournaments", func(r chi.Router) {

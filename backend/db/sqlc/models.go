@@ -1193,6 +1193,23 @@ type Player struct {
 	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
 }
 
+// Final standings result for one player in one completed tournament. Snapshotted at tournament completion. Source for all-time player rankings.
+type PlayerTournamentStat struct {
+	ID             pgtype.UUID        `json:"id"`
+	PlayerID       pgtype.UUID        `json:"player_id"`
+	TournamentID   pgtype.UUID        `json:"tournament_id"`
+	OrganizationID pgtype.UUID        `json:"organization_id"`
+	Position       int32              `json:"position"`
+	MatchesPlayed  int32              `json:"matches_played"`
+	MatchesWon     int32              `json:"matches_won"`
+	MatchesDrawn   int32              `json:"matches_drawn"`
+	MatchesLost    int32              `json:"matches_lost"`
+	Points         int32              `json:"points"`
+	ScoreFor       int32              `json:"score_for"`
+	ScoreAgainst   int32              `json:"score_against"`
+	SnapshottedAt  pgtype.Timestamptz `json:"snapshotted_at"`
+}
+
 // JWT refresh token revocation store. Stores a hash of the raw token — the raw token is never persisted. A token is valid when: revoked_at IS NULL AND expires_at > NOW(). Expired and revoked rows are cleaned up by a periodic background job.
 type RefreshToken struct {
 	ID     pgtype.UUID `json:"id"`
@@ -1273,6 +1290,23 @@ type TeamMembership struct {
 	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
 	// Tenant scope: must equal both teams.organization_id and players.organization_id for this membership row. Enforced by trg_team_memberships_org_consistency.
 	OrganizationID pgtype.UUID `json:"organization_id"`
+}
+
+// Final standings result for one team in one completed tournament. Snapshotted at tournament completion. Source for all-time team rankings.
+type TeamTournamentStat struct {
+	ID             pgtype.UUID        `json:"id"`
+	TeamID         pgtype.UUID        `json:"team_id"`
+	TournamentID   pgtype.UUID        `json:"tournament_id"`
+	OrganizationID pgtype.UUID        `json:"organization_id"`
+	Position       int32              `json:"position"`
+	MatchesPlayed  int32              `json:"matches_played"`
+	MatchesWon     int32              `json:"matches_won"`
+	MatchesDrawn   int32              `json:"matches_drawn"`
+	MatchesLost    int32              `json:"matches_lost"`
+	Points         int32              `json:"points"`
+	ScoreFor       int32              `json:"score_for"`
+	ScoreAgainst   int32              `json:"score_against"`
+	SnapshottedAt  pgtype.Timestamptz `json:"snapshotted_at"`
 }
 
 // A tournament hosted by an organization. slug is unique within the org. Status transitions are one-way in application logic: draft → registration_open → registration_closed → ongoing → completed. Any state → cancelled is always permitted.

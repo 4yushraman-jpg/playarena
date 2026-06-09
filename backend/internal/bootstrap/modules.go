@@ -24,6 +24,7 @@ import (
 	"github.com/4yushraman-jpg/playarena/internal/players"
 	"github.com/4yushraman-jpg/playarena/internal/realtime"
 	"github.com/4yushraman-jpg/playarena/internal/teams"
+	"github.com/4yushraman-jpg/playarena/internal/rankings"
 	"github.com/4yushraman-jpg/playarena/internal/tournament_registrations"
 	"github.com/4yushraman-jpg/playarena/internal/tournaments"
 	"github.com/4yushraman-jpg/playarena/internal/users"
@@ -85,6 +86,8 @@ func registerModules(
 	}
 	webhookRepo := webhookworker.NewRepository(pool)
 
+	rankingsRepo := rankings.NewRepository(queries, pool)
+
 	health.RegisterRoutes(r, pool)
 	authHandler := auth.RegisterRoutes(r, pool, cfg, log, authLimiter, emailSender, reg)
 
@@ -103,12 +106,13 @@ func registerModules(
 		organizations.RegisterRoutes(r, pool, cfg, log, authz)
 		players.RegisterRoutes(r, pool, cfg, log, authz)
 		teams.RegisterRoutes(r, pool, cfg, log, authz)
-		tournaments.RegisterRoutes(r, pool, cfg, log, authz, notifSvc)
+		tournaments.RegisterRoutes(r, pool, cfg, log, authz, notifSvc, rankingsRepo)
 		tournament_registrations.RegisterRoutes(r, pool, cfg, log, authz, notifSvc)
 		matches.RegisterRoutes(r, pool, cfg, log, authz, notifSvc)
 		match_events.RegisterRoutes(r, pool, cfg, log, authz)
 		notifications.RegisterRoutes(r, pool, cfg, log, authz, hub)
 		webhooks.RegisterRoutes(r, pool, cfg, log, authz)
+		rankings.RegisterRoutes(r, pool, cfg, log)
 	})
 
 	mediaBackend, err := mediastorage.New(cfg)
