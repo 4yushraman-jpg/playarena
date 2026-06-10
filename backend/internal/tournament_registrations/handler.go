@@ -216,6 +216,8 @@ func (h *Handler) writeRegError(w http.ResponseWriter, r *http.Request, err erro
 		response.Error(w, http.StatusNotFound, "tournament not found")
 	case errors.Is(err, ErrTeamNotFound):
 		response.Error(w, http.StatusNotFound, "team not found")
+	case errors.Is(err, ErrPlayerNotFound):
+		response.Error(w, http.StatusNotFound, "player not found")
 	case errors.Is(err, ErrRegistrationNotFound):
 		response.Error(w, http.StatusNotFound, "registration not found")
 	case errors.Is(err, ErrForbidden):
@@ -233,6 +235,10 @@ func (h *Handler) writeRegError(w http.ResponseWriter, r *http.Request, err erro
 	case errors.Is(err, ErrWindowClosed):
 		response.Error(w, http.StatusUnprocessableEntity, err.Error())
 	case errors.Is(err, ErrTeamNotActive):
+		response.Error(w, http.StatusUnprocessableEntity, err.Error())
+	case errors.Is(err, ErrPlayerNotActive):
+		response.Error(w, http.StatusUnprocessableEntity, err.Error())
+	case errors.Is(err, ErrWrongParticipantType):
 		response.Error(w, http.StatusUnprocessableEntity, err.Error())
 	case errors.Is(err, ErrEmptyTeam):
 		response.Error(w, http.StatusUnprocessableEntity, err.Error())

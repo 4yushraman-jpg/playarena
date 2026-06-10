@@ -140,6 +140,31 @@ func (r *Repository) TournamentExists(ctx context.Context, tournamentID, orgID p
 	})
 }
 
+func (r *Repository) MatchExists(ctx context.Context, matchID, orgID pgtype.UUID) (bool, error) {
+	_, err := r.queries.GetMatchByID(ctx, db.GetMatchByIDParams{
+		ID:             matchID,
+		OrganizationID: orgID,
+	})
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func (r *Repository) UserExists(ctx context.Context, userID pgtype.UUID) (bool, error) {
+	_, err := r.queries.GetUserByID(ctx, userID)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
 // ── writes (transactional) ────────────────────────────────────────────────────
 
 // createMediaTxParams bundles inputs for CreateWithAudit.

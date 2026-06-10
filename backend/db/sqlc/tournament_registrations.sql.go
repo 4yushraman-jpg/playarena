@@ -183,6 +183,44 @@ func (q *Queries) GetRegistrationByID(ctx context.Context, arg GetRegistrationBy
 	return i, err
 }
 
+const getRegistrationByPlayer = `-- name: GetRegistrationByPlayer :one
+SELECT id, tournament_id, organization_id, team_id, player_id, seed_number, status, registered_by, registered_at, approved_by, approved_at, notes, metadata, created_at, updated_at
+FROM   tournament_registrations
+WHERE  tournament_id = $1
+  AND  player_id     = $2
+LIMIT  1
+`
+
+type GetRegistrationByPlayerParams struct {
+	TournamentID pgtype.UUID `json:"tournament_id"`
+	PlayerID     pgtype.UUID `json:"player_id"`
+}
+
+// Returns an existing registration for the given (tournament, player) pair,
+// regardless of status. Used to enforce Rule 4: no duplicate registrations.
+func (q *Queries) GetRegistrationByPlayer(ctx context.Context, arg GetRegistrationByPlayerParams) (TournamentRegistration, error) {
+	row := q.db.QueryRow(ctx, getRegistrationByPlayer, arg.TournamentID, arg.PlayerID)
+	var i TournamentRegistration
+	err := row.Scan(
+		&i.ID,
+		&i.TournamentID,
+		&i.OrganizationID,
+		&i.TeamID,
+		&i.PlayerID,
+		&i.SeedNumber,
+		&i.Status,
+		&i.RegisteredBy,
+		&i.RegisteredAt,
+		&i.ApprovedBy,
+		&i.ApprovedAt,
+		&i.Notes,
+		&i.Metadata,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const getRegistrationByTeam = `-- name: GetRegistrationByTeam :one
 SELECT id, tournament_id, organization_id, team_id, player_id, seed_number, status, registered_by, registered_at, approved_by, approved_at, notes, metadata, created_at, updated_at
 FROM   tournament_registrations

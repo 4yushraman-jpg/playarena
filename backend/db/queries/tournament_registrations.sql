@@ -88,6 +88,15 @@ WHERE  tournament_id = $1
   AND  status        = 'approved'
 LIMIT  1;
 
+-- name: GetRegistrationByPlayer :one
+-- Returns an existing registration for the given (tournament, player) pair,
+-- regardless of status. Used to enforce Rule 4: no duplicate registrations.
+SELECT *
+FROM   tournament_registrations
+WHERE  tournament_id = $1
+  AND  player_id     = $2
+LIMIT  1;
+
 -- name: GetApprovedRegistrationByPlayer :one
 -- Used by the matches module to verify a player has an approved registration
 -- before being assigned as a match participant.

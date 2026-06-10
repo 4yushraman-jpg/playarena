@@ -11,6 +11,7 @@ import (
 	"github.com/4yushraman-jpg/playarena/internal/auth"
 	"github.com/4yushraman-jpg/playarena/internal/email"
 	"github.com/4yushraman-jpg/playarena/internal/health"
+	"github.com/4yushraman-jpg/playarena/internal/members"
 	"github.com/4yushraman-jpg/playarena/internal/match_events"
 	"github.com/4yushraman-jpg/playarena/internal/matches"
 	"github.com/4yushraman-jpg/playarena/internal/media"
@@ -104,6 +105,7 @@ func registerModules(
 		}
 		users.RegisterRoutes(r, pool, cfg, log)
 		organizations.RegisterRoutes(r, pool, cfg, log, authz)
+		members.RegisterRoutes(r, pool, cfg, log, authz)
 		players.RegisterRoutes(r, pool, cfg, log, authz)
 		teams.RegisterRoutes(r, pool, cfg, log, authz)
 		tournaments.RegisterRoutes(r, pool, cfg, log, authz, notifSvc, rankingsRepo)

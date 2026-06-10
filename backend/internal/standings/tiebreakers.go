@@ -1,13 +1,18 @@
 package standings
 
+import "sort"
+
 // makeLess returns the comparator function passed to sort.SliceStable.
 //
 // Tiebreaker chain (highest priority first):
 //
 //  1. Points DESC — primary ranking criterion.
-//  2. Head-to-head result — applied ONLY when exactly two participants share
-//     the same point total (strict 2-way tie).  N-way head-to-head sub-table
-//     resolution is deferred to a future phase.
+//  2. Head-to-head sub-table — applied to ALL N participants that share the
+//     same points total (N ≥ 2).  The sub-table considers only matches played
+//     among the tied group and is sorted by h2h points → h2h score difference →
+//     h2h score for.  If two participants are still tied after all h2h criteria
+//     (e.g., a cyclic A>B>C>A result), they share the same h2h rank and this
+//     criterion is inconclusive for that pair.
 //  3. Score difference DESC (ScoreFor - ScoreAgainst across all matches).
 //  4. Score for DESC (total points scored).
 //  5. Wins DESC.
@@ -18,15 +23,8 @@ package standings
 //     this criterion guarantees a fully deterministic sort with no ties.
 //
 // The comparator is both consistent (a<b implies b>a) and transitive.
-// Head-to-head is restricted to strict 2-way ties to avoid the classic
-// non-transitivity problem that arises with 3+ participants in a cycle.
 func makeLess(rows []StandingsRow, matches []CompletedMatch, s Settings) func(i, j int) bool {
-	// Pre-compute how many participants share each point total.
-	// Used to detect strict 2-way ties for head-to-head application.
-	pointsFreq := make(map[int]int, len(rows))
-	for _, r := range rows {
-		pointsFreq[r.Points]++
-	}
+	h2hRanks := buildH2HRanks(rows, matches, s)
 
 	return func(i, j int) bool {
 		ri, rj := rows[i], rows[j]
@@ -36,11 +34,10 @@ func makeLess(rows []StandingsRow, matches []CompletedMatch, s Settings) func(i,
 			return ri.Points > rj.Points
 		}
 
-		// 2. Head-to-head (strict 2-way ties only)
-		if pointsFreq[ri.Points] == 2 {
-			if cmp := h2hCompare(ri.ParticipantID, rj.ParticipantID, matches, s); cmp != 0 {
-				return cmp > 0
-			}
+		// 2. Head-to-head rank (N-way sub-table among all tied participants)
+		aRank, bRank := h2hRanks[ri.ParticipantID], h2hRanks[rj.ParticipantID]
+		if aRank != bRank {
+			return aRank < bRank
 		}
 
 		// 3. Score difference DESC
@@ -68,92 +65,108 @@ func makeLess(rows []StandingsRow, matches []CompletedMatch, s Settings) func(i,
 	}
 }
 
-// h2hCompare returns the head-to-head comparison between participants a and b,
-// considering only matches played between them.  Uses the tournament's own
-// point system so the sub-ranking is consistent with the main table.
+// buildH2HRanks pre-computes an ordinal h2h rank for every participant within
+// its tied-points group. Ranks are 1-indexed (rank 1 = best in sub-table).
 //
-// Return values:
+// Algorithm per group:
+//  1. Filter matches to those played exclusively among group members.
+//  2. Accumulate h2h points, score difference, and score for each member.
+//  3. Sort members by h2h points DESC → h2h score diff DESC → h2h score for DESC.
+//  4. Assign ranks; members with identical stats share the same rank.
 //
-//	+1  a ranks higher in head-to-head
-//	-1  b ranks higher in head-to-head
-//	 0  inconclusive (no h2h matches played, or still tied after h2h criteria)
-func h2hCompare(aID, bID string, matches []CompletedMatch, s Settings) int {
-	var aPoints, bPoints int
-	var aScoreDiff, bScoreDiff int
-	var aScoreFor, bScoreFor int
+// A shared rank means h2h is inconclusive for that pair — the main comparator
+// falls through to the next global tiebreaker (score difference, etc.).
+// Cyclic results (A>B>C>A) naturally produce a three-way shared rank.
+func buildH2HRanks(rows []StandingsRow, matches []CompletedMatch, s Settings) map[string]int {
+	groups := make(map[int][]string)
+	for _, r := range rows {
+		groups[r.Points] = append(groups[r.Points], r.ParticipantID)
+	}
 
-	for _, m := range matches {
-		var homeIsA bool
-		switch {
-		case m.HomeParticipantID == aID && m.AwayParticipantID == bID:
-			homeIsA = true
-		case m.HomeParticipantID == bID && m.AwayParticipantID == aID:
-			homeIsA = false
-		default:
+	out := make(map[string]int, len(rows))
+
+	for _, group := range groups {
+		if len(group) == 1 {
+			out[group[0]] = 1
 			continue
 		}
 
-		if homeIsA {
-			aScoreFor += m.HomeScore
-			bScoreFor += m.AwayScore
-			aScoreDiff += m.HomeScore - m.AwayScore
-			bScoreDiff += m.AwayScore - m.HomeScore
-			switch m.WinnerID {
-			case aID:
-				aPoints += s.WinPoints
-				margin := m.HomeScore - m.AwayScore
-				if margin < 0 {
-					margin = -margin
-				}
-				bPoints += closeLossPoints(s, margin, m.IsWalkover)
-			case bID:
-				bPoints += s.WinPoints
-				margin := m.HomeScore - m.AwayScore
-				if margin < 0 {
-					margin = -margin
-				}
-				aPoints += closeLossPoints(s, margin, m.IsWalkover)
-			default:
-				aPoints += s.DrawPoints
-				bPoints += s.DrawPoints
+		inGroup := make(map[string]bool, len(group))
+		for _, pid := range group {
+			inGroup[pid] = true
+		}
+
+		type h2hStats struct {
+			id        string
+			points    int
+			scoreDiff int
+			scoreFor  int
+		}
+
+		statsMap := make(map[string]*h2hStats, len(group))
+		for _, pid := range group {
+			statsMap[pid] = &h2hStats{id: pid}
+		}
+
+		for _, m := range matches {
+			if !inGroup[m.HomeParticipantID] || !inGroup[m.AwayParticipantID] {
+				continue
 			}
-		} else {
-			bScoreFor += m.HomeScore
-			aScoreFor += m.AwayScore
-			bScoreDiff += m.HomeScore - m.AwayScore
-			aScoreDiff += m.AwayScore - m.HomeScore
-			switch m.WinnerID {
-			case bID:
-				bPoints += s.WinPoints
-				margin := m.HomeScore - m.AwayScore
-				if margin < 0 {
-					margin = -margin
-				}
-				aPoints += closeLossPoints(s, margin, m.IsWalkover)
-			case aID:
-				aPoints += s.WinPoints
-				margin := m.HomeScore - m.AwayScore
-				if margin < 0 {
-					margin = -margin
-				}
-				bPoints += closeLossPoints(s, margin, m.IsWalkover)
-			default:
-				aPoints += s.DrawPoints
-				bPoints += s.DrawPoints
+			home := statsMap[m.HomeParticipantID]
+			away := statsMap[m.AwayParticipantID]
+
+			home.scoreFor += m.HomeScore
+			away.scoreFor += m.AwayScore
+			home.scoreDiff += m.HomeScore - m.AwayScore
+			away.scoreDiff += m.AwayScore - m.HomeScore
+
+			margin := m.HomeScore - m.AwayScore
+			if margin < 0 {
+				margin = -margin
 			}
+
+			switch m.WinnerID {
+			case m.HomeParticipantID:
+				home.points += s.WinPoints
+				away.points += closeLossPoints(s, margin, m.IsWalkover)
+			case m.AwayParticipantID:
+				away.points += s.WinPoints
+				home.points += closeLossPoints(s, margin, m.IsWalkover)
+			default:
+				home.points += s.DrawPoints
+				away.points += s.DrawPoints
+			}
+		}
+
+		sorted := make([]*h2hStats, 0, len(group))
+		for _, pid := range group {
+			sorted = append(sorted, statsMap[pid])
+		}
+		sort.SliceStable(sorted, func(i, j int) bool {
+			a, b := sorted[i], sorted[j]
+			if a.points != b.points {
+				return a.points > b.points
+			}
+			if a.scoreDiff != b.scoreDiff {
+				return a.scoreDiff > b.scoreDiff
+			}
+			return a.scoreFor > b.scoreFor
+		})
+
+		// Assign ordinal ranks; tied entries share the same rank.
+		rank := 1
+		for i, st := range sorted {
+			if i > 0 {
+				prev := sorted[i-1]
+				if st.points != prev.points || st.scoreDiff != prev.scoreDiff || st.scoreFor != prev.scoreFor {
+					rank = i + 1
+				}
+			}
+			out[st.id] = rank
 		}
 	}
 
-	if aPoints != bPoints {
-		return sign(aPoints - bPoints)
-	}
-	if aScoreDiff != bScoreDiff {
-		return sign(aScoreDiff - bScoreDiff)
-	}
-	if aScoreFor != bScoreFor {
-		return sign(aScoreFor - bScoreFor)
-	}
-	return 0
+	return out
 }
 
 // seedCompare compares two optional seed numbers.

@@ -1,11 +1,11 @@
 # PlayArena — Project State & Handoff Document
 
-**Last Updated:** 2026-06-07  
+**Last Updated:** 2026-06-10  
 **Build status:** `go build ./...` passing, `go vet ./...` clean, `sqlc generate` clean  
-**Migrations applied:** 000001 – 000026  
+**Migrations applied:** 000001 – 000027  
 **Go version:** 1.25.6  
 **Database:** PostgreSQL 17  
-**Phases complete:** 1 – 12, Auth Security Hotfix v2, Phase 13A, Phase 13B.1, Phase 13B.2A, Phase 13B.2B-A, Phase 13B.2B-B, Phase 14, Phase 15A, Phase 15A Remediation, Phase 16, Phase 17, Phase 18, Phase 19, Phase 19 Remediation, Phase 20, Phase 20 Remediation
+**Phases complete:** 1 – 12, Auth Security Hotfix v2, Phase 13A, Phase 13B.1, Phase 13B.2A, Phase 13B.2B-A, Phase 13B.2B-B, Phase 14, Phase 15A, Phase 15A Remediation, Phase 16, Phase 17, Phase 18, Phase 19, Phase 19 Remediation, Phase 20, Phase 20 Remediation, Phase 21, Phase 22, Phase 23A, Phase 23B, Phase 23C, Phase 23D
 
 ---
 
@@ -36,7 +36,7 @@
 backend/
 ├── cmd/api/main.go                         Entry point — config, DB pool, HTTP server, graceful shutdown
 ├── db/
-│   ├── migrations/                         golang-migrate files (000001–000025, up + down); embed.go exports FS for test runners
+│   ├── migrations/                         golang-migrate files (000001–000027, up + down); embed.go exports FS for test runners
 │   ├── queries/                            Hand-written SQL (sqlc source)
 │   └── sqlc/                              Generated type-safe Go — never edited by hand
 ├── internal/
@@ -181,7 +181,25 @@ backend/
 │   │       ├── testmain_test.go           Standard testcontainers TestMain
 │   │       └── worker_test.go             10 integration tests: delivery, idempotency, signature verification, retry on 5xx, permanent failure on 4xx, 429 retry, dead-letter after 3 attempts, concurrent workers, start/stop, tenant isolation
 │   ├── realtime/                           In-process pub/sub Hub for SSE (Phase 20)
-│   │   └── hub.go                         Hub — sync.RWMutex-protected map[subKey]map[chan []byte]struct{}; Subscribe/Unsubscribe/Publish/Shutdown/Done; buffer 32; non-blocking publish (drop on full; RLock held through fan-out to prevent data race + send-on-closed panic)
+│   │   └── hub.go                         Hub — sync.RWMutex-protected map[subKey]map[chan []byte]struct{}; Subscribe/Unsubscribe/Publish/Shutdown/Done; buffer 32; non-blocking publish (drop on full; RLock held through fan-out to prevent data race + send-on-closed panic); WithMetrics for Prometheus instrumentation
+│   ├── rankings/                           Rankings domain (fully implemented, Phase 22)
+│   │   ├── errors.go                      ErrOrganizationNotFound sentinel
+│   │   ├── dto.go                         ListParams, PlayerRankingEntry, TeamRankingEntry, PlayerRankingsResponse, TeamRankingsResponse
+│   │   ├── model.go                       StatsRow (tournament-agnostic stats carrier for snapshot)
+│   │   ├── models.go                      sqlc-generated type aliases for query results
+│   │   ├── repository.go                  ListPlayerRankings, ListTeamRankings (SQL RANK() window function + GROUP BY), SnapshotPlayerStats, SnapshotTeamStats (ON CONFLICT DO UPDATE upsert)
+│   │   ├── service.go                     ListPlayerRankings, ListTeamRankings — validates org, computes win_rate in Go, returns ranked list
+│   │   ├── handler.go                     HTTP handlers for GET /players and GET /teams; parseListParams
+│   │   └── routes.go                      RegisterRoutes() — GET /api/v1/organizations/{slug}/rankings/players|teams; RequireAuth
+│   ├── users/                             Users domain (fully implemented, Phase 16)
+│   │   ├── errors.go
+│   │   ├── dto.go
+│   │   ├── model.go
+│   │   ├── repository.go
+│   │   ├── service.go
+│   │   ├── handler.go
+│   │   └── routes.go
+│   ├── news/                              News domain (stub — package declaration only, no business logic)
 │   ├── testutil/                           Shared integration-test infrastructure (Phase 13B.1)
 │   │   ├── container.go                   SetupTestDB — postgres:17-alpine container, migrations, pool; Docker-skip logic
 │   │   └── fixtures/
@@ -191,17 +209,21 @@ backend/
 │   │                                      CreateExpiredPasswordResetToken, CreateExpiredEmailVerificationToken,
 │   │                                      CleanupUser, HashToken
 │   ├── bootstrap/
-│   │   ├── app.go                         App struct (authHandler, notifEmailWorker, notifWebhookWorker fields); Handler() starts EmailWorker + WebhookWorker + cleanup scheduler; Shutdown() drains all workers then stops all
-│   │   ├── router.go                      Builds chi router + global middleware stack; returns (http.Handler, *auth.Handler, *notifworker.EmailWorker, *webhookworker.WebhookWorker)
-│   │   └── modules.go                     Wires all domain modules; constructs EmailWorker + WebhookWorker; BodySizeLimit + writeLimiter on domain write group; returns (*auth.Handler, *notifworker.EmailWorker, *webhookworker.WebhookWorker)
+│   │   ├── app.go                         App struct (reg, internalServer, scraperDone, scheduler, 3 limiters, authHandler, notifEmailWorker, notifWebhookWorker, realtimeHub fields); Handler() starts all workers + scrapers + internal server; Shutdown() drains all workers then stops all
+│   │   ├── router.go                      Builds chi router + global middleware stack (RequestID, TrustedRealIP, Recoverer, RequestLogger, CORS, Metrics); returns (http.Handler, *auth.Handler, *notifworker.EmailWorker, *webhookworker.WebhookWorker, *realtime.Hub, *notifications.Repository, *webhookworker.Repository)
+│   │   ├── modules.go                     Wires all domain modules; constructs EmailWorker + WebhookWorker + Hub + rankingsRepo; BodySizeLimit + writeLimiter on domain write group; returns all workers + repos for metrics scrapers
+│   │   └── observability.go               newInternalServer (:9090, /metrics + /ready + /live + optional /debug/pprof/*); startDBPoolScraper (15s interval, pgxpool.Stat()); startOutboxMetricsScraper (30s interval, pending outbox rows + dead letters)
 │   └── platform/
-│       ├── config/config.go               ENV-based config with validation
+│       ├── config/config.go               ENV-based config with validation; includes AppInternalPort, PprofEnabled, DrainTimeoutSeconds, AuditLogRetentionDays
 │       ├── database/postgres.go           pgxpool factory with production defaults
 │       ├── logger/logger.go               slog (JSON in prod, text in dev)
+│       ├── metrics/metrics.go             Prometheus Registry — playarena_* prefix; HTTP counters/histogram/in-flight; rate-limit rejections; DB pool gauges; auth counters; notification drain metrics; email/webhook worker metrics; realtime hub metrics; WithMetrics() pattern used by Hub, limiters, workers, notifSvc
+│       ├── metrics/metrics_test.go        Unit tests for metrics registry construction
 │       ├── middleware/bodysize.go         BodySizeLimit(maxBytes) — caps body reads; maps *http.MaxBytesError → ErrBodyTooLarge → 413
 │       ├── middleware/cors.go             CORS() middleware — origin reflection; Allow-Credentials; Vary: Origin; preflight 204
-│       ├── middleware/logging.go          Per-request structured logging
-│       ├── middleware/ratelimit.go        IPRateLimiter — per-IP token bucket; sync.Map + atomic.Int64 lastSeen; Middleware() (all methods); WriteMiddleware() (writes only); Retry-After: 1 on 429
+│       ├── middleware/logging.go          RequestLogger — per-request structured slog (method, path, status, latency, request_id)
+│       ├── middleware/metrics.go          Metrics(reg) — Prometheus HTTP middleware; instruments HTTPRequests counter, HTTPDuration histogram, HTTPInFlight gauge
+│       ├── middleware/ratelimit.go        IPRateLimiter — per-IP token bucket; sync.Map + atomic.Int64 lastSeen; Middleware() (all methods); WriteMiddleware() (writes only); Retry-After: 1 on 429; WithMetrics() injects rate-limit rejection counter
 │       ├── middleware/realip.go           TrustedRealIP(trustedCIDRs) — rewrites RemoteAddr from X-Forwarded-For only for connections from trusted CIDRs; falls back to chi.RealIP when unconfigured
 │       ├── pgutil/pgutil.go               Shared PostgreSQL helpers (UUID parse/format, unique violation check)
 │       ├── response/response.go           JSON write helpers
@@ -209,7 +231,7 @@ backend/
 ```
 
 **Remaining stubs** (files exist with package declaration only, no logic):
-`users/`, `rankings/`, `news/`
+`news/`
 
 ### Request Lifecycle
 
@@ -244,6 +266,7 @@ HTTP request
 | Image decode (WebP) | golang.org/x/image | v0.41.0 |
 | Rate limiting | golang.org/x/time | v0.15.0 |
 | AWS SDK (SES v2) | aws-sdk-go-v2 | latest |
+| Metrics | prometheus/client_golang | v1.22.0 |
 
 ---
 
@@ -279,6 +302,7 @@ HTTP request
 | 000024 | Password Reset Tokens | `password_reset_tokens` — single-use, SHA-256-hashed, 1-hour expiry; `fk_password_reset_tokens_user` CASCADE; `uq_password_reset_tokens_hash` unique; `idx_password_reset_tokens_user_id` for bulk invalidation; `idx_password_reset_tokens_expires WHERE used_at IS NULL` for cleanup |
 | 000025 | Notification Email Delivery | Adds 4 delivery-state columns to `notifications`: `attempt_count INT NOT NULL DEFAULT 0`, `last_attempted_at TIMESTAMPTZ`, `lease_expires_at TIMESTAMPTZ`, `failed_permanently BOOL NOT NULL DEFAULT FALSE`; `idx_notifications_email_pending` partial index on `(last_attempted_at NULLS FIRST, created_at) WHERE channel = 'email' AND sent_at IS NULL AND failed_permanently = FALSE` |
 | 000026 | Webhook Notifications | `webhook_endpoints` (id, organization_id, url, secret_ciphertext BYTEA, description, active, created_by, created_at, updated_at); `webhook_deliveries` (id, organization_id, endpoint_id, outbox_id, event_type, entity_type, entity_id, payload JSONB, attempt_count, last_attempted_at, lease_expires_at, sent_at, failed_permanently, created_at); `UNIQUE(outbox_id, endpoint_id)`; partial indexes for pending delivery and active endpoints; seeds 4 webhook RBAC permissions (webhook.create/read/update/delete) for platform_admin, org_owner, org_admin |
+| 000027 | Rankings Stats | `player_tournament_stats` + `team_tournament_stats` — per-tournament participation rows upserted at completion; `UNIQUE(player_id, tournament_id)` / `UNIQUE(team_id, tournament_id)`; columns: position, matches_played, matches_won, matches_drawn, matches_lost, points, score_for, score_against, snapshotted_at; covering indexes `(organization_id, player_id)` / `(organization_id, team_id)` for ranking query performance; no CASCADE from tournaments (orphaned stats are harmless; FK prevents accidental loss) |
 
 ### Table Summary
 
@@ -375,6 +399,12 @@ Unique constraints: `(user_id, organization_id, role_id)` for org grants; partia
 
 **`webhook_deliveries`** — One row per `(outbox_id, endpoint_id)` pair. Written atomically inside `DrainOutbox` as part of the outbox transaction. Separate from `notifications` because webhook deliveries are endpoint-centric (not user-centric) and would conflict with the `UNIQUE(outbox_id, user_id, channel)` constraint. `UNIQUE(outbox_id, endpoint_id)` — drains are idempotent via `ON CONFLICT DO NOTHING`. Delivery-state columns (`attempt_count`, `last_attempted_at`, `lease_expires_at`, `sent_at`, `failed_permanently`) mirror the email worker model. Partial index on `(last_attempted_at NULLS FIRST, created_at) WHERE sent_at IS NULL AND failed_permanently = FALSE` for worker claim query. FK to `webhook_endpoints` ON DELETE CASCADE — deleting an endpoint cascades to all pending/completed deliveries.
 
+#### Rankings Tables (added migration 000027)
+
+**`player_tournament_stats`** — Final standings row for one player in one completed tournament. Upserted (ON CONFLICT DO UPDATE) when a tournament transitions to `completed`, so crash-and-retry is idempotent. `UNIQUE(player_id, tournament_id)`. Columns: `position INT` (1 = winner), `matches_played`, `matches_won`, `matches_drawn`, `matches_lost`, `points`, `score_for`, `score_against`, `snapshotted_at`. Rankings list queries aggregate across tournaments via `GROUP BY player_id` + `RANK()` window function at read time. Covering index on `(organization_id, player_id)`.
+
+**`team_tournament_stats`** — Mirrors `player_tournament_stats` for team-based tournaments. `UNIQUE(team_id, tournament_id)`. Covering index on `(organization_id, team_id)`.
+
 ### Key Design Decisions
 
 **Event sourcing for live scoring.** `match_events` is the single source of truth for all scoring during active matches. The live scoring engine (`internal/scoring/`) derives home and away scores on every `GET /matches/{id}/score` request from the effective event log — no score is ever stored for live matches.
@@ -388,6 +418,8 @@ Unique constraints: `(user_id, organization_id, role_id)` for org grants; partia
 **Soft foreign keys in media.** `media_attachments` uses a polymorphic `(entity_type, entity_id)` reference. No DB-level FK is possible. The application service layer is responsible for orphan cleanup when parent entities are deleted.
 
 **Transactional outbox for notifications.** Domain writes (matches, tournaments, registrations) write a row to `notification_outbox` inside the same transaction as the domain mutation. After the transaction commits, the domain service calls `DrainOutbox` synchronously. The drain opens a fresh transaction, claims pending rows with `FOR UPDATE SKIP LOCKED`, fans out in-app notifications to all org members (filtered by preferences loaded in one batch query per event type), and marks entries processed. This decouples notification delivery from domain transactions: a drain failure never rolls back a committed domain operation, and the outbox entries remain durable for the next drain cycle. Drain idempotency is enforced at the database level by `UNIQUE (outbox_id, user_id, channel)` on `notifications` — a retry can never produce duplicate rows.
+
+**Snapshot-on-completion for rankings.** When a tournament transitions to `completed`, `tournaments.Service.Update` calls `snapshotTournamentStats` after the DB write succeeds. This derives the final standings (using the existing `standings.Compute` engine) and upserts rows into `player_tournament_stats` / `team_tournament_stats`. Rankings are then derived at read time by aggregating across tournaments with `GROUP BY + RANK()` in SQL. This approach is correct by construction (one upsert per tournament per participant), read-efficient (no event log re-aggregation at query time), and idempotent (a retry after a crash re-upserts the same values). `win_rate` is intentionally kept out of the SQL `ORDER BY` and computed in the Go service layer to avoid float precision issues in PostgreSQL sort keys. The `rankingsRepo` field on `tournaments.Service` is nil-safe — integration tests that don't need rankings pass `nil` and skip the snapshot.
 
 ---
 
@@ -763,11 +795,29 @@ All webhook endpoints require `RequireAuth` and `RequirePermission(webhook.*)`. 
 
 **Delivery protocol:** `POST` to the registered URL, `Content-Type: application/json`. Signed with HMAC-SHA256 using the raw secret as key. Canonical string: `<unix_timestamp>\n<delivery_uuid>\n<body_bytes>`. Headers: `X-PlayArena-Signature` (hex), `X-PlayArena-Timestamp` (Unix seconds), `X-PlayArena-Event-ID` (delivery UUID). Both `X-PlayArena-Timestamp` and `payload.timestamp` (RFC3339) represent the same instant.
 
+### Rankings (`/api/v1/organizations/{slug}/rankings`)
+
+All rankings endpoints require `RequireAuth`. Org scope resolved from URL slug. Rankings aggregate across all completed tournaments hosted by the org. `win_rate` is computed in the Go service layer (not SQL).
+
+| Method | Path | Auth | Description |
+|--------|------|:----:|-------------|
+| `GET` | `/api/v1/organizations/{slug}/rankings/players` | Yes | Paginated player leaderboard for the org; ordered by `tournaments_won DESC → podium_finishes DESC → total_points DESC → total_wins DESC → total_matches DESC`; `RANK()` window function assigns ranks (ties share a rank); returns `organization_id`, `rankings[]`, `total`, `limit`, `offset` |
+| `GET` | `/api/v1/organizations/{slug}/rankings/teams` | Yes | Same as above for teams |
+
 ### Health
 
 | Method | Path | Auth | Description |
 |--------|------|:----:|-------------|
 | `GET` | `/api/v1/health` | No | DB connectivity check; returns `{"status":"ok","database":"connected"}` |
+
+### Observability (internal port `:9090`, never public)
+
+| Method | Path | Auth | Description |
+|--------|------|:----:|-------------|
+| `GET` | `/metrics` | None (internal only) | Prometheus metrics exposition; `playarena_*` prefix |
+| `GET` | `/ready` | None (internal only) | Kubernetes/Docker readiness probe — 200 if DB reachable, 503 otherwise |
+| `GET` | `/live` | None (internal only) | Kubernetes/Docker liveness probe — always 200 if process responds |
+| `GET` | `/debug/pprof/*` | None (internal only, `PPROF_ENABLED=true` required) | Go runtime profiling endpoints |
 
 ---
 
@@ -2419,6 +2469,12 @@ r.Group(func(r chi.Router) {
 - [x] **Phase 18 — Email Notification Delivery Workers** — Transactional outbox pattern extended to multi-channel (in_app + email); migration 000025 (4 delivery-state columns + partial index); `internal/notifworker/` package (`EmailWorker` with Start/Stop/Drain, soft-lease claim, 3-attempt retry, dead-letter); P2-5 auth fix (`UseAllUserEmailVerificationTokens` atomic with create); notification email templates; 90-day outbox retention in cleanup scheduler; 5 notifworker integration tests; new config field: `NOTIF_WORKER_INTERVAL_SECONDS` (default 30)
 - [x] **Phase 20 — Real-Time Notifications (SSE)** — `internal/realtime.Hub` (in-process pub/sub; composite `subKey{orgID,userID}` map; buffer 32; non-blocking publish; `Shutdown` + `Done`); SSE stream endpoint `GET /notifications/stream?token=` (JWT via query param + Bearer fallback; org-scoped; 25s keepalive; platform-admin 403; graceful shutdown via `hub.Done()`); `DrainOutbox` calls `hub.Publish` post-commit; hub wired through bootstrap (`modules.go`, `app.go`); adversarial review: all findings PASS; 31 stream integration tests (14 inbox + 17 stream)
 - [x] **Phase 20 Remediation** — Hub.Publish data race fixed (RLock held through entire fan-out); MT-1 `TestStream_PlatformAdminToken_Forbidden` (platform-admin token → 403 regression gate); MT-2 `TestStream_DrainOutbox_Idempotent_NoDuplicateSSE` strengthened (full first-frame drain before 300ms window); MT-3 `TestStream_SubscribeAfterShutdown_ImmediateDisconnect` (subscribe after shutdown → immediate EOF); mini adversarial review: all findings PASS
+- [x] **Phase 21 — Observability and Operations** — `internal/platform/metrics.Registry` with 30+ `playarena_*` Prometheus metrics; `Metrics(reg)` HTTP middleware; `RequestLogger` structured slog middleware; internal observability server (`:9090`; `/metrics`, `/ready`, `/live`, optional `/debug/pprof/*`); DB pool scraper (15s); outbox + dead-letter scraper (30s); `health.Handler` with Check/Ready/Live methods; 5 Grafana dashboards; 12 Prometheus alert rules; CI/CD pipeline (`.github/workflows/ci.yml`); docker-compose updated with Prometheus v3 + Grafana 11.3; `WithMetrics()` injection on Hub, limiters, workers, notifications service
+- [x] **Phase 22 — Rankings Module** — `internal/rankings/` full module (handler, service, repository, routes, dto, errors, models); migration 000027 (`player_tournament_stats` + `team_tournament_stats`); snapshot-on-completion in `tournaments.Service.Update`; nullable `rankingsRepo` field (nil = skip snapshot in tests); SQL `RANK()` window function + GROUP BY for leaderboards; win_rate computed in Go service layer; 10 integration tests including E2E snapshot-on-completion test
+- [x] **Phase 23A — Role Assignment API** — `internal/members/` module (errors, model, dto, repository, service, handler, routes); 5 new SQL queries in `db/queries/rbac.sql` (`GrantOrgRole`, `ListOrgMembersWithRoles`, `GetUserGrantsInOrg`, `RevokeRoleFromUserInOrg`, `CountActiveOrgOwnersByOrg`); 4 endpoints under `/api/v1/organizations/{slug}/members`; all gate on `role.assign` permission; last-owner guard prevents removing the final `org_owner`; transactional audit logging with `AuditActionPermissionChange`; wired into `bootstrap/modules.go`
+- [x] **Phase 23B — Media Entity Types Expanded** — Added `user` and `match` to `supportedEntityTypes` in `internal/media/service.go`; `MatchExists` and `UserExists` repo methods using existing `GetMatchByID` / `GetUserByID` queries; `user` entities check existence only (no org scope); `match` entities are org-scoped
+- [x] **Phase 23C — Player-Based Individual Tournaments** — `tournament_registrations.CreateRequest` now accepts either `team_id` or `player_id`; service routes to `registerTeam` / `registerPlayer` based on `tournament.ParticipantType`; new `GetRegistrationByPlayer` SQL query; `ErrPlayerNotFound`, `ErrPlayerNotActive`, `ErrWrongParticipantType` errors added; handler error cases updated
+- [x] **Phase 23D — N-Way Head-to-Head Standings** — Replaced strict 2-way h2h guard in `internal/standings/tiebreakers.go` with `buildH2HRanks()` that computes full sub-table ranking for all N tied participants; cyclic results (A>B>C>A) produce shared rank → fall through to score difference; `h2hCompare` removed
 
 ### Previously tracked auth hardening items (resolved in Phase 13A)
 
@@ -2438,20 +2494,22 @@ r.Group(func(r chi.Router) {
 ### Required for feature completeness
 
 - [x] **Users module** — Implemented in Phase 16: list, get, update profile, change password, deactivate; fully integration-tested.
+- [x] **Rankings module** — Implemented in Phase 22: player and team leaderboards, snapshot-on-completion, 10 integration tests.
 - [ ] **News module** — Stub exists; no business logic.
-- [ ] **N-way head-to-head resolution** — Phase 10 standings apply head-to-head only to strict 2-way ties. Full sub-table resolution for 3+ tied participants is deferred. When exactly N>2 participants share the same points, tiebreaking falls through to score difference (criterion 3).
+- [x] **N-way head-to-head resolution** — Implemented in Phase 23D. Full sub-table resolution for all N tied participants now handled by `buildH2HRanks()` in `internal/standings/tiebreakers.go`.
 
 ### Technical debt
 
 - [ ] **`golang-jwt/jwt/v5` declared `indirect` in `go.mod`.** Running `go mod tidy` will correct this.
 - [x] **Auth integration test infrastructure** — `internal/testutil/` (testcontainers-go + golang-migrate + pgxpool); `internal/testutil/fixtures/` (typed auth fixtures); 8 concurrency tests in `internal/auth/`. Phase 13B.1.
 - [x] **Auth integration test suite** — 92 tests across 12 files in `internal/auth/integration/`; full lifecycle, middleware, refresh state-machine (Cases 2 & 3), password-reset, email-verification, suspension, multi-tenant, concurrency, CORS, rate-limiting, JWT-claims, and complete validation-path coverage. Phases 13B.2A + 13B.2B-A + 13B.2B-B.
-- [x] **Integration tests for non-auth domains** — Notifications (14 tests), notifworker (5 tests) completed in Phases 17–18. Tournament registration, match lifecycle, match event sequence, and full multi-tenant isolation remain open for future phases.
+- [x] **Integration tests for non-auth domains** — 16 integration test packages total: `auth/integration`, `matches/integration`, `match_events/integration`, `media/integration`, `members/integration`, `notifications/integration`, `notifworker/integration`, `organizations/integration`, `players/integration`, `rankings/integration`, `teams/integration`, `tournaments/integration`, `tournament_registrations/integration`, `users/integration`, `webhooks/integration`, `webhookworker/integration`. Coverage depth varies by package.
 - [ ] **`internal/platform/middleware/auth.go`** contains only a placeholder comment. Can be removed or used to re-export `auth.RequireAuth`.
 - [ ] **`internal/bootstrap/database.go`** is a stub. Can be removed or used for DB-level bootstrap helpers.
 - [ ] **`internal/platform/cache/redis.go`** is a stub. No Redis dependency in `go.mod`. Delete if Redis is not planned.
 - [ ] **`user_organization_roles.expires_at` expiry enforcement** — background job to revoke grants past their `expires_at`; only the query filter prevents expired grants from functioning, but rows are never cleaned up.
 - [ ] **Validator limitation for pointer types** — `internal/platform/validator/validator.go` uses `fmt.Sprintf("%v", ...)` for field extraction; `omitempty` does not fire on nil `*string` fields. Validation of optional fields is handled in service layers as a workaround.
+- [ ] **sqlc CASE-expression parameter naming** — Parameters inside CASE expressions (e.g. `CASE WHEN $13::TIMESTAMPTZ IS NOT NULL`) are named `Column{N}` by sqlc because it cannot determine field names for CASE expressions. Consuming service files (`matches/service.go`, `tournament_registrations/service.go`) reference `Column13`/`Column7` directly. Adding `sqlc.arg()` inside CASE expressions fails with `could not determine data type of parameter $N`.
 
 ---
 
@@ -2493,6 +2551,8 @@ r.Group(func(r chi.Router) {
 | Phase 19 Remediation | Timestamp consistency fix, signature verification test, 429 retry test | **COMPLETE** |
 | Phase 20 | Real-Time Notifications — SSE stream, in-process Hub, 31 integration tests | **COMPLETE** |
 | Phase 20 Remediation | Hub data race fix; platform-admin 403 gate test; full-frame drain assertion; subscribe-after-shutdown test | **COMPLETE** |
+| Phase 21 | Observability and Operations — Prometheus metrics, Grafana dashboards, health/readiness/liveness, pprof, CI/CD pipeline | **COMPLETE** |
+| Phase 22 | Rankings Module — snapshot-on-completion, player/team leaderboards, 10 integration tests | **COMPLETE** |
 
 ---
 
@@ -2998,18 +3058,273 @@ Four correctness and regression-resistance improvements identified during advers
 
 ---
 
-## 10. Next Recommended Phase
+### Phase 21 — Observability and Operations (Complete)
 
-**Phase 21 — Rankings Module / N-way Head-to-Head / Search**
+**Status: COMPLETE. `go build ./...` + `go vet ./...` clean. All metrics wired end-to-end.**
 
-Phases 1 – 20 are complete. The notification system delivers all four channels: `in_app`, `email`, `webhook`, and real-time SSE. The remaining stubs are `rankings/` and `news/`, and one known standings limitation exists.
+Phase 21 delivered the full production observability stack: Prometheus metrics instrumentation across every subsystem, Grafana dashboards, health + readiness + liveness probes, CI/CD pipeline, pprof profiling, and the docker-compose compose file updated with Prometheus and Grafana services.
 
-**Candidate Phase 21 scope:**
+#### Architecture Decisions
 
-1. **Rankings module** (`internal/rankings/`) — global player and team leaderboards derived from completed tournament standings; paginated `GET /api/v1/rankings/players` and `GET /api/v1/rankings/teams`; org-scoped and cross-org views.
-2. **N-way head-to-head resolution** — Phase 10 standings apply head-to-head only to strict 2-way ties; full sub-table resolution for 3+ participants is deferred in `internal/standings/tiebreakers.go`.
-3. **News module** (`internal/news/`) — the stub exists with only a package declaration.
-4. **Redis pub/sub for multi-instance SSE** — Phase 20 Hub is in-process (single binary). Horizontal scaling requires a Redis pub/sub bridge so events published by one instance reach SSE clients on another.
+- **Separate internal server** — Observability endpoints (`:9090`) are served by a distinct `*http.Server` with its own address, timeouts, and router. Never exposed via the public load balancer or load balancer port mapping.
+- **Custom Prometheus registry** — All metrics use a fresh `prometheus.NewRegistry()` (not `prometheus.DefaultRegisterer`) to prevent cross-test pollution and avoid implicit registration side-effects. Go and process collectors registered alongside application metrics.
+- **`playarena_` prefix** — All application metrics use the `playarena_` prefix per Prometheus naming convention.
+- **WithMetrics() injection pattern** — Components that produce metrics accept a `*metrics.Registry` and expose a `WithMetrics(reg, ...)` builder method. `nil` registry is always safe (components check for `nil` before recording). This avoids import cycles and keeps metrics registration co-located with the component rather than in bootstrap.
+- **Cardinality rules** — Route labels use chi route patterns (`/api/v1/organizations/{slug}`), never actual URL values. Worker, result, and channel labels drawn from bounded enums. user_id, org_id, request_id, delivery_id are never used as labels.
+- **Background scrapers** — DB pool stats and outbox depth are read by background goroutines on fixed intervals (15s for pool, 30s for outbox/dead-letters) without blocking request paths. A shared `done` channel ties scraper lifetime to `App.Shutdown`.
+
+#### Deliverables
+
+| Component | Description |
+|-----------|-------------|
+| `internal/platform/metrics/metrics.go` | `Registry` — 30+ metrics across HTTP, rate-limiting, DB pool, auth, notifications, email worker, webhook worker, realtime hub; `New()` constructor |
+| `internal/platform/metrics/metrics_test.go` | Unit tests for registry construction |
+| `internal/platform/middleware/metrics.go` | `Metrics(reg)` middleware — `playarena_http_requests_total`, `playarena_http_request_duration_seconds`, `playarena_http_requests_in_flight` |
+| `internal/platform/middleware/logging.go` | `RequestLogger(log)` — per-request slog structured logging (method, path, status, latency, request_id) |
+| `internal/bootstrap/observability.go` | `newInternalServer` (`:9090`); `startDBPoolScraper` (15s, pgxpool.Stat()); `startOutboxMetricsScraper` (30s, pending+dead-letter counts) |
+| `internal/health/handler.go` | `Check` (`GET /api/v1/health` — DB ping, 200/503); `Ready` (Kubernetes readiness, `/ready`); `Live` (liveness, `/live`) |
+| `internal/health/handler_test.go` | Unit tests for health handlers |
+| `deploy/prometheus/prometheus.yml` | Prometheus config scraping `api:9090/metrics` every 15s |
+| `deploy/prometheus/alerts.yaml` | 10 alert rules: DatabaseUnavailable, HighErrorRate5xx, EmailWorkerStuck, WebhookWorkerStuck, EmailDeadLetterBurst, WebhookDeadLetterBurst, HighP99Latency, DBPoolNearSaturation, AuthLoginAnomalySpike, TokenReplayDetected, OutboxBacklogHigh, RealtimeDroppedEvents |
+| `deploy/grafana/dashboards/*.json` | 5 Grafana dashboards: api-overview, auth, infrastructure, notifications, realtime |
+| `deploy/grafana/provisioning/` | Auto-provision datasource (Prometheus) and dashboards |
+| `docker-compose.yml` | Updated with `prometheus` (prom/prometheus:v3.0.0) and `grafana` (grafana/grafana:11.3.0) services; api exposes `:9090` |
+| `.github/workflows/ci.yml` | CI pipeline: `go vet ./...` → `go build ./...` → `go test -race` for unit tests (platform, email, realtime, webhooks); triggered on push/PR to `main` for `backend/**` |
+| `internal/platform/config/config.go` | Added `AppInternalPort`, `PprofEnabled`, `DrainTimeoutSeconds`, `AuditLogRetentionDays` config fields |
+
+#### New Config Fields (Phase 21)
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `APP_INTERNAL_PORT` | `9090` | Internal observability server port |
+| `PPROF_ENABLED` | `false` | Enables `/debug/pprof/*` on internal server |
+| `DRAIN_TIMEOUT_SECONDS` | `30` | Timeout for DrainOutbox operations (surfaced in metrics) |
+| `AUDIT_LOG_RETENTION_DAYS` | `90` | How many days of audit log rows to keep in cleanup scheduler |
+
+#### Metrics Instrumented
+
+| Metric | Type | Labels | Source |
+|--------|------|--------|--------|
+| `playarena_http_requests_total` | Counter | method, route, status_code | Metrics middleware |
+| `playarena_http_request_duration_seconds` | Histogram | method, route, status_class | Metrics middleware |
+| `playarena_http_requests_in_flight` | Gauge | — | Metrics middleware |
+| `playarena_rate_limit_rejections_total` | Counter | limiter | IPRateLimiter.WithMetrics |
+| `playarena_db_pool_open/acquired/idle/constructing/max_connections` | Gauge | — | DBPoolScraper |
+| `playarena_db_pool_empty_acquire_total` | Counter | — | DBPoolScraper |
+| `playarena_auth_login_attempts_total` | Counter | result | auth.Handler |
+| `playarena_auth_token_refresh_total` | Counter | result | auth.Handler |
+| `playarena_auth_token_replay_detections_total` | Counter | — | auth.Repository |
+| `playarena_auth_password_reset_requests_total` | Counter | — | auth.Handler |
+| `playarena_notification_outbox_pending_rows` | Gauge | — | OutboxScraper |
+| `playarena_notification_drain_duration_seconds` | Histogram | — | notifications.Service.WithMetrics |
+| `playarena_notification_drain_total` | Counter | result | notifications.Service.WithMetrics |
+| `playarena_email_worker_tick_total` | Counter | result | notifworker.EmailWorker |
+| `playarena_email_worker_deliveries_total` | Counter | status | notifworker.EmailWorker |
+| `playarena_email_worker_batch_size` | Histogram | — | notifworker.EmailWorker |
+| `playarena_email_dead_letters_total` | Gauge | — | OutboxScraper |
+| `playarena_webhook_worker_tick_total` | Counter | result | webhookworker.WebhookWorker |
+| `playarena_webhook_worker_deliveries_total` | Counter | status | webhookworker.WebhookWorker |
+| `playarena_webhook_worker_batch_size` | Histogram | — | webhookworker.WebhookWorker |
+| `playarena_webhook_dead_letters_total` | Gauge | — | OutboxScraper |
+| `playarena_realtime_active_subscribers` | Gauge | — | realtime.Hub.WithMetrics |
+| `playarena_realtime_subscribe/unsubscribe/publish/dropped_total` | Counter | — | realtime.Hub.WithMetrics |
+
+---
+
+### Phase 22 — Rankings Module (Complete)
+
+**Status: COMPLETE. All 10 integration tests passing. `go build ./...` + `go vet ./...` clean.**
+
+Phase 22 implemented the full global rankings system: snapshot-on-completion that writes per-tournament stats when a tournament is marked completed, and two paginated `GET` endpoints that aggregate those stats into ranked leaderboards.
+
+#### Architecture Decisions
+
+- **Per-tournament stats rows, ranked at read time** — `player_tournament_stats` / `team_tournament_stats` store one final-standings row per (participant, tournament). Rankings aggregate via SQL `GROUP BY + RANK()` window function at query time. This makes the upsert idempotent-by-construction and enables future date-range filtering without any schema changes.
+- **Snapshot triggered by HTTP PATCH** — `tournaments.Service.Update` calls `snapshotTournamentStats` after `UpdateWithAudit` succeeds when `status == completed`. Errors are logged but do not fail the PATCH response (snapshot is best-effort, non-blocking for the tournament status update).
+- **Nullable `rankingsRepo` on `tournaments.Service`** — Tests that don't exercise ranking pass `nil` for the `rankings.Repository` parameter; `snapshotTournamentStats` is skipped when the repo is nil. Only the 3 integration test server files that use tournaments needed updating to pass `nil`.
+- **win_rate computed in Go** — Intentionally excluded from the SQL ORDER BY to avoid float precision in PostgreSQL sort keys. The Go service computes `(total_wins / total_matches)` after fetching the aggregate row.
+- **Five-level tiebreak** — `tournaments_won DESC → podium_finishes DESC → total_points DESC → total_wins DESC → total_matches DESC`. SQL `RANK()` handles equal-rank ties; `win_rate` is appended in the response but is not a sort key.
+- **sqlc CASE-expression column naming regression** — sqlc regeneration during Phase 22 renamed CASE-expression parameters: `EndedAt → Column13` in `UpdateMatchParams`, `ApprovedAt → Column7` in `UpdateRegistrationParams`. Cannot use `sqlc.arg()` inside CASE expressions (sqlc type inference fails). Consuming service files (`matches/service.go`, `tournament_registrations/service.go`) were updated to use the generated column names.
+
+#### Deliverables
+
+| Component | Description |
+|-----------|-------------|
+| Migration 000027 | `player_tournament_stats` + `team_tournament_stats` tables; UNIQUE constraints; covering indexes |
+| `db/queries/rankings.sql` | `ListPlayerRankings` (CTE + GROUP BY + RANK() + pagination); `ListTeamRankings`; `SnapshotPlayerStats` / `SnapshotTeamStats` (INSERT ON CONFLICT DO UPDATE) |
+| `db/sqlc/rankings.sql.go` | Generated — all query functions |
+| `internal/rankings/` | Full module: errors, dto, model, models, repository, service, handler, routes |
+| `internal/rankings/repository.go` | `ListPlayerRankings`, `ListTeamRankings` (aggregate queries with RANK() window); `SnapshotPlayerStats`, `SnapshotTeamStats` (upsert) |
+| `internal/rankings/service.go` | Validates org by slug; calls repository; computes `win_rate` in Go; returns ranked response |
+| `internal/rankings/handler.go` | `ListPlayerRankings`, `ListTeamRankings` HTTP handlers; `parseListParams` (limit/offset from query string) |
+| `internal/rankings/routes.go` | `RegisterRoutes()` — `GET /api/v1/organizations/{slug}/rankings/players|teams`; `RequireAuth` |
+| `internal/tournaments/service.go` | Added `rankingsRepo *rankings.Repository` field; `snapshotTournamentStats` method called in `Update` on completion |
+| `internal/tournaments/routes.go` | Updated to accept and forward `*rankings.Repository` parameter |
+| `internal/bootstrap/modules.go` | Constructs `rankingsRepo`; passes to `tournaments.RegisterRoutes`; calls `rankings.RegisterRoutes` |
+| `internal/rankings/integration/testmain_test.go` | Standard testcontainers TestMain |
+| `internal/rankings/integration/server_test.go` | `buildTestServer` wires real `rankingsRepo` into tournaments for E2E snapshot testing; response structs; HTTP helpers |
+| `internal/rankings/integration/rankings_test.go` | 10 integration tests: unauthenticated (401), org not found (404), empty lists (200), direct DB insert stats, ranking order, field correctness, pagination, E2E snapshot-on-completion |
+
+#### Integration Tests (10)
+
+| Test | Coverage |
+|------|---------|
+| `TestRankings_Players_Unauthenticated` | 401 without token |
+| `TestRankings_Teams_Unauthenticated` | 401 without token |
+| `TestRankings_Players_OrgNotFound` | 404 for non-existent org slug |
+| `TestRankings_Teams_OrgNotFound` | 404 for non-existent org slug |
+| `TestRankings_Players_Empty` | 200 with `total=0` and empty `rankings` array |
+| `TestRankings_Teams_Empty` | 200 with `total=0` and empty `rankings` array |
+| `TestRankings_Teams_WithStats` | Ranking order, TournamentsWon field, rank assignment via direct DB insert |
+| `TestRankings_Players_WithStats` | Player ranking list, win_rate > 0, rank=1 correctness |
+| `TestRankings_Teams_Pagination` | `limit=2` returns 2 rows, `total=3` |
+| `TestRankings_Snapshot_OnTournamentCompletion` | E2E: PATCH tournament to completed → snapshot triggered → GET rankings returns 2 teams with correct TournamentsWon=1 |
+
+---
+
+## 10. Frontend Application
+
+**Status: Foundation locked. FE-1/FE-2/FE-3 complete. FE-4 may begin.**
+**Last validated:** 2026-06-10
+**Typecheck:** `tsc --noEmit` — 0 errors
+**Lint:** `eslint .` — 0 errors, 0 warnings
+**Tests:** 18/18 passing (`vitest run`)
+**Build:** `next build` — clean, 9 routes
+
+---
+
+### Tech Stack
+
+| Technology | Version | Role |
+|---|---|---|
+| Next.js | 16 | App Router framework |
+| React | 19 | UI library (concurrent features) |
+| TypeScript | 5 | Static typing throughout |
+| Tailwind CSS | 4 | CSS-first utility styling (`@theme inline`) |
+| shadcn/ui | radix-nova | Component library (unified `radix-ui` package) |
+| Zustand | 5 | Client state: auth session, UI state |
+| TanStack Query | 5 | Server state, caching, invalidation |
+| TanStack Table | 8 | Headless data table with server-side pagination |
+| React Hook Form | 7 | Form state management |
+| Zod | 4 | Schema validation |
+| Axios | 1 | HTTP client with interceptors |
+| Vitest | 3 | Test runner |
+| Testing Library | 16 | Component and hook testing |
+
+---
+
+### Completed Frontend Phases
+
+#### FE-1 — Architecture Foundation
+
+| File | Purpose |
+|---|---|
+| `frontend/src/lib/api/client.ts` | Axios singleton; Bearer-token request interceptor; 401 response interceptor with `refreshPromise` deduplication; `tokenManager` (access: sessionStorage, refresh: localStorage); exported `attemptTokenRefresh` |
+| `frontend/src/lib/api/query-client.ts` | TanStack Query client factory; `getQueryClient()` browser singleton (server always creates new); `staleTime: 30s`, `gcTime: 5min`, `retry: 1` |
+| `frontend/src/lib/api/auth.ts` | Auth API layer: login, register, logout, me, verifyEmail, forgotPassword, resetPassword, resendVerification |
+| `frontend/src/lib/api/organizations.ts` | Organizations API: list (used for orgSlug resolution after login), getBySlug, create, update, delete |
+| `frontend/src/lib/query-keys.ts` | Org-scoped query key factories for all 11 domain resources; `orgKeys` and `userKeys` not org-scoped (intentional) |
+| `frontend/src/stores/auth.store.ts` | Zustand auth store: claims, orgSlug, pendingOrgSelection, isHydrating; setSession, hydrateClaims, setOrgSlug, clearSession, setPendingOrgSelection |
+| `frontend/src/stores/ui.store.ts` | Zustand UI store: sidebarOpen, commandOpen |
+| `frontend/src/types/api/` | TypeScript DTOs for all 15 backend resource types; audited against live backend DTOs |
+| `frontend/src/types/common.ts` | Shared Role enum, PaginatedResponse |
+| `frontend/src/lib/utils.ts` | `cn()` — Tailwind class merge utility |
+| `frontend/src/lib/api-error.ts` | `extractApiError()`, `isOrgRequiredError()` for HTTP 409 multi-org detection |
+
+#### FE-2 — Design System
+
+| File | Purpose |
+|---|---|
+| `frontend/src/app/globals.css` | oklch design tokens; `@theme inline {}` Tailwind 4 mapping; full dark mode; status color tokens; sidebar tokens |
+| `frontend/src/components/ui/status-badge.tsx` | Semantic domain status badges: MatchStatus (5), TournamentStatus (6), RegistrationStatus (5), PlayerStatus (2), TeamStatus (2); every variant renders a visible text label — no color-only state |
+| `frontend/src/components/ui/data-table.tsx` | TanStack Table v8 wrapper; server-side and client-side pagination/sort; SkeletonRows while loading |
+| `frontend/src/components/ui/form-field.tsx` | RHF Controller wrappers: FormField, FormTextarea, FormSelect, FormDatePicker; FieldWrapper with aria-invalid/aria-describedby |
+| `frontend/src/components/ui/page-header.tsx` | Title + shadcn Breadcrumb + optional action slot |
+| `frontend/src/components/ui/empty-state.tsx` | Dashed-border placeholder with icon, title, description, action |
+| `frontend/src/components/ui/confirm-dialog.tsx` | Controlled dialog; `destructive` prop for red confirm button |
+| `frontend/src/components/ui/loading-skeleton.tsx` | TableSkeleton, CardSkeleton, StatSkeleton, PageSkeleton |
+| `frontend/src/components/ui/button.tsx` | shadcn Button (CVA variants) |
+| `frontend/src/components/ui/input.tsx` | shadcn Input |
+| `frontend/src/components/ui/label.tsx` | shadcn Label |
+| `frontend/src/components/ui/select.tsx` | shadcn Select |
+| `frontend/src/components/ui/dialog.tsx` | shadcn Dialog (radix, focus-trapped) |
+| `frontend/src/components/ui/dropdown-menu.tsx` | shadcn DropdownMenu |
+| `frontend/src/components/ui/breadcrumb.tsx` | shadcn Breadcrumb |
+| `frontend/src/components/ui/table.tsx` | shadcn Table |
+| `frontend/src/components/ui/badge.tsx` | Generic badge primitive |
+| `frontend/src/components/ui/separator.tsx` | shadcn Separator |
+| `frontend/src/components/ui/skeleton.tsx` | shadcn Skeleton |
+
+#### FE-3 — Core App Infrastructure
+
+| File | Purpose |
+|---|---|
+| `frontend/src/app/layout.tsx` | Root layout: QueryClientProvider, ThemeProvider, Toaster |
+| `frontend/src/app/page.tsx` | Root redirect: runs useAuthGuard to restore session from stored tokens; redirects to /{orgSlug} or /login; shows PageSkeleton while hydrating |
+| `frontend/src/app/(auth)/layout.tsx` | Centered auth card layout |
+| `frontend/src/app/(auth)/login/page.tsx` | Login form (RHF + Zod); multi-org 409 flow with sessionStorage credential hand-off; redirects to /{orgSlug} |
+| `frontend/src/app/(auth)/register/page.tsx` | Registration form |
+| `frontend/src/app/(auth)/verify-email/page.tsx` | Token-based email verification; auto-verifies on mount when `?token=` present; resend flow |
+| `frontend/src/app/(auth)/forgot-password/page.tsx` | Forgot password form |
+| `frontend/src/app/(auth)/reset-password/page.tsx` | Reset password form |
+| `frontend/src/app/(auth)/org-select/page.tsx` | Multi-org picker: reads pending orgs from store; re-calls login with organization_id; guard checks orgSlug before redirecting to prevent race with router.push |
+| `frontend/src/app/(app)/layout.tsx` | App shell: runs useAuthGuard; shows PageSkeleton while hydrating |
+| `frontend/src/app/(app)/[orgSlug]/layout.tsx` | Org layout: sidebar + header + mobile backdrop overlay; SSE stream mount; closes sidebar on mobile init; `lg:ml-60` content offset |
+| `frontend/src/hooks/use-auth-guard.ts` | Hydration guard: refresh token check → me() silent refresh → hydrateClaims() → orgSlug resolution → setHydrating(false); one-shot on mount |
+| `frontend/src/hooks/use-notification-stream.ts` | SSE hook: connects with `?token=` query param; exponential backoff on onerror; on auth_error calls `attemptTokenRefresh()` explicitly before reconnecting to prevent infinite loop; `connectRef` pattern avoids stale closures |
+| `frontend/src/components/layout/org-sidebar.tsx` | Fixed sidebar: memoized nav (`useMemo`); `aria-current="page"` on active link; closes drawer on mobile nav-click |
+| `frontend/src/components/layout/org-header.tsx` | Sticky header: sidebar toggle; theme toggle; logout (`getQueryClient().clear()` → `clearSession()` → `/login`) |
+
+---
+
+### Authentication Architecture
+
+| Aspect | Detail |
+|---|---|
+| Access token storage | sessionStorage (tab-scoped, cleared on tab close) |
+| Refresh token storage | localStorage (persists across page loads) |
+| JWT decoding | Inline base64url decode; `claims.exp * 1000 - Date.now() > 60_000` for expiry check |
+| Refresh deduplication | Module-level `refreshPromise` in client.ts — concurrent 401s await the same in-flight refresh |
+| Multi-org 409 flow | Login → 409 → store pending orgs + sessionStorage credentials → org-select → re-login with organization_id → clear credentials immediately |
+| Silent session restore | useAuthGuard decodes token → calls me() → 401 interceptor refreshes → hydrateClaims() writes decoded claims to store |
+| Platform admin orgId | `null` (not empty string) — `decoded.organization_id \|\| null` normalises both absent field and empty string |
+| SSE auth_error | `attemptTokenRefresh()` called explicitly before reconnect; redirect to /login if refresh fails |
+
+### Query Architecture
+
+| Aspect | Detail |
+|---|---|
+| Cache keys | All org-scoped; `orgKeys` and `userKeys` intentionally not org-scoped |
+| SSE invalidation | `useNotificationStream` invalidates specific query key subtrees per event_type |
+| Cache on logout | `getQueryClient().clear()` called before `clearSession()` — stale data cannot survive the session boundary |
+
+---
+
+### Testing Foundation
+
+| Test file | Tests | Coverage |
+|---|---|---|
+| `src/hooks/__tests__/use-auth-guard.test.ts` | 5 | Claims populated after me(); orgSlug resolved; redirect on no refresh token; redirect on me() failure; no duplicate me() when claims valid |
+| `src/app/(auth)/org-select/__tests__/org-select.test.tsx` | 5 | Org list rendered; redirect to /login on empty+no-orgSlug; successful selection → /{orgSlug} not /login; credential cleanup; no /login redirect when orgSlug set |
+| `src/hooks/__tests__/use-notification-stream.test.ts` | 5 | EventSource URL contains token; attemptTokenRefresh called on auth_error; reconnect with new EventSource; redirect to /login on refresh failure; no infinite loop |
+| `src/components/layout/__tests__/org-header.test.tsx` | 3 | Query cache cleared on logout; cache cleared before session cleared; redirect to /login after logout |
+
+Test infrastructure: Vitest 3, `@testing-library/react` 16, jsdom, `@testing-library/jest-dom`; `vitest.config.ts` at `frontend/`; `src/test/setup.ts` + `src/test/test-utils.tsx`.
+
+---
+
+## 11. Next Recommended Phase
+
+**Phases 1 – 22 are complete.** All four notification delivery channels (in_app, email, webhook, SSE), the full observability stack, and the rankings module are implemented and production-hardened.
+
+**Phases 23A–D are complete.** All four backend blockers that prevented frontend development are resolved.
+
+**Candidate Phase 24 scope (no recommendation):**
+
+1. **News module** (`internal/news/`) — stub exists with only a package declaration; no business logic.
+2. **Redis pub/sub for multi-instance SSE** — Phase 20 Hub is in-process (single binary). Horizontal scaling requires a Redis pub/sub bridge so events published by one instance reach SSE clients on another.
+3. **Frontend application** — A frontend (`frontend/`) directory exists but the backend API has no corresponding UI. All backend blockers (members API, media entity types, player tournaments, N-way h2h) are now resolved.
+4. **Integration test coverage gaps** — Organizations, players, teams, matches, match_events, media, users, and tournament_registrations integration packages exist but test coverage depth varies. The new `internal/members/` module has no integration tests yet.
 
 ---
 
@@ -3036,7 +3351,7 @@ Phases 1 – 20 are complete. The notification system delivers all four channels
 | `backend/internal/scoring/rules.go` | Kabaddi scoring rules: `participantSide`, `allOutScore`, `payloadPoints` |
 | `backend/internal/scoring/validation.go` | `ValidateScoreEventPayload` + `ValidateAllOutParticipant` — write-time payload guards |
 | `backend/internal/standings/engine.go` | `standings.Compute` — pure standings derivation from completed match snapshots; no DB access |
-| `backend/internal/standings/tiebreakers.go` | Full 7-level tiebreak comparator; head-to-head for strict 2-way ties |
+| `backend/internal/standings/tiebreakers.go` | Full 7-level tiebreak comparator; N-way h2h sub-table via `buildH2HRanks()`; cyclic ties fall through to score difference |
 | `backend/internal/tournaments/service.go` | `GetStandings` — orchestrates standings derivation; `parseStandingsSettings` reads point values from JSONB |
 | `backend/db/migrations/000019_match_score_snapshots.up.sql` | Adds `home_score`/`away_score` to `matches`; immutability contract documented in comments |
 | `backend/internal/bootstrap/modules.go` | Single place to register new domain modules |
@@ -3109,4 +3424,24 @@ Phases 1 – 20 are complete. The notification system delivers all four channels
 
 ---
 
-*This document was last updated on 2026-06-07 (Phase 20 complete — Real-Time Notifications SSE stream, in-process Hub, 31 stream integration tests; Phase 20 Remediation complete — Hub data race fix, MT-1 platform-admin 403 gate, MT-2 full-frame drain assertion, MT-3 subscribe-after-shutdown test). It should be updated whenever a phase is completed or significant architectural changes are made.*
+| `backend/internal/platform/metrics/metrics.go` | `Registry` — 30+ Prometheus metrics with `playarena_` prefix; HTTP, rate-limit, DB pool, auth, notifications, email worker, webhook worker, realtime hub; `New()` registers against a fresh non-default registry |
+| `backend/internal/platform/middleware/metrics.go` | `Metrics(reg)` — Prometheus HTTP instrumentation middleware; records requests total, request duration, in-flight gauge; uses chi route pattern as label |
+| `backend/internal/platform/middleware/logging.go` | `RequestLogger(log *slog.Logger)` — per-request structured slog logging (method, path, status, latency, request_id) |
+| `backend/internal/bootstrap/observability.go` | `newInternalServer` (:9090); `startDBPoolScraper` (15s, pgxpool.Stat()); `startOutboxMetricsScraper` (30s, CountPendingOutboxRows + CountEmailDeadLetters + CountDeadLetters) |
+| `backend/internal/health/handler.go` | `Handler.Check` (GET /api/v1/health); `Handler.Ready` (K8s readiness — 200/503 based on DB ping); `Handler.Live` (K8s liveness — always 200) |
+| `backend/deploy/prometheus/prometheus.yml` | Scrapes `api:9090/metrics` every 15s |
+| `backend/deploy/prometheus/alerts.yaml` | 12 alert rules across critical + warning groups: DatabaseUnavailable, HighErrorRate5xx, EmailWorkerStuck, WebhookWorkerStuck, EmailDeadLetterBurst, WebhookDeadLetterBurst, HighP99Latency, DBPoolNearSaturation, AuthLoginAnomalySpike, TokenReplayDetected, OutboxBacklogHigh, RealtimeDroppedEvents |
+| `backend/deploy/grafana/dashboards/*.json` | 5 pre-provisioned Grafana dashboards: api-overview, auth, infrastructure, notifications, realtime |
+| `.github/workflows/ci.yml` | Go CI: vet → build → unit tests (`-race`) on ubuntu-latest; triggered on push/PR to `main` for `backend/**` |
+| `backend/db/migrations/000027_rankings_stats.up.sql` | `player_tournament_stats` + `team_tournament_stats` tables; UNIQUE per-tournament constraints; covering indexes for ranking list queries |
+| `backend/db/queries/rankings.sql` | `ListPlayerRankings` / `ListTeamRankings` (CTE + GROUP BY + RANK() window function + LIMIT/OFFSET); `SnapshotPlayerStats` / `SnapshotTeamStats` (INSERT ON CONFLICT DO UPDATE) |
+| `backend/internal/rankings/repository.go` | `ListPlayerRankings`, `ListTeamRankings` (aggregate + rank), `SnapshotPlayerStats`, `SnapshotTeamStats` (upsert) |
+| `backend/internal/rankings/service.go` | Org validation by slug; delegates to repo; computes `win_rate` in Go after fetch |
+| `backend/internal/rankings/handler.go` | HTTP handlers; `parseListParams` (limit/offset from query string) |
+| `backend/internal/rankings/routes.go` | `GET /api/v1/organizations/{slug}/rankings/players|teams`; `RequireAuth` |
+| `backend/internal/tournaments/service.go` | `snapshotTournamentStats` — derives standings + upserts stats rows when tournament transitions to completed; nil-safe (skipped when `rankingsRepo == nil`) |
+| `backend/internal/rankings/integration/rankings_test.go` | 10 integration tests: 401 unauthenticated, 404 org not found, 200 empty, ranking order + fields, pagination, E2E snapshot-on-completion |
+
+---
+
+*This document was last updated on 2026-06-09 (Phase 21 complete — Observability and Operations; Phase 22 complete — Rankings Module with snapshot-on-completion, player/team leaderboards, 10 integration tests). It should be updated whenever a phase is completed or significant architectural changes are made.*

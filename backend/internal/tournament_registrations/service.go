@@ -47,15 +47,18 @@ func NewService(repo *Repository, log *slog.Logger, notifSvc *notifications.Serv
 
 // ── public methods ────────────────────────────────────────────────────────────
 
-// Register submits a new registration for a team in a tournament.
+// Register submits a new registration for a tournament.
+//
+// For team tournaments: req.TeamID is required.
+// For individual tournaments: req.PlayerID is required.
 //
 // Enforces all seven business rules in order:
-//  1. Tournament and team belong to the URL org (multi-tenant safety).
+//  1. Participant belongs to the URL org (multi-tenant safety).
 //  2. Tournament is in registration_open status.
 //  3. Current time is within the registration window.
-//  4. Team is not already registered.
-//  5. Team is active and belongs to the org.
-//  6. Team has at least one active member.
+//  4. Participant is not already registered.
+//  5. Participant is active.
+//  6. Team has at least one active member (team tournaments only).
 //  7. Tournament has not reached max_participants capacity.
 //
 // BOLA guard: actorOrgID must match the URL org or be empty (platform admin).
@@ -79,7 +82,6 @@ func (s *Service) Register(
 		return nil, ErrTournamentNotFound
 	}
 
-	// Tournament must belong to the URL org.
 	tournament, err := s.repo.GetTournamentByID(ctx, tid, org.ID)
 	if err != nil {
 		return nil, err
@@ -95,13 +97,36 @@ func (s *Service) Register(
 		return nil, err
 	}
 
-	teamUID, err := pgutil.ParseUUID(req.TeamID)
+	actorUID, err := pgutil.ParseUUID(actorID)
+	if err != nil {
+		return nil, errors.New("invalid actor user id")
+	}
+
+	if tournament.ParticipantType == db.ParticipantTypeIndividual {
+		return s.registerPlayer(ctx, tid, org.ID, tournament.MaxParticipants, req, actorUID)
+	}
+	return s.registerTeam(ctx, tid, org.ID, tournament.MaxParticipants, req, actorUID)
+}
+
+// registerTeam handles registrations for team-based tournaments.
+func (s *Service) registerTeam(
+	ctx context.Context,
+	tid, orgID pgtype.UUID,
+	maxParticipants *int16,
+	req CreateRequest,
+	actorUID pgtype.UUID,
+) (*Response, error) {
+	if req.TeamID == nil || *req.TeamID == "" {
+		return nil, ErrWrongParticipantType
+	}
+
+	teamUID, err := pgutil.ParseUUID(*req.TeamID)
 	if err != nil {
 		return nil, ErrTeamNotFound
 	}
 
 	// Rules 1 & 5: Team must exist and belong to the URL org.
-	team, err := s.repo.GetTeamByID(ctx, teamUID, org.ID)
+	team, err := s.repo.GetTeamByID(ctx, teamUID, orgID)
 	if err != nil {
 		if errors.Is(err, ErrTeamNotFound) {
 			return nil, ErrCrossOrgRegistration
@@ -109,7 +134,6 @@ func (s *Service) Register(
 		return nil, err
 	}
 
-	// Rule 5: Team must be active.
 	if team.Status != db.TeamStatusActive {
 		return nil, ErrTeamNotActive
 	}
@@ -124,7 +148,7 @@ func (s *Service) Register(
 	}
 
 	// Rule 6: Team must have at least one active member.
-	hasMembers, err := s.repo.HasActiveMembers(ctx, teamUID, org.ID)
+	hasMembers, err := s.repo.HasActiveMembers(ctx, teamUID, orgID)
 	if err != nil {
 		return nil, err
 	}
@@ -132,26 +156,74 @@ func (s *Service) Register(
 		return nil, ErrEmptyTeam
 	}
 
-	// Rule 7 — Capacity enforcement is deferred to CreateWithAudit, where it
-	// runs under a tournament row lock (SELECT … FOR UPDATE). Performing the
-	// count and insert inside the same locked transaction prevents concurrent
-	// requests from both reading "capacity available" and both inserting.
-	actorUID, err := pgutil.ParseUUID(actorID)
+	reg, err := s.repo.CreateWithAudit(ctx, createRegistrationTxParams{
+		createParams: db.CreateRegistrationParams{
+			TournamentID:   tid,
+			OrganizationID: orgID,
+			TeamID:         teamUID,
+			PlayerID:       pgtype.UUID{},
+			RegisteredBy:   actorUID,
+			Notes:          req.Notes,
+		},
+		actorID:         actorUID,
+		maxParticipants: maxParticipants,
+	})
 	if err != nil {
-		return nil, errors.New("invalid actor user id")
+		return nil, err
+	}
+	return registrationToResponse(reg), nil
+}
+
+// registerPlayer handles registrations for individual tournaments.
+func (s *Service) registerPlayer(
+	ctx context.Context,
+	tid, orgID pgtype.UUID,
+	maxParticipants *int16,
+	req CreateRequest,
+	actorUID pgtype.UUID,
+) (*Response, error) {
+	if req.PlayerID == nil || *req.PlayerID == "" {
+		return nil, ErrWrongParticipantType
+	}
+
+	playerUID, err := pgutil.ParseUUID(*req.PlayerID)
+	if err != nil {
+		return nil, ErrPlayerNotFound
+	}
+
+	// Rules 1 & 5: Player must exist and belong to the URL org.
+	player, err := s.repo.GetPlayerByID(ctx, playerUID, orgID)
+	if err != nil {
+		if errors.Is(err, ErrPlayerNotFound) {
+			return nil, ErrCrossOrgRegistration
+		}
+		return nil, err
+	}
+
+	if player.Status != db.PlayerStatusActive {
+		return nil, ErrPlayerNotActive
+	}
+
+	// Rule 4: No duplicate registration for this (tournament, player) pair.
+	existing, err := s.repo.GetByPlayer(ctx, tid, playerUID)
+	if err != nil {
+		return nil, err
+	}
+	if existing != nil {
+		return nil, ErrAlreadyRegistered
 	}
 
 	reg, err := s.repo.CreateWithAudit(ctx, createRegistrationTxParams{
 		createParams: db.CreateRegistrationParams{
 			TournamentID:   tid,
-			OrganizationID: org.ID,
-			TeamID:         teamUID,
-			PlayerID:       pgtype.UUID{}, // null for team registrations
+			OrganizationID: orgID,
+			TeamID:         pgtype.UUID{},
+			PlayerID:       pgtype.UUID{Bytes: playerUID.Bytes, Valid: true},
 			RegisteredBy:   actorUID,
 			Notes:          req.Notes,
 		},
 		actorID:         actorUID,
-		maxParticipants: tournament.MaxParticipants,
+		maxParticipants: maxParticipants,
 	})
 	if err != nil {
 		return nil, err

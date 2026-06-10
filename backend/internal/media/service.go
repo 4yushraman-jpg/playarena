@@ -19,13 +19,13 @@ import (
 	"github.com/4yushraman-jpg/playarena/internal/platform/pgutil"
 )
 
-// supportedEntityTypes lists entity types supported in Phase 11.
-// "match" and "user" are deferred.
 var supportedEntityTypes = map[string]db.MediaEntityType{
 	"organization": db.MediaEntityTypeOrganization,
+	"user":         db.MediaEntityTypeUser,
 	"team":         db.MediaEntityTypeTeam,
 	"player":       db.MediaEntityTypePlayer,
 	"tournament":   db.MediaEntityTypeTournament,
+	"match":        db.MediaEntityTypeMatch,
 }
 
 // Service implements media use-cases.
@@ -445,6 +445,23 @@ func (s *Service) assertEntityExists(ctx context.Context, entityType db.MediaEnt
 		}
 	case db.MediaEntityTypeTournament:
 		ok, err := s.repo.TournamentExists(ctx, entityID, orgID)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return ErrEntityNotFound
+		}
+	case db.MediaEntityTypeMatch:
+		ok, err := s.repo.MatchExists(ctx, entityID, orgID)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return ErrEntityNotFound
+		}
+	case db.MediaEntityTypeUser:
+		// Users are platform-scoped, not org-scoped; just verify the user exists.
+		ok, err := s.repo.UserExists(ctx, entityID)
 		if err != nil {
 			return err
 		}

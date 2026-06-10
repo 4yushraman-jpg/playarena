@@ -11,6 +11,24 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const countActiveOrgOwnersByOrg = `-- name: CountActiveOrgOwnersByOrg :one
+SELECT COUNT(DISTINCT uor.user_id)
+FROM   user_organization_roles uor
+JOIN   roles r ON r.id = uor.role_id
+WHERE  uor.organization_id = $1
+  AND  r.slug              = 'org_owner'
+  AND  (uor.expires_at IS NULL OR uor.expires_at > NOW())
+`
+
+// Count of distinct users with a non-expired org_owner grant in the org.
+// Used to enforce the last-owner guard before revoking an org_owner role.
+func (q *Queries) CountActiveOrgOwnersByOrg(ctx context.Context, orgID pgtype.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countActiveOrgOwnersByOrg, orgID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const getRoleBySlug = `-- name: GetRoleBySlug :one
 
 SELECT id, organization_id, name, slug, description, scope, is_system, created_at, updated_at
@@ -39,6 +57,65 @@ func (q *Queries) GetRoleBySlug(ctx context.Context, slug string) (Role, error) 
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const getUserGrantsInOrg = `-- name: GetUserGrantsInOrg :many
+SELECT
+    uor.id         AS grant_id,
+    r.slug         AS role_slug,
+    r.name         AS role_name,
+    uor.granted_at,
+    uor.expires_at,
+    uor.granted_by
+FROM   user_organization_roles uor
+JOIN   roles r ON r.id = uor.role_id
+WHERE  uor.user_id         = $1
+  AND  uor.organization_id = $2
+  AND  (uor.expires_at IS NULL OR uor.expires_at > NOW())
+ORDER  BY r.slug ASC
+`
+
+type GetUserGrantsInOrgParams struct {
+	UserID pgtype.UUID `json:"user_id"`
+	OrgID  pgtype.UUID `json:"org_id"`
+}
+
+type GetUserGrantsInOrgRow struct {
+	GrantID   pgtype.UUID        `json:"grant_id"`
+	RoleSlug  string             `json:"role_slug"`
+	RoleName  string             `json:"role_name"`
+	GrantedAt pgtype.Timestamptz `json:"granted_at"`
+	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
+	GrantedBy pgtype.UUID        `json:"granted_by"`
+}
+
+// Returns all active non-expired role grants for a specific user in a specific org.
+// Used to build the per-member response and to return the result after granting.
+func (q *Queries) GetUserGrantsInOrg(ctx context.Context, arg GetUserGrantsInOrgParams) ([]GetUserGrantsInOrgRow, error) {
+	rows, err := q.db.Query(ctx, getUserGrantsInOrg, arg.UserID, arg.OrgID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []GetUserGrantsInOrgRow{}
+	for rows.Next() {
+		var i GetUserGrantsInOrgRow
+		if err := rows.Scan(
+			&i.GrantID,
+			&i.RoleSlug,
+			&i.RoleName,
+			&i.GrantedAt,
+			&i.ExpiresAt,
+			&i.GrantedBy,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const getUserOrganizations = `-- name: GetUserOrganizations :many
@@ -279,6 +356,34 @@ func (q *Queries) GetUserRolesByOrganization(ctx context.Context, arg GetUserRol
 	return items, nil
 }
 
+const grantOrgRole = `-- name: GrantOrgRole :exec
+INSERT INTO user_organization_roles (user_id, organization_id, role_id, granted_by, expires_at)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT DO NOTHING
+`
+
+type GrantOrgRoleParams struct {
+	UserID         pgtype.UUID        `json:"user_id"`
+	OrganizationID pgtype.UUID        `json:"organization_id"`
+	RoleID         pgtype.UUID        `json:"role_id"`
+	GrantedBy      pgtype.UUID        `json:"granted_by"`
+	ExpiresAt      pgtype.Timestamptz `json:"expires_at"`
+}
+
+// Grants a role to a user within a specific organization, with optional expiry.
+// ON CONFLICT DO NOTHING: idempotent — if the exact same (user, org, role)
+// grant already exists it is silently skipped.
+func (q *Queries) GrantOrgRole(ctx context.Context, arg GrantOrgRoleParams) error {
+	_, err := q.db.Exec(ctx, grantOrgRole,
+		arg.UserID,
+		arg.OrganizationID,
+		arg.RoleID,
+		arg.GrantedBy,
+		arg.ExpiresAt,
+	)
+	return err
+}
+
 const grantRoleToUserInOrg = `-- name: GrantRoleToUserInOrg :exec
 INSERT INTO user_organization_roles (user_id, organization_id, role_id, granted_by)
 VALUES ($1, $2, $3, $4)
@@ -334,4 +439,103 @@ func (q *Queries) HasPermission(ctx context.Context, arg HasPermissionParams) (b
 	var has_permission bool
 	err := row.Scan(&has_permission)
 	return has_permission, err
+}
+
+const listOrgMembersWithRoles = `-- name: ListOrgMembersWithRoles :many
+SELECT
+    u.id           AS user_id,
+    u.email,
+    u.username,
+    u.first_name,
+    u.last_name,
+    u.status       AS user_status,
+    r.slug         AS role_slug,
+    r.name         AS role_name,
+    uor.id         AS grant_id,
+    uor.granted_at,
+    uor.expires_at,
+    uor.granted_by
+FROM   user_organization_roles uor
+JOIN   users u ON u.id = uor.user_id
+JOIN   roles r ON r.id = uor.role_id
+WHERE  uor.organization_id = $1
+  AND  (uor.expires_at IS NULL OR uor.expires_at > NOW())
+ORDER  BY u.email ASC, r.slug ASC
+`
+
+type ListOrgMembersWithRolesRow struct {
+	UserID     pgtype.UUID        `json:"user_id"`
+	Email      string             `json:"email"`
+	Username   string             `json:"username"`
+	FirstName  string             `json:"first_name"`
+	LastName   string             `json:"last_name"`
+	UserStatus UserStatus         `json:"user_status"`
+	RoleSlug   string             `json:"role_slug"`
+	RoleName   string             `json:"role_name"`
+	GrantID    pgtype.UUID        `json:"grant_id"`
+	GrantedAt  pgtype.Timestamptz `json:"granted_at"`
+	ExpiresAt  pgtype.Timestamptz `json:"expires_at"`
+	GrantedBy  pgtype.UUID        `json:"granted_by"`
+}
+
+// Returns all users with at least one active non-expired role in the org.
+// One row per (user × role) pair — aggregate into MemberResponse in Go.
+func (q *Queries) ListOrgMembersWithRoles(ctx context.Context, orgID pgtype.UUID) ([]ListOrgMembersWithRolesRow, error) {
+	rows, err := q.db.Query(ctx, listOrgMembersWithRoles, orgID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListOrgMembersWithRolesRow{}
+	for rows.Next() {
+		var i ListOrgMembersWithRolesRow
+		if err := rows.Scan(
+			&i.UserID,
+			&i.Email,
+			&i.Username,
+			&i.FirstName,
+			&i.LastName,
+			&i.UserStatus,
+			&i.RoleSlug,
+			&i.RoleName,
+			&i.GrantID,
+			&i.GrantedAt,
+			&i.ExpiresAt,
+			&i.GrantedBy,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const revokeRoleFromUserInOrg = `-- name: RevokeRoleFromUserInOrg :execrows
+DELETE FROM user_organization_roles
+USING  roles
+WHERE  user_organization_roles.user_id         = $1
+  AND  user_organization_roles.organization_id = $2
+  AND  user_organization_roles.role_id         = roles.id
+  AND  roles.slug                              = $3
+  AND  roles.organization_id                  IS NULL
+`
+
+type RevokeRoleFromUserInOrgParams struct {
+	UserID   pgtype.UUID `json:"user_id"`
+	OrgID    pgtype.UUID `json:"org_id"`
+	RoleSlug string      `json:"role_slug"`
+}
+
+// Deletes a specific role grant by (user_id, org_id, role_slug).
+// Returns rows deleted: 1 = deleted, 0 = grant did not exist.
+// USING avoids a correlated subquery and keeps organization_id unambiguous.
+func (q *Queries) RevokeRoleFromUserInOrg(ctx context.Context, arg RevokeRoleFromUserInOrgParams) (int64, error) {
+	result, err := q.db.Exec(ctx, revokeRoleFromUserInOrg, arg.UserID, arg.OrgID, arg.RoleSlug)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }

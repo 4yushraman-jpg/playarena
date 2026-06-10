@@ -12,11 +12,16 @@ const (
 // CreateRequest is the payload for
 // POST /api/v1/organizations/{slug}/tournaments/{tournamentId}/registrations.
 //
-// Phase 7B supports team-based registrations only. team_id is required.
+// Supply exactly one of team_id (team tournaments) or player_id (individual tournaments).
+// The service validates that the provided field matches the tournament's participant_type.
 type CreateRequest struct {
 	// TeamID must be a team that belongs to the same organization as the tournament.
-	TeamID string  `json:"team_id" validate:"required,uuid"`
-	Notes  *string `json:"notes"`
+	// Required for team tournaments; must be omitted for individual tournaments.
+	TeamID *string `json:"team_id,omitempty"`
+	// PlayerID must be a player that belongs to the same organization as the tournament.
+	// Required for individual tournaments; must be omitted for team tournaments.
+	PlayerID *string `json:"player_id,omitempty"`
+	Notes    *string `json:"notes"`
 }
 
 // UpdateRequest is the payload for

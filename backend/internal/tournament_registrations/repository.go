@@ -83,6 +83,37 @@ func (r *Repository) CountActiveRegistrations(ctx context.Context, tournamentID 
 	return r.queries.CountActiveRegistrations(ctx, tournamentID)
 }
 
+// GetPlayerByID fetches a player scoped to an org. Returns ErrPlayerNotFound if
+// the player does not exist or does not belong to the org.
+func (r *Repository) GetPlayerByID(ctx context.Context, id, orgID pgtype.UUID) (*db.Player, error) {
+	p, err := r.queries.GetPlayerByID(ctx, db.GetPlayerByIDParams{
+		ID:             id,
+		OrganizationID: orgID,
+	})
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, ErrPlayerNotFound
+		}
+		return nil, err
+	}
+	return &p, nil
+}
+
+// GetByPlayer checks whether a player is already registered for a tournament.
+func (r *Repository) GetByPlayer(ctx context.Context, tournamentID, playerID pgtype.UUID) (*db.TournamentRegistration, error) {
+	reg, err := r.queries.GetRegistrationByPlayer(ctx, db.GetRegistrationByPlayerParams{
+		TournamentID: tournamentID,
+		PlayerID:     pgtype.UUID{Bytes: playerID.Bytes, Valid: true},
+	})
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, nil // not registered — OK to proceed
+		}
+		return nil, err
+	}
+	return &reg, nil
+}
+
 // GetByTeam checks whether a team is already registered for a tournament.
 func (r *Repository) GetByTeam(ctx context.Context, tournamentID, teamID pgtype.UUID) (*db.TournamentRegistration, error) {
 	reg, err := r.queries.GetRegistrationByTeam(ctx, db.GetRegistrationByTeamParams{
