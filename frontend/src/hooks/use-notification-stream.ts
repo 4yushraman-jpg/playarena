@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation"
 import { useQueryClient } from "@tanstack/react-query"
 import { tokenManager, attemptTokenRefresh } from "@/lib/api/client"
 import { useAuthStore } from "@/stores/auth.store"
+import { getQueryClient } from "@/lib/api/query-client"
 import { matchKeys, tournamentKeys, notificationKeys } from "@/lib/query-keys"
 import type { QueryClient } from "@tanstack/react-query"
 import type { NotificationStreamEvent } from "@/types/api/notifications"
@@ -67,7 +68,7 @@ export function useNotificationStream({ orgSlug, enabled = true }: UseNotificati
     es.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data) as NotificationStreamEvent
-        queryClient.invalidateQueries({ queryKey: notificationKeys.list(orgSlug) })
+        queryClient.invalidateQueries({ queryKey: notificationKeys.all(orgSlug) })
         handleStreamEvent(data, orgSlug, queryClient)
       } catch {
         // Ignore malformed frames
@@ -98,8 +99,8 @@ export function useNotificationStream({ orgSlug, enabled = true }: UseNotificati
       attemptTokenRefresh().then((newToken) => {
         if (!mountedRef.current) return
         if (!newToken) {
-          // Refresh failed — the token manager already cleared tokens.
-          // Clear store state and send user back to login.
+          // Refresh failed — flush cache, clear store state, redirect to login.
+          getQueryClient().clear()
           useAuthStore.getState().clearSession()
           router.replace("/login")
           return

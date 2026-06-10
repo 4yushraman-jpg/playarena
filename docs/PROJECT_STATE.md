@@ -3184,12 +3184,12 @@ Phase 22 implemented the full global rankings system: snapshot-on-completion tha
 
 ## 10. Frontend Application
 
-**Status: Foundation locked. FE-1/FE-2/FE-3 complete. FE-4 may begin.**
+**Status: FE-1/FE-2/FE-3/FE-4 complete. FE-4 CLOSED. FE-5 may begin.**
 **Last validated:** 2026-06-10
 **Typecheck:** `tsc --noEmit` — 0 errors
 **Lint:** `eslint .` — 0 errors, 0 warnings
-**Tests:** 18/18 passing (`vitest run`)
-**Build:** `next build` — clean, 9 routes
+**Tests:** 67/67 passing (`vitest run`) — 11 test files
+**Build:** `next build` — clean, 14 routes (6 dynamic ƒ, 8 static ○)
 
 ---
 
@@ -3269,11 +3269,28 @@ Phase 22 implemented the full global rankings system: snapshot-on-completion tha
 | `frontend/src/app/(auth)/reset-password/page.tsx` | Reset password form |
 | `frontend/src/app/(auth)/org-select/page.tsx` | Multi-org picker: reads pending orgs from store; re-calls login with organization_id; guard checks orgSlug before redirecting to prevent race with router.push |
 | `frontend/src/app/(app)/layout.tsx` | App shell: runs useAuthGuard; shows PageSkeleton while hydrating |
-| `frontend/src/app/(app)/[orgSlug]/layout.tsx` | Org layout: sidebar + header + mobile backdrop overlay; SSE stream mount; closes sidebar on mobile init; `lg:ml-60` content offset |
+| `frontend/src/app/(app)/[orgSlug]/layout.tsx` | Org layout: sidebar + header + mobile backdrop overlay; SSE stream mount; closes sidebar on mobile init; `lg:ml-60` content offset; `useSyncExternalStore` matchMedia for desktop detection; `inert` on main content when mobile drawer open; Escape key closes; focus moves to first sidebar element on open |
 | `frontend/src/hooks/use-auth-guard.ts` | Hydration guard: refresh token check → me() silent refresh → hydrateClaims() → orgSlug resolution → setHydrating(false); one-shot on mount |
-| `frontend/src/hooks/use-notification-stream.ts` | SSE hook: connects with `?token=` query param; exponential backoff on onerror; on auth_error calls `attemptTokenRefresh()` explicitly before reconnecting to prevent infinite loop; `connectRef` pattern avoids stale closures |
-| `frontend/src/components/layout/org-sidebar.tsx` | Fixed sidebar: memoized nav (`useMemo`); `aria-current="page"` on active link; closes drawer on mobile nav-click |
+| `frontend/src/hooks/use-notification-stream.ts` | SSE hook: connects with `?token=` query param; exponential backoff on onerror; on auth_error calls `attemptTokenRefresh()` explicitly before reconnecting to prevent infinite loop; `connectRef` pattern avoids stale closures; `getQueryClient().clear()` on forced logout from SSE |
+| `frontend/src/components/layout/org-sidebar.tsx` | Fixed sidebar: memoized nav (`useMemo`); `aria-current="page"` on active link; closes drawer on mobile nav-click; `data-sidebar="true"` + `tabIndex={-1}` for focus management; `role="dialog"` + `aria-modal="true"` when acting as mobile overlay |
 | `frontend/src/components/layout/org-header.tsx` | Sticky header: sidebar toggle; theme toggle; logout (`getQueryClient().clear()` → `clearSession()` → `/login`) |
+
+---
+
+#### FE-4 — Core App Pages
+
+| File | Purpose |
+|---|---|
+| `frontend/src/app/(app)/[orgSlug]/page.tsx` | Dashboard: welcome banner with role badge; role-filtered quick actions (`hasPermission`); notification/tournament/match widgets with error retry; unread count badge via `useUnreadCount`; `Button asChild` pattern for link-button; `focus-visible:ring` on quick action cards |
+| `frontend/src/app/(app)/[orgSlug]/notifications/page.tsx` | Notification center: `useInfiniteQuery` with Load More pagination; optimistic mark-read, mark-all-read, delete (with rollback); `role="feed"` list; Retry button on error |
+| `frontend/src/app/(app)/[orgSlug]/settings/profile/page.tsx` | Profile settings: RHF + Zod form; dirty-state tracking; cancel reverts to server values; read-only email uses `<p>` not `<label>`; `useCurrentUser` for greeting |
+| `frontend/src/app/(app)/[orgSlug]/settings/security/page.tsx` | Password change: show/hide toggles; password strength meter with 4 rules; `aria-live` + `aria-label` on strength; field-level error for wrong current password; form reset on success |
+| `frontend/src/app/(app)/[orgSlug]/settings/notifications/page.tsx` | Notification preferences: opt-out model (default enabled); optimistic toggle with rollback; webhook channel intentionally excluded; Retry button on load error |
+| `frontend/src/components/layout/org-switcher.tsx` | Org switcher: single-org static display; multi-org dropdown; org switch = logout → `queryClient.clear()` → `/login` (no dead-code query params) |
+| `frontend/src/components/notifications/notification-item.tsx` | Notification item: `role="article"`; action buttons visible on hover, focus-within, AND touch devices (`[@media(hover:none)]:opacity-100`); `aria-label` on all actions |
+| `frontend/src/hooks/use-unread-count.ts` | Unread badge hook: `notificationKeys.list(orgSlug, { limit: 50, offset: 0 })`; single source of truth for all badge displays |
+| `frontend/src/hooks/use-current-user.ts` | Current user hook: `userKeys.detail(userId)`; enabled only when userId is known |
+| `frontend/src/lib/permissions.ts` | Shared RBAC helpers: `hasPermission(role, perm)`, `ROLE_LABELS`, `ROLE_VARIANTS`; extracted from dashboard for reuse |
 
 ---
 
@@ -3288,26 +3305,39 @@ Phase 22 implemented the full global rankings system: snapshot-on-completion tha
 | Multi-org 409 flow | Login → 409 → store pending orgs + sessionStorage credentials → org-select → re-login with organization_id → clear credentials immediately |
 | Silent session restore | useAuthGuard decodes token → calls me() → 401 interceptor refreshes → hydrateClaims() writes decoded claims to store |
 | Platform admin orgId | `null` (not empty string) — `decoded.organization_id \|\| null` normalises both absent field and empty string |
-| SSE auth_error | `attemptTokenRefresh()` called explicitly before reconnect; redirect to /login if refresh fails |
+| SSE auth_error | `attemptTokenRefresh()` called explicitly before reconnect; `getQueryClient().clear()` + `clearSession()` + redirect to /login if refresh fails |
+| Org switch | logout → `getQueryClient().clear()` → `clearSession()` → `/login`; no dead-code `?email`/`?next` params |
 
 ### Query Architecture
 
 | Aspect | Detail |
 |---|---|
 | Cache keys | All org-scoped; `orgKeys` and `userKeys` intentionally not org-scoped |
-| SSE invalidation | `useNotificationStream` invalidates specific query key subtrees per event_type |
+| SSE invalidation | `useNotificationStream` invalidates `notificationKeys.all(orgSlug)` on every message (covers all notification query variants); per-event-type invalidation of match/tournament/registration keys |
 | Cache on logout | `getQueryClient().clear()` called before `clearSession()` — stale data cannot survive the session boundary |
+| Cache on SSE forced logout | `getQueryClient().clear()` called in `auth_error` handler when refresh fails — consistent with explicit logout |
+| Unread count | `useUnreadCount(orgSlug)` is the single source of truth for all unread badge displays (header bell, sidebar badge, dashboard, notification center) |
+| Infinite query | Notification center uses `useInfiniteQuery` with offset-based `getNextPageParam`; optimistic mutations map over `InfiniteData.pages` |
 
 ---
 
-### Testing Foundation
+### Testing
 
-| Test file | Tests | Coverage |
+| Test file | Tests | What it regresses |
 |---|---|---|
 | `src/hooks/__tests__/use-auth-guard.test.ts` | 5 | Claims populated after me(); orgSlug resolved; redirect on no refresh token; redirect on me() failure; no duplicate me() when claims valid |
 | `src/app/(auth)/org-select/__tests__/org-select.test.tsx` | 5 | Org list rendered; redirect to /login on empty+no-orgSlug; successful selection → /{orgSlug} not /login; credential cleanup; no /login redirect when orgSlug set |
-| `src/hooks/__tests__/use-notification-stream.test.ts` | 5 | EventSource URL contains token; attemptTokenRefresh called on auth_error; reconnect with new EventSource; redirect to /login on refresh failure; no infinite loop |
+| `src/hooks/__tests__/use-notification-stream.test.ts` | 7 | SSE key invalidates `notificationKeys.all`; EventSource URL has token; attemptTokenRefresh on auth_error; reconnect with new token; redirect + no reconnect on refresh failure; **query cache cleared on forced logout**; no infinite auth_error loop |
 | `src/components/layout/__tests__/org-header.test.tsx` | 3 | Query cache cleared on logout; cache cleared before session cleared; redirect to /login after logout |
+| `src/components/layout/__tests__/org-switcher.test.tsx` | 4 | Single-org static display; dropdown trigger for multi-org; other orgs listed; **logout + cache clear + redirect to /login (no dead query params)** |
+| `src/app/(app)/[orgSlug]/__tests__/dashboard.test.tsx` | 7 | Welcome/role badge; quick actions by role; widget headings; empty states; unread count badge (correct `{ limit: 50 }` key); **widget error states show retry button** |
+| `src/app/(app)/[orgSlug]/notifications/__tests__/notification-center.test.tsx` | 8 | Loading skeleton; empty state; list renders; mark-all-read optimistic update; SSE cache update (InfiniteData shape); Load More button |
+| `src/app/(app)/[orgSlug]/settings/__tests__/notifications.test.tsx` | 6 | Skeleton; event groups; column headers; preference state in toggles; opt-out default; updatePreference API call |
+| `src/app/(app)/[orgSlug]/settings/__tests__/profile.test.tsx` | 7 | Loading skeleton; form fields; save button disabled when clean; save enables when dirty; unsaved indicator; cancel button; form resets on cancel; validation |
+| `src/app/(app)/[orgSlug]/settings/__tests__/security.test.tsx` | 7 | Renders all fields; submit button; strength meter; "Strong" label; correct API args; field error on wrong password; form reset after success |
+| `src/components/notifications/__tests__/notification-item.test.tsx` | 7 | Event label; mark-as-read only for unread; delete always present; **`[@media(hover:none)]:opacity-100` class present for touch accessibility**; callbacks fire with correct id |
+
+**Total: 67 tests across 11 files.**
 
 Test infrastructure: Vitest 3, `@testing-library/react` 16, jsdom, `@testing-library/jest-dom`; `vitest.config.ts` at `frontend/`; `src/test/setup.ts` + `src/test/test-utils.tsx`.
 
@@ -3319,12 +3349,23 @@ Test infrastructure: Vitest 3, `@testing-library/react` 16, jsdom, `@testing-lib
 
 **Phases 23A–D are complete.** All four backend blockers that prevented frontend development are resolved.
 
-**Candidate Phase 24 scope (no recommendation):**
+**Frontend phases FE-1 through FE-4 are complete.** The core app shell, design system, auth infrastructure, and all primary user-facing pages are implemented, reviewed, and passing 67 tests.
+
+**Next frontend phase: FE-5 — Players & Teams**
+
+Scope:
+- Player list, player detail, player create/edit/delete (RBAC-gated)
+- Team list, team detail, team create/edit/delete (RBAC-gated)
+- Team membership management (add/remove players)
+- Player tournament history view
+
+Backend APIs are available: `/organizations/{slug}/players`, `/organizations/{slug}/teams`, `/organizations/{slug}/teams/{id}/members`.
+
+**Candidate backend scope (no recommendation):**
 
 1. **News module** (`internal/news/`) — stub exists with only a package declaration; no business logic.
 2. **Redis pub/sub for multi-instance SSE** — Phase 20 Hub is in-process (single binary). Horizontal scaling requires a Redis pub/sub bridge so events published by one instance reach SSE clients on another.
-3. **Frontend application** — A frontend (`frontend/`) directory exists but the backend API has no corresponding UI. All backend blockers (members API, media entity types, player tournaments, N-way h2h) are now resolved.
-4. **Integration test coverage gaps** — Organizations, players, teams, matches, match_events, media, users, and tournament_registrations integration packages exist but test coverage depth varies. The new `internal/members/` module has no integration tests yet.
+3. **Integration test coverage gaps** — Organizations, players, teams, matches, match_events, media, users, and tournament_registrations integration packages exist but test coverage depth varies. The new `internal/members/` module has no integration tests yet.
 
 ---
 

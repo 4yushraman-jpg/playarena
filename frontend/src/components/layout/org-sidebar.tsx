@@ -18,41 +18,44 @@ import {
 import { cn } from "@/lib/utils"
 import { useUIStore } from "@/stores/ui.store"
 import { useAuthStore, selectRole } from "@/stores/auth.store"
+import { useUnreadCount } from "@/hooks/use-unread-count"
 
 interface NavItem {
   label: string
   href: string
   icon: React.ElementType
+  showBadge?: boolean
 }
 
 function buildNav(orgSlug: string): NavItem[] {
   const base = `/${orgSlug}`
   return [
-    { label: "Dashboard",     href: base,                    icon: HomeIcon },
-    { label: "Players",       href: `${base}/players`,       icon: UsersIcon },
-    { label: "Teams",         href: `${base}/teams`,         icon: ShieldIcon },
-    { label: "Tournaments",   href: `${base}/tournaments`,   icon: TrophyIcon },
-    { label: "Matches",       href: `${base}/matches`,       icon: SwordsIcon },
-    { label: "Rankings",      href: `${base}/rankings`,      icon: BarChart2Icon },
-    { label: "Notifications", href: `${base}/notifications`, icon: BellIcon },
-    { label: "Webhooks",      href: `${base}/webhooks`,      icon: WebhookIcon },
-    { label: "Media",         href: `${base}/media`,         icon: ImageIcon },
-    { label: "Settings",      href: `${base}/settings`,      icon: SettingsIcon },
+    { label: "Dashboard",     href: base,                          icon: HomeIcon },
+    { label: "Players",       href: `${base}/players`,             icon: UsersIcon },
+    { label: "Teams",         href: `${base}/teams`,               icon: ShieldIcon },
+    { label: "Tournaments",   href: `${base}/tournaments`,         icon: TrophyIcon },
+    { label: "Matches",       href: `${base}/matches`,             icon: SwordsIcon },
+    { label: "Rankings",      href: `${base}/rankings`,            icon: BarChart2Icon },
+    { label: "Notifications", href: `${base}/notifications`,       icon: BellIcon, showBadge: true },
+    { label: "Webhooks",      href: `${base}/webhooks`,            icon: WebhookIcon },
+    { label: "Media",         href: `${base}/media`,               icon: ImageIcon },
+    { label: "Settings",      href: `${base}/settings/profile`,    icon: SettingsIcon },
   ]
 }
 
 interface OrgSidebarProps {
   orgSlug: string
+  isDrawerMode?: boolean
 }
 
-export function OrgSidebar({ orgSlug }: OrgSidebarProps) {
+export function OrgSidebar({ orgSlug, isDrawerMode = false }: OrgSidebarProps) {
   const pathname = usePathname()
   const { sidebarOpen, setSidebarOpen } = useUIStore()
   const role = useAuthStore(selectRole)
   const nav = useMemo(() => buildNav(orgSlug), [orgSlug])
+  const { unreadCount } = useUnreadCount(orgSlug)
 
   function handleNavClick() {
-    // Close the sidebar drawer after navigation on mobile.
     if (typeof window !== "undefined" && window.innerWidth < 1024) {
       setSidebarOpen(false)
     }
@@ -60,7 +63,10 @@ export function OrgSidebar({ orgSlug }: OrgSidebarProps) {
 
   return (
     <aside
+      data-sidebar="true"
+      tabIndex={-1}
       aria-label="Primary navigation"
+      {...(isDrawerMode ? { role: "dialog" as const, "aria-modal": "true" } : {})}
       className={cn(
         "fixed inset-y-0 left-0 z-30 flex w-60 flex-col border-r border-sidebar-border bg-sidebar transition-transform duration-200",
         !sidebarOpen && "-translate-x-full",
@@ -71,20 +77,25 @@ export function OrgSidebar({ orgSlug }: OrgSidebarProps) {
         <div className="flex size-7 items-center justify-center rounded-lg bg-sidebar-primary text-sidebar-primary-foreground text-xs font-bold select-none">
           PA
         </div>
-        <span className="text-sm font-semibold text-sidebar-foreground truncate">PlayArena</span>
+        <span className="truncate text-sm font-semibold text-sidebar-foreground">PlayArena</span>
       </div>
 
       {/* Org slug pill */}
       <div className="px-3 py-2">
         <div className="rounded-md bg-sidebar-accent px-2.5 py-1">
-          <p className="text-xs font-medium text-sidebar-accent-foreground truncate">/{orgSlug}</p>
+          <p className="truncate text-xs font-medium text-sidebar-accent-foreground">/{orgSlug}</p>
         </div>
       </div>
 
       {/* Nav */}
-      <nav className="flex-1 overflow-y-auto px-2 py-1 space-y-0.5">
+      <nav className="flex-1 space-y-0.5 overflow-y-auto px-2 py-1">
         {nav.map((item) => {
-          const isActive = pathname === item.href || pathname.startsWith(`${item.href}/`)
+          const isActive =
+            item.href === `/${orgSlug}`
+              ? pathname === item.href
+              : pathname === item.href || pathname.startsWith(`${item.href}/`)
+          const badge = item.showBadge && unreadCount > 0 ? unreadCount : 0
+
           return (
             <Link
               key={item.href}
@@ -99,7 +110,15 @@ export function OrgSidebar({ orgSlug }: OrgSidebarProps) {
               )}
             >
               <item.icon className="size-4 shrink-0" />
-              {item.label}
+              <span className="flex-1">{item.label}</span>
+              {badge > 0 && (
+                <span
+                  className="flex h-4 min-w-4 items-center justify-center rounded-full bg-primary px-1 text-[10px] font-medium leading-none text-primary-foreground"
+                  aria-label={`${badge} unread`}
+                >
+                  {badge > 9 ? "9+" : badge}
+                </span>
+              )}
             </Link>
           )
         })}
@@ -108,7 +127,7 @@ export function OrgSidebar({ orgSlug }: OrgSidebarProps) {
       {/* Role indicator */}
       {role && (
         <div className="border-t border-sidebar-border px-4 py-3">
-          <p className="text-xs text-sidebar-foreground/60 capitalize">{role.replace(/_/g, " ")}</p>
+          <p className="text-xs capitalize text-sidebar-foreground/60">{role.replace(/_/g, " ")}</p>
         </div>
       )}
     </aside>

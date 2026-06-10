@@ -12,6 +12,7 @@ class MockEventSource {
   url: string
   onopen: EventHandler | null = null
   onerror: EventHandler | null = null
+  onmessage: ((ev: MessageEvent) => void) | null = null
   private listeners = new Map<string, EventHandler[]>()
   readyState = 1
 
@@ -53,8 +54,16 @@ vi.mock("@/lib/api/client", () => ({
   attemptTokenRefresh: vi.fn(),
 }))
 
+vi.mock("@/lib/api/query-client", () => ({
+  getQueryClient: vi.fn().mockReturnValue({ clear: vi.fn() }),
+  makeQueryClient: vi.fn(),
+}))
+
 import { tokenManager, attemptTokenRefresh } from "@/lib/api/client"
+import { getQueryClient } from "@/lib/api/query-client"
 import { useNotificationStream } from "../use-notification-stream"
+import { makeTestQueryClient } from "@/test/test-utils"
+import { notificationKeys } from "@/lib/query-keys"
 
 beforeEach(() => {
   vi.clearAllMocks()
@@ -75,6 +84,37 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllGlobals()
+})
+
+describe("useNotificationStream — SSE invalidation", () => {
+  it("invalidates notificationKeys.all(orgSlug) when a message is received", async () => {
+    const client = makeTestQueryClient()
+    const invalidateSpy = vi.spyOn(client, "invalidateQueries")
+
+    renderHookWithProviders(() => useNotificationStream({ orgSlug: "my-org" }), { client })
+
+    const es = MockEventSource.instances[0]
+    act(() => {
+      if (es.onmessage) {
+        es.onmessage({
+          data: JSON.stringify({
+            id: "n1",
+            event_type: "match_started",
+            entity_type: "match",
+            entity_id: "m1",
+            payload: {},
+            created_at: new Date().toISOString(),
+          }),
+        } as MessageEvent)
+      }
+    })
+
+    await waitFor(() => {
+      expect(invalidateSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ queryKey: notificationKeys.all("my-org") }),
+      )
+    })
+  })
 })
 
 describe("useNotificationStream — P0-3 auth_error fix", () => {
@@ -130,6 +170,25 @@ describe("useNotificationStream — P0-3 auth_error fix", () => {
     // Refresh returned null — no reconnect, redirect to /login
     expect(MockEventSource.instances).toHaveLength(1)
     expect(mockReplace).toHaveBeenCalledWith("/login")
+
+    vi.useRealTimers()
+  })
+
+  it("clears the query cache when token refresh fails on auth_error", async () => {
+    vi.mocked(attemptTokenRefresh).mockResolvedValue(null)
+    vi.useFakeTimers()
+
+    const client = makeTestQueryClient()
+    const clearSpy = vi.spyOn(client, "clear")
+    // Route getQueryClient() to the test client so the spy fires correctly
+    vi.mocked(getQueryClient).mockReturnValueOnce(client as never)
+
+    renderHookWithProviders(() => useNotificationStream({ orgSlug: "my-org" }), { client })
+
+    act(() => { MockEventSource.instances[0].emit("auth_error") })
+    await act(() => vi.runAllTimersAsync())
+
+    expect(clearSpy).toHaveBeenCalledTimes(1)
 
     vi.useRealTimers()
   })
