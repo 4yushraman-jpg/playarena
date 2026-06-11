@@ -1,6 +1,6 @@
 # PlayArena — Project State & Handoff Document
 
-**Last Updated:** 2026-06-10  
+**Last Updated:** 2026-06-11  
 **Build status:** `go build ./...` passing, `go vet ./...` clean, `sqlc generate` clean  
 **Migrations applied:** 000001 – 000027  
 **Go version:** 1.25.6  
@@ -20,7 +20,8 @@
 7. [Phase Implementation Notes](#7-phase-implementation-notes)
 8. [Outstanding Work](#8-outstanding-work)
 9. [Recommended Development Roadmap](#9-recommended-development-roadmap)
-10. [Next Recommended Phase](#10-next-recommended-phase)
+10. [Frontend Application](#10-frontend-application)
+11. [Next Recommended Phase](#11-next-recommended-phase)
 
 ---
 
@@ -3184,12 +3185,12 @@ Phase 22 implemented the full global rankings system: snapshot-on-completion tha
 
 ## 10. Frontend Application
 
-**Status: FE-1/FE-2/FE-3/FE-4/FE-5 complete. FE-5 CLOSED. FE-6 is next.**
+**Status: FE-1/FE-2/FE-3/FE-4/FE-5/FE-6 complete. FE-6 CLOSED. FE-7 is next.**
 **Last validated:** 2026-06-11
 **Typecheck:** `tsc --noEmit` — 0 errors
 **Lint:** `eslint .` — 0 errors, 0 warnings
-**Tests:** 108/108 passing (`vitest run`) — 15 test files
-**Build:** `next build` — clean, 20 routes (12 dynamic ƒ, 8 static ○)
+**Tests:** 166/166 passing (`vitest run`) — 22 test files
+**Build:** `next build` — clean, 27 routes (19 dynamic ƒ, 8 static ○)
 
 ---
 
@@ -3389,24 +3390,79 @@ Test infrastructure: Vitest 3, `@testing-library/react` 16, jsdom, `@testing-lib
 
 ---
 
+#### FE-6 — Tournaments & Registrations
+
+**Status: CLOSED.** Implementation → adversarial review (CONDITIONAL PASS, 8 P1 + 15 P2 findings) → full remediation → final adversarial review: **FE-6 CLOSED — FE-7 may begin** (2026-06-11).
+
+| File | Purpose |
+|---|---|
+| `frontend/src/app/(app)/[orgSlug]/tournaments/page.tsx` | Tournament directory: URL-driven state (`?q=&status=&page=`, survives refresh/share/back); 300ms debounced search; status filter; server pagination; "Registered" column shows real `active / max` usage; Suspense-wrapped for `useSearchParams` |
+| `frontend/src/app/(app)/[orgSlug]/tournaments/[id]/page.tsx` | Tournament detail: lifecycle timeline, action buttons, registration-health sidebar driven by server `registration_counts` (no client aggregation), capacity bar with pending+approved semantics + explainer caption, standings card for ongoing/completed, register button for both participant types |
+| `frontend/src/app/(app)/[orgSlug]/tournaments/new/page.tsx` | Create tournament (RBAC-gated); redirects to detail on success |
+| `frontend/src/app/(app)/[orgSlug]/tournaments/[id]/edit/page.tsx` | Edit tournament; cancelled/completed are view-only; no enum casts (typed `CoercedTournamentValues`) |
+| `frontend/src/app/(app)/[orgSlug]/tournaments/[id]/registrations/page.tsx` | Registration dashboard: 6 status tabs (incl. Disqualified) with counts from `registration_counts`; server-side filtering + pagination (limit 50); explicit error state with Retry (distinct from empty); named participants; per-participant aria-labels; approve/reject/withdraw with confirmations |
+| `frontend/src/components/tournaments/tournament-form.tsx` | RHF + Zod v4 form; RFC3339 ↔ datetime-local conversion; exports typed `coerceTournamentFormValues` |
+| `frontend/src/components/tournaments/tournament-actions.tsx` | Status-transition buttons from transition map; per-transition success toasts ("Tournament published — registrations are open", …); cancel via `useDeleteTournament` |
+| `frontend/src/components/tournaments/tournament-timeline.tsx` | 5-step lifecycle rail; compact mobile variant under `sm` ("Step 2 of 5 · Open" + progress dots); `aria-current="step"` on `<li>`; cancelled renders `role="status"` banner |
+| `frontend/src/components/tournaments/register-participant-dialog.tsx` | Unified team + individual registration: searchable picker backed by server-side search (limit 20, overflow hint "Showing first 20 of N"); per-selection duplicate check via `team_id`/`player_id`-filtered registration query; exported `analyzeEligibility` mirrors backend rules (status, window, capacity = active, duplicates block in ANY status — Rule 4); eligibility verdicts in `aria-live` region; picker error state distinct from empty |
+| `frontend/src/hooks/use-tournaments.ts` | `useTournamentList/useTournament/useTournamentStandings/useCreate/useUpdate/useDelete`; update writes PATCH response (incl. `registration_counts`) via `setQueryData` — shape-consistent with detail cache |
+| `frontend/src/hooks/use-registrations.ts` | `useRegistrationList` (accepts `enabled` option), `useRegisterParticipant`, `useUpdateRegistration`, `useWithdrawRegistration`; all mutations invalidate registrations root + tournament detail (capacity) + directory lists; status-specific success toasts |
+| `frontend/src/hooks/use-debounce.ts` | `useDebouncedValue<T>(value, delayMs)` |
+| `frontend/src/lib/tournament-list-state.ts` | Directory URL state: `parseListState`/`serializeListState`; 1-based page in URL; invalid values ignored; defaults omitted |
+| `frontend/src/lib/registration-stats.ts` | `getRegistrationCounts` (zeroed fallback), `getCapacityUsage` (used = ACTIVE = pending+approved — matches backend enforcement), `formatCapacityLabel`, `getParticipantLabel` (name-first; UUID-slice only as defensive fallback) |
+| `frontend/src/lib/notification-copy.ts` | Shared human-readable notification copy (`getNotificationLabel`/`getNotificationDescription`); used by notification center AND dashboard widget — no raw `event_type` strings render anywhere |
+| `frontend/src/lib/api/tournaments.ts`, `lib/api/registrations.ts` | Full CRUD API layers; registrations list accepts `status`/`team_id`/`player_id` filters |
+| `frontend/src/lib/query-keys.ts` | Tournament keys restructured: params-less invalidation roots (`lists`, `registrations`) + params-bearing query keys (`list`, `registrationList`, `registration`) |
+| `frontend/src/hooks/use-notification-stream.ts` | Registration SSE events read `payload.tournament_id` (NOT `entity_id`, which is the registration UUID) and invalidate registrations root + tournament detail |
+
+**Backend changes shipped with FE-6 remediation** (no new migration; queries + services only, full integration suite green):
+
+- `tournament_registrations`: list query LEFT JOINs `teams.name`/`players.display_name` → `team_name`/`player_name` on list responses; `team_id`/`player_id` query-param filters on list/count (per-participant duplicate checks).
+- `tournaments`: `CountRegistrationsByStatusForTournaments` (single `ANY(uuid[]) GROUP BY` query) → `registration_counts {pending, approved, rejected, withdrawn, disqualified, active, total}` embedded in create/get/list/update responses, where **`active = pending + approved`** mirrors `CountActiveRegistrations` capacity enforcement; standings rows gain `participant_name` via batch `ListTeamNamesByIDs`/`ListPlayerNamesByIDs`.
+
+**Architecture decisions:**
+- **Counts are server-authoritative.** Capacity/health/tab counts come from `registration_counts` on the tournament response — never from paging registrations client-side (the original `limit: 200` aggregation truncated silently and used approved-only math that disagreed with backend enforcement).
+- **Names are server-joined.** No UUIDs render anywhere; no N+1 (one join for lists, two batch lookups for standings).
+- **Query-key invalidation rule:** TanStack partial matching fails when a filter key ends in `undefined` against a stored key ending in a params object. Tournament keys now expose params-less roots used for ALL invalidation; regression-tested against live params-keyed queries. ⚠️ `teamKeys`/`playerKeys`/`matchKeys` etc. still carry this hazard in their `list(orgSlug)` invalidation call sites — apply the same `lists()` root pattern when those modules are next touched.
+- Duplicate registration checks ask the server per selection (filtered list query) rather than scanning a truncated page; backend Rule 4 (duplicates block in ANY status, incl. rejected/withdrawn) is mirrored in `analyzeEligibility`.
+
+**FE-6 tests added (58 tests; 7 new files + 2 added to SSE suite):**
+
+| Test file | Tests | What it regresses |
+|---|---|---|
+| `src/lib/__tests__/registration-stats.test.ts` | 13 | Capacity = active not approved-only (P1-03); boundary/clamp/isFull; directory label never shows a dash (P2-09); name-first participant labels (P1-05) |
+| `src/lib/__tests__/tournament-list-state.test.ts` | 7 | URL state round-trip, 1-based pages, invalid input ignored (P1-01) |
+| `src/lib/__tests__/notification-copy.test.ts` | 3 | Every event type has human copy; no underscores leak (P2-12) |
+| `src/components/tournaments/__tests__/eligibility.test.ts` | 18 | Status/window gates; capacity boundary with pending+approved (P1-04); duplicates block in all 5 statuses (Rule 4); picker overflow hint (P2-13) |
+| `src/components/tournaments/__tests__/tournament-timeline.test.tsx` | 6 | `aria-current` on `<li>` (P2-06); compact mobile summary (P2-10); cancelled banner |
+| `src/hooks/__tests__/use-registrations.test.tsx` | 6 | Approval invalidates tournament detail (P1-08); status-specific toasts (P1-07); error toast; live params-keyed query actually invalidated (key-architecture regression) |
+| `src/app/(app)/[orgSlug]/tournaments/__tests__/registrations-page.test.tsx` | 3 | Error ≠ empty state, counts stay server-driven during list failure (P2-04); team names + unique action aria-labels (P1-05/P2-07) |
+| `src/hooks/__tests__/use-notification-stream.test.ts` (+2) | 9 total | Registration SSE events use `payload.tournament_id`, never `entity_id`; live registration-list cache actually invalidated |
+
+**Total after FE-6: 166 tests across 22 files.**
+
+**Known P2 carry-overs (disclosed at closure, none blocking):** no realtime push on registration *creation* (backend emits no `registration_created` outbox event — capacity still enforced server-side); `match_completed` SSE doesn't invalidate standings (60s staleTime + refocus covers it); participant picker lacks ARIA combobox arrow-key navigation; directory search input can desync from URL on browser back (list stays correct); no bulk approve; dashboard tabs not URL-persisted; FE-7 should add an individual-tournament registration flow test (P1 test gap).
+
+---
+
 ## 11. Next Recommended Phase
 
 **Phases 1 – 22 are complete.** All four notification delivery channels (in_app, email, webhook, SSE), the full observability stack, and the rankings module are implemented and production-hardened.
 
 **Phases 23A–D are complete.** All four backend blockers that prevented frontend development are resolved.
 
-**Frontend phases FE-1 through FE-5 are complete.** Players & Teams pages, roster management, and media upload are implemented, reviewed, and passing 108 tests.
+**Frontend phases FE-1 through FE-6 are complete.** Tournaments and registration management (both team and individual participant types), lifecycle transitions, standings display, and server-authoritative registration counts are implemented, twice adversarially reviewed, and passing 166 tests. Matches were descoped from FE-6 into FE-7.
 
-**Next frontend phase: FE-6 — Tournaments & Matches**
+**Next frontend phase: FE-7 — Matches & Live Scoring**
 
 Scope:
-- Tournament list, tournament detail, tournament create/edit/delete (RBAC-gated)
-- Match list, match detail, match scoring interface
-- Tournament registration management
+- Match list, match detail, match create/edit (RBAC-gated)
+- Match scoring interface + live score view (SSE already invalidates `matchKeys.score`)
 - Match event log (scorer view)
 - Cross-linking player tournament history on player profile (placeholder exists at `PlayerProfilePage` "Teams" card)
+- Early items: individual-tournament registration flow test (P1 test gap from FE-6 closure); invalidate `tournamentKeys.standings` on `match_completed` SSE; apply the params-less `lists()` invalidation-root pattern to `matchKeys` before relying on match invalidations (same latent bug FE-6 fixed for tournaments)
 
-Backend APIs available: `/organizations/{slug}/tournaments`, `/organizations/{slug}/matches`, `/organizations/{slug}/matches/{id}/events`, `/organizations/{slug}/tournament-registrations`.
+Backend APIs available: `/organizations/{slug}/matches`, `/organizations/{slug}/matches/{id}/events`, `/organizations/{slug}/matches/{id}/score`, `/organizations/{slug}/tournaments/{id}/standings`.
 
 **Candidate backend scope (no recommendation):**
 
