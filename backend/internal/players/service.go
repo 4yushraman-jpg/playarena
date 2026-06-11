@@ -90,6 +90,11 @@ func (s *Service) Create(ctx context.Context, orgSlug string, req CreateRequest,
 
 // List returns a paginated page of non-inactive players for an organization.
 // No ownership check: any authenticated user may list any org's players.
+//
+// avatar_url is intentionally omitted from list responses. The list view renders
+// thumbnails at size-sm (8 × 8px) using initials only, so media URLs add no
+// visible value. Full media is populated by GetByID. Do NOT add GetPrimaryMediaURL
+// here without batching it across all rows; a per-row media lookup is an N+1 query.
 func (s *Service) List(ctx context.Context, orgSlug string, params ListParams) (*ListResponse, error) {
 	org, err := s.repo.GetOrgBySlug(ctx, orgSlug)
 	if err != nil {
@@ -149,7 +154,13 @@ func (s *Service) GetByID(ctx context.Context, orgSlug, playerID string) (*Respo
 	if err != nil {
 		return nil, err
 	}
-	return playerToResponse(player), nil
+	resp := playerToResponse(player)
+	avatarURL, err := s.repo.GetPrimaryMediaURL(ctx, player.ID, org.ID)
+	if err != nil {
+		return nil, err
+	}
+	resp.AvatarURL = avatarURL
+	return resp, nil
 }
 
 // Update applies a partial update to a player.

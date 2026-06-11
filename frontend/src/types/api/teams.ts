@@ -26,6 +26,7 @@ export interface TeamMember {
   team_id: string
   player_id: string
   organization_id: string
+  player_display_name: string  // embedded from players JOIN; use this for all UI display
   role: string             // e.g. "player", "captain"
   jersey_number: string | null
   status: MembershipStatus

@@ -5,8 +5,9 @@ import { cn } from "@/lib/utils"
 export type MatchStatus = "scheduled" | "live" | "completed" | "cancelled" | "abandoned"
 export type TournamentStatus = "draft" | "registration_open" | "registration_closed" | "ongoing" | "completed" | "cancelled"
 export type RegistrationStatus = "pending" | "approved" | "rejected" | "withdrawn" | "disqualified"
-export type PlayerStatus = "active" | "inactive"
-export type TeamStatus = "active" | "inactive"
+export type PlayerStatus = "active" | "inactive" | "injured" | "suspended" | "retired"
+export type TeamStatus = "active" | "inactive" | "disbanded"
+export type MembershipStatus = "active" | "released"
 
 type StatusType =
   | MatchStatus
@@ -14,6 +15,7 @@ type StatusType =
   | RegistrationStatus
   | PlayerStatus
   | TeamStatus
+  | MembershipStatus
 
 // --- Label + color mappings ---
 
@@ -38,6 +40,11 @@ const STATUS_CONFIG: Record<StatusType, { label: string; className: string }> = 
   // Player/Team
   active:              { label: "Active",               className: "bg-green-50  text-green-700  border-green-200  dark:bg-green-950/40 dark:text-green-300  dark:border-green-800" },
   inactive:            { label: "Inactive",             className: "bg-neutral-100 text-neutral-600 border-neutral-200 dark:bg-neutral-800 dark:text-neutral-400 dark:border-neutral-700" },
+  injured:             { label: "Injured",              className: "bg-orange-50 text-orange-700 border-orange-200 dark:bg-orange-950/40 dark:text-orange-300 dark:border-orange-800" },
+  suspended:           { label: "Suspended",            className: "bg-red-50    text-red-700    border-red-200    dark:bg-red-950/40   dark:text-red-300    dark:border-red-800" },
+  retired:             { label: "Retired",              className: "bg-neutral-100 text-neutral-500 border-neutral-200 dark:bg-neutral-800 dark:text-neutral-400 dark:border-neutral-700" },
+  disbanded:           { label: "Disbanded",            className: "bg-neutral-100 text-neutral-500 border-neutral-200 dark:bg-neutral-800 dark:text-neutral-400 dark:border-neutral-700" },
+  released:            { label: "Released",             className: "bg-neutral-100 text-neutral-600 border-neutral-200 dark:bg-neutral-800 dark:text-neutral-400 dark:border-neutral-700" },
 }
 
 interface StatusBadgeProps {

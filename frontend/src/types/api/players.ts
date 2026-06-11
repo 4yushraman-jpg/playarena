@@ -15,6 +15,7 @@ export interface Player {
   nationality: string | null
   bio: string | null
   status: PlayerStatus
+  avatar_url: string | null      // CDN URL of primary media attachment; null until first upload
   created_at: string
   updated_at: string
 }

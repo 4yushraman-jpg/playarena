@@ -74,6 +74,9 @@ type Response struct {
 	// team membership and match event data remain resolvable.
 	Status    string  `json:"status"`
 	Bio       *string `json:"bio,omitempty"`
+	// AvatarURL is the CDN URL of the player's primary media attachment.
+	// Populated by GET /players/{id}; nil when no avatar has been uploaded.
+	AvatarURL *string `json:"avatar_url,omitempty"`
 	CreatedAt string  `json:"created_at"`
 	UpdatedAt string  `json:"updated_at"`
 }

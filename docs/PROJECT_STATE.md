@@ -3184,12 +3184,12 @@ Phase 22 implemented the full global rankings system: snapshot-on-completion tha
 
 ## 10. Frontend Application
 
-**Status: FE-1/FE-2/FE-3/FE-4 complete. FE-4 CLOSED. FE-5 may begin.**
-**Last validated:** 2026-06-10
+**Status: FE-1/FE-2/FE-3/FE-4/FE-5 complete. FE-5 CLOSED. FE-6 is next.**
+**Last validated:** 2026-06-11
 **Typecheck:** `tsc --noEmit` — 0 errors
 **Lint:** `eslint .` — 0 errors, 0 warnings
-**Tests:** 67/67 passing (`vitest run`) — 11 test files
-**Build:** `next build` — clean, 14 routes (6 dynamic ƒ, 8 static ○)
+**Tests:** 108/108 passing (`vitest run`) — 15 test files
+**Build:** `next build` — clean, 20 routes (12 dynamic ƒ, 8 static ○)
 
 ---
 
@@ -3337,9 +3337,55 @@ Phase 22 implemented the full global rankings system: snapshot-on-completion tha
 | `src/app/(app)/[orgSlug]/settings/__tests__/security.test.tsx` | 7 | Renders all fields; submit button; strength meter; "Strong" label; correct API args; field error on wrong password; form reset after success |
 | `src/components/notifications/__tests__/notification-item.test.tsx` | 7 | Event label; mark-as-read only for unread; delete always present; **`[@media(hover:none)]:opacity-100` class present for touch accessibility**; callbacks fire with correct id |
 
-**Total: 67 tests across 11 files.**
+**Total: 67 tests across 11 files** (FE-1 through FE-4 scope).
 
 Test infrastructure: Vitest 3, `@testing-library/react` 16, jsdom, `@testing-library/jest-dom`; `vitest.config.ts` at `frontend/`; `src/test/setup.ts` + `src/test/test-utils.tsx`.
+
+---
+
+#### FE-5 — Players & Teams
+
+**Status: CLOSED.** Final adversarial review + remediation pass complete (2026-06-11).
+
+| File | Purpose |
+|---|---|
+| `frontend/src/app/(app)/[orgSlug]/players/page.tsx` | Player directory: DataTable with server-side pagination/sort/filter; URL-driven state; debounced search; `localSearch` drives `hasFilters` (P1-1 fix); viewer-gated create |
+| `frontend/src/app/(app)/[orgSlug]/players/[playerId]/page.tsx` | Player profile: avatar, status badge, detail rows, delete confirmation; `avatar_url` from `GetByID` media query |
+| `frontend/src/app/(app)/[orgSlug]/players/[playerId]/edit/page.tsx` | Player edit form (RHF + Zod); dirty-state guard; cancel reverts |
+| `frontend/src/app/(app)/[orgSlug]/players/new/page.tsx` | Player create form; RBAC-gated |
+| `frontend/src/app/(app)/[orgSlug]/teams/page.tsx` | Team directory: same URL-driven pattern as players; `LogoDisplay` in table rows |
+| `frontend/src/app/(app)/[orgSlug]/teams/[teamId]/page.tsx` | Team profile: `TeamLogo` (upload-capable), detail grid, disband `ConfirmDialog`, `MembersSection` |
+| `frontend/src/app/(app)/[orgSlug]/teams/[teamId]/edit/page.tsx` | Team edit form; color pickers |
+| `frontend/src/app/(app)/[orgSlug]/teams/new/page.tsx` | Team create form |
+| `frontend/src/components/players/player-avatar.tsx` | `PlayerAvatar` (upload-capable) + `AvatarDisplay` (read-only) |
+| `frontend/src/components/teams/team-logo.tsx` | `TeamLogo` (upload-capable, P1-B fixed: `primaryColor` applied to single div) + `LogoDisplay` (read-only) |
+| `frontend/src/components/teams/members-section.tsx` | Active roster with member count, remove confirmation; passes `existingMemberPlayerIds` to duplicate guard |
+| `frontend/src/components/teams/add-member-dialog.tsx` | Player picker; `existingMemberPlayerIds` disables already-added players with "On team" badge (P1-2 fix) |
+| `frontend/src/hooks/use-players.ts` | `usePlayerList`, `usePlayer`, `useCreatePlayer`, `useUpdatePlayer`, `useDeletePlayer` |
+| `frontend/src/hooks/use-teams.ts` | `useTeamList`, `useTeam`, `useCreateTeam`, `useUpdateTeam`, `useDeleteTeam` |
+| `frontend/src/hooks/use-team-members.ts` | `useTeamMembers`, `useAddTeamMember`, `useRemoveTeamMember` |
+| `frontend/src/hooks/use-media-upload.ts` | `useMediaUpload`: multipart POST to `/media`; progress tracking; invalidates `mediaKeys.list` on success |
+| `frontend/src/lib/api/players.ts` | Players API layer |
+| `frontend/src/lib/api/teams.ts` | Teams API layer; `TeamMemberListResponse` uses `members[]` (no total/limit/offset) |
+| `frontend/src/lib/api/media.ts` | Media API layer; no manual `Content-Type` header (P1-3 fix) |
+| `frontend/src/types/api/players.ts` | `Player` DTO including `avatar_url: string \| null` |
+| `frontend/src/types/api/teams.ts` | `Team`, `TeamMember` DTOs; `player_display_name: string` on `TeamMember` |
+| `frontend/src/components/ui/media-upload.tsx` | Drag-and-drop / click file picker; progress overlay; size validation |
+
+**Architecture decisions:**
+- `avatar_url` is present on `Player` DTO and populated by `GetByID` only. The list endpoint intentionally returns null (no N+1 per-row media query). List view always renders initials at thumbnail size.
+- Backend `ListActiveMembersWithNames` JOIN query returns `player_display_name` with each membership — no separate player lookup on the frontend.
+
+**FE-5 tests added (41 tests across 4 new files):**
+
+| Test file | Tests | What it regresses |
+|---|---|---|
+| `src/app/(app)/[orgSlug]/players/__tests__/players.test.tsx` | 14 | P0-2: avatar renders; P1-1: localSearch drives Clear; P1-A: list shows initials only; C-1: upload invalidates player detail key; permission gates; cache seeding |
+| `src/app/(app)/[orgSlug]/teams/__tests__/teams.test.tsx` | 10 | Directory listing; P1-4 clear button; D-1: viewer cannot create teams |
+| `src/app/(app)/[orgSlug]/teams/__tests__/members.test.tsx` | 11 | P0-1: display names not UUIDs; P1-2: duplicate guard; C-3: error state (toast.error + dialog stays open); add/remove flows; permission gates |
+| `src/app/(app)/[orgSlug]/teams/__tests__/team-detail.test.tsx` | 9 | C-2: disband confirm + cancel; D-2: TeamLogo primaryColor applied to single div |
+
+**Total after FE-5: 108 tests across 15 files.**
 
 ---
 
@@ -3349,17 +3395,18 @@ Test infrastructure: Vitest 3, `@testing-library/react` 16, jsdom, `@testing-lib
 
 **Phases 23A–D are complete.** All four backend blockers that prevented frontend development are resolved.
 
-**Frontend phases FE-1 through FE-4 are complete.** The core app shell, design system, auth infrastructure, and all primary user-facing pages are implemented, reviewed, and passing 67 tests.
+**Frontend phases FE-1 through FE-5 are complete.** Players & Teams pages, roster management, and media upload are implemented, reviewed, and passing 108 tests.
 
-**Next frontend phase: FE-5 — Players & Teams**
+**Next frontend phase: FE-6 — Tournaments & Matches**
 
 Scope:
-- Player list, player detail, player create/edit/delete (RBAC-gated)
-- Team list, team detail, team create/edit/delete (RBAC-gated)
-- Team membership management (add/remove players)
-- Player tournament history view
+- Tournament list, tournament detail, tournament create/edit/delete (RBAC-gated)
+- Match list, match detail, match scoring interface
+- Tournament registration management
+- Match event log (scorer view)
+- Cross-linking player tournament history on player profile (placeholder exists at `PlayerProfilePage` "Teams" card)
 
-Backend APIs are available: `/organizations/{slug}/players`, `/organizations/{slug}/teams`, `/organizations/{slug}/teams/{id}/members`.
+Backend APIs available: `/organizations/{slug}/tournaments`, `/organizations/{slug}/matches`, `/organizations/{slug}/matches/{id}/events`, `/organizations/{slug}/tournament-registrations`.
 
 **Candidate backend scope (no recommendation):**
 

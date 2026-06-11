@@ -70,20 +70,21 @@ func (r *Repository) GetTeamBySlug(ctx context.Context, slug string, orgID pgtyp
 	return &t, nil
 }
 
-// GetPlayerByID verifies a player exists within an organization. Used during
-// membership creation to confirm the player belongs to the correct org.
-func (r *Repository) GetPlayerByID(ctx context.Context, id, orgID pgtype.UUID) error {
-	_, err := r.queries.GetPlayerByID(ctx, db.GetPlayerByIDParams{
+// GetPlayerByID verifies a player exists within an organization and returns
+// their display_name. Used during membership creation to confirm the player
+// belongs to the correct org and to embed the name in the membership response.
+func (r *Repository) GetPlayerByID(ctx context.Context, id, orgID pgtype.UUID) (string, error) {
+	p, err := r.queries.GetPlayerByID(ctx, db.GetPlayerByIDParams{
 		ID:             id,
 		OrganizationID: orgID,
 	})
 	if err != nil {
 		if err == pgx.ErrNoRows {
-			return ErrPlayerNotFound
+			return "", ErrPlayerNotFound
 		}
-		return err
+		return "", err
 	}
-	return nil
+	return p.DisplayName, nil
 }
 
 // List returns a paginated page of non-disbanded teams for an org.
@@ -147,6 +148,64 @@ func (r *Repository) ListActiveMembers(ctx context.Context, teamID, orgID pgtype
 		TeamID:         teamID,
 		OrganizationID: orgID,
 	})
+}
+
+// memberWithName holds a team_membership row joined with the player's
+// display_name so the roster API can return display-ready data in one query.
+type memberWithName struct {
+	ID                pgtype.UUID
+	TeamID            pgtype.UUID
+	PlayerID          pgtype.UUID
+	OrganizationID    pgtype.UUID
+	Role              string
+	JerseyNumber      pgtype.Text
+	Status            string
+	JoinedAt          pgtype.Timestamptz
+	LeftAt            pgtype.Timestamptz
+	Notes             pgtype.Text
+	CreatedAt         pgtype.Timestamptz
+	UpdatedAt         pgtype.Timestamptz
+	PlayerDisplayName string
+}
+
+// ListActiveMembersWithNames returns all active memberships for a team joined
+// with each player's display_name, ordered alphabetically by player name.
+// Uses a raw JOIN query to avoid N+1 lookups.
+func (r *Repository) ListActiveMembersWithNames(ctx context.Context, teamID, orgID pgtype.UUID) ([]memberWithName, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT
+			tm.id, tm.team_id, tm.player_id, tm.organization_id,
+			tm.role, tm.jersey_number, tm.status,
+			tm.joined_at, tm.left_at, tm.notes,
+			tm.created_at, tm.updated_at,
+			p.display_name
+		FROM team_memberships tm
+		JOIN players p ON p.id = tm.player_id
+		WHERE tm.team_id = $1
+		  AND tm.organization_id = $2
+		  AND tm.status = 'active'
+		ORDER BY p.display_name ASC
+	`, teamID, orgID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []memberWithName
+	for rows.Next() {
+		var m memberWithName
+		if err := rows.Scan(
+			&m.ID, &m.TeamID, &m.PlayerID, &m.OrganizationID,
+			&m.Role, &m.JerseyNumber, &m.Status,
+			&m.JoinedAt, &m.LeftAt, &m.Notes,
+			&m.CreatedAt, &m.UpdatedAt,
+			&m.PlayerDisplayName,
+		); err != nil {
+			return nil, err
+		}
+		results = append(results, m)
+	}
+	return results, rows.Err()
 }
 
 // GetMembershipByID fetches a membership by UUID within an organization.

@@ -328,12 +328,14 @@ func (s *Service) AddMember(ctx context.Context, orgSlug, teamID string, req Add
 		return nil, err
 	}
 
-	// Verify the player belongs to the same org.
+	// Verify the player belongs to the same org and capture their display name
+	// so it can be embedded in the membership response.
 	pid, err := pgutil.ParseUUID(req.PlayerID)
 	if err != nil {
 		return nil, ErrPlayerNotFound
 	}
-	if err := s.repo.GetPlayerByID(ctx, pid, org.ID); err != nil {
+	playerDisplayName, err := s.repo.GetPlayerByID(ctx, pid, org.ID)
+	if err != nil {
 		if errors.Is(err, ErrPlayerNotFound) {
 			return nil, ErrCrossOrgMembership
 		}
@@ -374,7 +376,9 @@ func (s *Service) AddMember(ctx context.Context, orgSlug, teamID string, req Add
 	if err != nil {
 		return nil, err
 	}
-	return membershipToResponse(m), nil
+	resp := membershipToResponse(m)
+	resp.PlayerDisplayName = playerDisplayName
+	return resp, nil
 }
 
 // ListMembers returns all currently active members of a team.
@@ -393,14 +397,14 @@ func (s *Service) ListMembers(ctx context.Context, orgSlug, teamID string) (*Mem
 		return nil, err
 	}
 
-	members, err := s.repo.ListActiveMembers(ctx, tid, org.ID)
+	members, err := s.repo.ListActiveMembersWithNames(ctx, tid, org.ID)
 	if err != nil {
 		return nil, err
 	}
 
 	resp := make([]MembershipResponse, len(members))
 	for i := range members {
-		resp[i] = *membershipToResponse(&members[i])
+		resp[i] = *memberWithNameToResponse(&members[i])
 	}
 	return &MemberListResponse{Members: resp}, nil
 }
@@ -581,5 +585,38 @@ func membershipToResponse(m *db.TeamMembership) *MembershipResponse {
 		Notes:          m.Notes,
 		CreatedAt:      m.CreatedAt.Time.UTC().Format(time.RFC3339),
 		UpdatedAt:      m.UpdatedAt.Time.UTC().Format(time.RFC3339),
+	}
+}
+
+// memberWithNameToResponse converts a memberWithName (JOIN result) into a
+// MembershipResponse with the embedded player display name populated.
+func memberWithNameToResponse(m *memberWithName) *MembershipResponse {
+	var leftAt *string
+	if m.LeftAt.Valid {
+		s := m.LeftAt.Time.UTC().Format(time.RFC3339)
+		leftAt = &s
+	}
+	var jerseyNumber *string
+	if m.JerseyNumber.Valid {
+		jerseyNumber = &m.JerseyNumber.String
+	}
+	var notes *string
+	if m.Notes.Valid {
+		notes = &m.Notes.String
+	}
+	return &MembershipResponse{
+		ID:                pgutil.UUIDToString(m.ID),
+		TeamID:            pgutil.UUIDToString(m.TeamID),
+		PlayerID:          pgutil.UUIDToString(m.PlayerID),
+		OrganizationID:    pgutil.UUIDToString(m.OrganizationID),
+		Role:              m.Role,
+		JerseyNumber:      jerseyNumber,
+		Status:            m.Status,
+		JoinedAt:          m.JoinedAt.Time.UTC().Format(time.RFC3339),
+		LeftAt:            leftAt,
+		Notes:             notes,
+		PlayerDisplayName: m.PlayerDisplayName,
+		CreatedAt:         m.CreatedAt.Time.UTC().Format(time.RFC3339),
+		UpdatedAt:         m.UpdatedAt.Time.UTC().Format(time.RFC3339),
 	}
 }

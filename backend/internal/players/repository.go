@@ -78,6 +78,29 @@ func (r *Repository) Count(ctx context.Context, orgID pgtype.UUID, params ListPa
 	})
 }
 
+// GetPrimaryMediaURL returns the CDN URL of the most recent primary
+// media_attachment for a player. Returns nil, nil when no attachment exists.
+// Prefers is_primary = true; falls back to most-recently-uploaded.
+func (r *Repository) GetPrimaryMediaURL(ctx context.Context, playerID, orgID pgtype.UUID) (*string, error) {
+	var fileURL string
+	err := r.pool.QueryRow(ctx, `
+		SELECT file_url
+		FROM media_attachments
+		WHERE entity_type = 'player'
+		  AND entity_id = $1
+		  AND organization_id = $2
+		ORDER BY is_primary DESC, created_at DESC
+		LIMIT 1
+	`, playerID, orgID).Scan(&fileURL)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &fileURL, nil
+}
+
 // ── transactional writes ──────────────────────────────────────────────────────
 
 type createPlayerTxParams struct {

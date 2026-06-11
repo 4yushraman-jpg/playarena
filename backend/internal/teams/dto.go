@@ -110,6 +110,9 @@ type MembershipResponse struct {
 	Notes          *string `json:"notes,omitempty"`
 	CreatedAt      string  `json:"created_at"`
 	UpdatedAt      string  `json:"updated_at"`
+	// PlayerDisplayName is the player's display_name at query time, embedded to
+	// avoid N+1 lookups on the roster UI.
+	PlayerDisplayName string `json:"player_display_name"`
 }
 
 // MemberListResponse wraps a list of active memberships.
