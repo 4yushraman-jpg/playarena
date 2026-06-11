@@ -91,3 +91,24 @@ WHERE  organization_id = sqlc.arg(organization_id)
   AND  status != 'cancelled'
   AND  (sqlc.narg(status_filter)::text IS NULL OR status::text = sqlc.narg(status_filter))
   AND  (sqlc.narg(search_query)::text  IS NULL OR name ILIKE '%' || sqlc.narg(search_query) || '%');
+
+-- name: CountRegistrationsByStatusForTournaments :many
+-- Aggregated per-status registration counts for a set of tournaments.
+-- Drives the registration_counts block embedded in tournament responses so
+-- clients never have to page through registrations to compute totals.
+SELECT tournament_id, status, COUNT(*) AS count
+FROM   tournament_registrations
+WHERE  tournament_id = ANY(sqlc.arg(tournament_ids)::uuid[])
+GROUP  BY tournament_id, status;
+
+-- name: ListTeamNamesByIDs :many
+-- Batch name lookup used to label standings participants.
+SELECT id, name
+FROM   teams
+WHERE  id = ANY(sqlc.arg(team_ids)::uuid[]);
+
+-- name: ListPlayerNamesByIDs :many
+-- Batch name lookup used to label standings participants.
+SELECT id, display_name
+FROM   players
+WHERE  id = ANY(sqlc.arg(player_ids)::uuid[]);

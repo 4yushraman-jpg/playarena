@@ -1,5 +1,6 @@
 import { act, waitFor } from "@testing-library/react"
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest"
+import { QueryClient } from "@tanstack/react-query"
 import { useAuthStore } from "@/stores/auth.store"
 import { renderHookWithProviders } from "@/test/test-utils"
 
@@ -63,7 +64,7 @@ import { tokenManager, attemptTokenRefresh } from "@/lib/api/client"
 import { getQueryClient } from "@/lib/api/query-client"
 import { useNotificationStream } from "../use-notification-stream"
 import { makeTestQueryClient } from "@/test/test-utils"
-import { notificationKeys } from "@/lib/query-keys"
+import { notificationKeys, tournamentKeys } from "@/lib/query-keys"
 
 beforeEach(() => {
   vi.clearAllMocks()
@@ -113,6 +114,80 @@ describe("useNotificationStream — SSE invalidation", () => {
       expect(invalidateSpy).toHaveBeenCalledWith(
         expect.objectContaining({ queryKey: notificationKeys.all("my-org") }),
       )
+    })
+  })
+
+  it("invalidates the tournament's registrations AND detail on registration events", async () => {
+    // entity_id is the REGISTRATION id; the tournament id lives in the
+    // payload. Using entity_id as the tournament id was the original P0 bug.
+    const client = makeTestQueryClient()
+    const invalidateSpy = vi.spyOn(client, "invalidateQueries")
+
+    renderHookWithProviders(() => useNotificationStream({ orgSlug: "my-org" }), { client })
+
+    const es = MockEventSource.instances[0]
+    act(() => {
+      es.onmessage?.({
+        data: JSON.stringify({
+          id: "n2",
+          event_type: "registration_approved",
+          entity_type: "tournament_registrations",
+          entity_id: "registration-uuid",
+          payload: { registration_id: "registration-uuid", tournament_id: "tournament-uuid" },
+          created_at: new Date().toISOString(),
+        }),
+      } as MessageEvent)
+    })
+
+    await waitFor(() => {
+      expect(invalidateSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          queryKey: tournamentKeys.registrations("my-org", "tournament-uuid"),
+        }),
+      )
+      expect(invalidateSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          queryKey: tournamentKeys.detail("my-org", "tournament-uuid"),
+        }),
+      )
+    })
+
+    // The registration id must never be used as a tournament id.
+    expect(invalidateSpy).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        queryKey: tournamentKeys.detail("my-org", "registration-uuid"),
+      }),
+    )
+  })
+
+  it("actually invalidates a live registration list cached with params", async () => {
+    // gcTime > 0 so the observer-less seeded query survives until asserted.
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, gcTime: Infinity } },
+    })
+    const listKey = tournamentKeys.registrationList("my-org", "tournament-uuid", {
+      limit: 50,
+      offset: 0,
+    })
+    client.setQueryData(listKey, { registrations: [], total: 0, limit: 50, offset: 0 })
+
+    renderHookWithProviders(() => useNotificationStream({ orgSlug: "my-org" }), { client })
+
+    act(() => {
+      MockEventSource.instances[0].onmessage?.({
+        data: JSON.stringify({
+          id: "n3",
+          event_type: "registration_withdrawn",
+          entity_type: "tournament_registrations",
+          entity_id: "registration-uuid",
+          payload: { tournament_id: "tournament-uuid" },
+          created_at: new Date().toISOString(),
+        }),
+      } as MessageEvent)
+    })
+
+    await waitFor(() => {
+      expect(client.getQueryState(listKey)?.isInvalidated).toBe(true)
     })
   })
 })

@@ -266,7 +266,7 @@ func (s *Service) List(ctx context.Context, orgSlug, tournamentID string, params
 
 	resp := make([]Response, len(regs))
 	for i := range regs {
-		resp[i] = *registrationToResponse(&regs[i])
+		resp[i] = *registrationRowToResponse(&regs[i])
 	}
 	return &ListResponse{
 		Registrations: resp,
@@ -510,6 +510,30 @@ func validateStatusTransition(from, to db.RegistrationStatus) error {
 		}
 	}
 	return fmt.Errorf("%w: %s → %s", ErrInvalidStatusTransition, from, to)
+}
+
+// registrationRowToResponse maps a name-enriched list row to the response DTO.
+func registrationRowToResponse(r *db.ListRegistrationsByTournamentPaginatedRow) *Response {
+	resp := registrationToResponse(&db.TournamentRegistration{
+		ID:             r.ID,
+		TournamentID:   r.TournamentID,
+		OrganizationID: r.OrganizationID,
+		TeamID:         r.TeamID,
+		PlayerID:       r.PlayerID,
+		SeedNumber:     r.SeedNumber,
+		Status:         r.Status,
+		RegisteredBy:   r.RegisteredBy,
+		RegisteredAt:   r.RegisteredAt,
+		ApprovedBy:     r.ApprovedBy,
+		ApprovedAt:     r.ApprovedAt,
+		Notes:          r.Notes,
+		Metadata:       r.Metadata,
+		CreatedAt:      r.CreatedAt,
+		UpdatedAt:      r.UpdatedAt,
+	})
+	resp.TeamName = r.TeamName
+	resp.PlayerName = r.PlayerName
+	return resp
 }
 
 func registrationToResponse(r *db.TournamentRegistration) *Response {

@@ -26,6 +26,7 @@ import { notificationsApi } from "@/lib/api/notifications"
 import { tournamentsApi } from "@/lib/api/tournaments"
 import { matchesApi } from "@/lib/api/matches"
 import { hasPermission, ROLE_LABELS, ROLE_VARIANTS } from "@/lib/permissions"
+import { getNotificationLabel } from "@/lib/notification-copy"
 import { formatRelative, formatDateTime } from "@/lib/format"
 import { cn } from "@/lib/utils"
 import type { Permission } from "@/types/common"
@@ -45,7 +46,7 @@ function getQuickActions(orgSlug: string, role: ReturnType<typeof selectRole>): 
   const all: QuickAction[] = [
     {
       label: "New Tournament",
-      href: `${base}/tournaments`,
+      href: `${base}/tournaments/new`,
       icon: TrophyIcon,
       permission: "tournament.create",
     },
@@ -209,6 +210,7 @@ export default function DashboardPage() {
               isLoading={tournamentLoading}
               isError={tournamentError}
               tournaments={tournamentData?.tournaments ?? []}
+              orgSlug={orgSlug}
               onRetry={refetchTournaments}
             />
           </CardContent>
@@ -277,7 +279,7 @@ function NotificationsWidget({ isLoading, isError, notifications, onRetry }: Not
           />
           <div className="min-w-0 flex-1">
             <p className={cn("truncate text-xs", n.read_at === null ? "font-medium" : "text-muted-foreground")}>
-              {n.event_type.replace(/_/g, " ")}
+              {getNotificationLabel(n.event_type)}
             </p>
             <p className="text-xs text-muted-foreground/70">{formatRelative(n.created_at)}</p>
           </div>
@@ -291,10 +293,11 @@ interface TournamentsWidgetProps {
   isLoading: boolean
   isError: boolean
   tournaments: import("@/types/api/tournaments").Tournament[]
+  orgSlug: string
   onRetry?: () => void
 }
 
-function TournamentsWidget({ isLoading, isError, tournaments, onRetry }: TournamentsWidgetProps) {
+function TournamentsWidget({ isLoading, isError, tournaments, orgSlug, onRetry }: TournamentsWidgetProps) {
   if (isLoading) return <WidgetSkeleton rows={3} />
   if (isError) return <WidgetError onRetry={onRetry} />
   if (tournaments.length === 0) {
@@ -312,7 +315,12 @@ function TournamentsWidget({ isLoading, isError, tournaments, onRetry }: Tournam
       {tournaments.map((t) => (
         <li key={t.id} className="flex items-start justify-between gap-2">
           <div className="min-w-0 flex-1">
-            <p className="truncate text-xs font-medium">{t.name}</p>
+            <Link
+              href={`/${orgSlug}/tournaments/${t.id}`}
+              className="block truncate text-xs font-medium hover:underline"
+            >
+              {t.name}
+            </Link>
             <p className="text-xs text-muted-foreground capitalize">{t.sport}</p>
           </div>
           <StatusBadge status={t.status} className="shrink-0 text-xs" />

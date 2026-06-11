@@ -87,6 +87,12 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	if v := r.URL.Query().Get("status"); v != "" {
 		params.StatusFilter = &v
 	}
+	if v := r.URL.Query().Get("team_id"); v != "" {
+		params.TeamFilter = &v
+	}
+	if v := r.URL.Query().Get("player_id"); v != "" {
+		params.PlayerFilter = &v
+	}
 
 	list, err := h.svc.List(r.Context(), slug, tournamentID, params)
 	if err != nil {
@@ -96,6 +102,14 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, ErrTournamentNotFound) {
 			response.Error(w, http.StatusNotFound, "tournament not found")
+			return
+		}
+		if errors.Is(err, ErrTeamNotFound) {
+			response.Error(w, http.StatusNotFound, "team not found")
+			return
+		}
+		if errors.Is(err, ErrPlayerNotFound) {
+			response.Error(w, http.StatusNotFound, "player not found")
 			return
 		}
 		h.log.ErrorContext(r.Context(), "registrations.list.failed",

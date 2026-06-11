@@ -144,11 +144,18 @@ func (r *Repository) GetByID(ctx context.Context, id, tournamentID pgtype.UUID) 
 	return &reg, nil
 }
 
-// List returns a paginated list of registrations for a tournament.
-func (r *Repository) List(ctx context.Context, tournamentID pgtype.UUID, params ListParams) ([]db.TournamentRegistration, error) {
+// List returns a paginated list of registrations for a tournament with
+// participant display names joined in.
+func (r *Repository) List(ctx context.Context, tournamentID pgtype.UUID, params ListParams) ([]db.ListRegistrationsByTournamentPaginatedRow, error) {
+	teamFilter, playerFilter, err := parseParticipantFilters(params)
+	if err != nil {
+		return nil, err
+	}
 	return r.queries.ListRegistrationsByTournamentPaginated(ctx, db.ListRegistrationsByTournamentPaginatedParams{
 		TournamentID: tournamentID,
 		StatusFilter: params.StatusFilter,
+		TeamFilter:   teamFilter,
+		PlayerFilter: playerFilter,
 		PageLimit:    params.Limit,
 		PageOffset:   params.Offset,
 	})
@@ -156,10 +163,35 @@ func (r *Repository) List(ctx context.Context, tournamentID pgtype.UUID, params 
 
 // Count returns the total registration count for pagination metadata.
 func (r *Repository) Count(ctx context.Context, tournamentID pgtype.UUID, params ListParams) (int64, error) {
+	teamFilter, playerFilter, err := parseParticipantFilters(params)
+	if err != nil {
+		return 0, err
+	}
 	return r.queries.CountRegistrationsByTournament(ctx, db.CountRegistrationsByTournamentParams{
 		TournamentID: tournamentID,
 		StatusFilter: params.StatusFilter,
+		TeamFilter:   teamFilter,
+		PlayerFilter: playerFilter,
 	})
+}
+
+// parseParticipantFilters converts optional team/player filter strings to
+// pgtype.UUIDs. Invalid UUIDs map to participant-not-found errors so callers
+// surface a 404 rather than a 500.
+func parseParticipantFilters(params ListParams) (team, player pgtype.UUID, err error) {
+	if params.TeamFilter != nil && *params.TeamFilter != "" {
+		team, err = pgutil.ParseUUID(*params.TeamFilter)
+		if err != nil {
+			return pgtype.UUID{}, pgtype.UUID{}, ErrTeamNotFound
+		}
+	}
+	if params.PlayerFilter != nil && *params.PlayerFilter != "" {
+		player, err = pgutil.ParseUUID(*params.PlayerFilter)
+		if err != nil {
+			return pgtype.UUID{}, pgtype.UUID{}, ErrPlayerNotFound
+		}
+	}
+	return team, player, nil
 }
 
 // ── transactional writes ──────────────────────────────────────────────────────

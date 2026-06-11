@@ -106,6 +106,23 @@ type Response struct {
 	CreatedBy            *string `json:"created_by,omitempty"`
 	CreatedAt            string  `json:"created_at"`
 	UpdatedAt            string  `json:"updated_at"`
+	// RegistrationCounts aggregates this tournament's registrations by status.
+	// Always present on create/get/list/update responses so clients can render
+	// capacity and health metrics without paging through registrations.
+	RegistrationCounts *RegistrationCountsResponse `json:"registration_counts,omitempty"`
+}
+
+// RegistrationCountsResponse is the per-status registration breakdown.
+// Active = pending + approved — the count enforced against max_participants
+// (mirrors CountActiveRegistrations used by the registration capacity check).
+type RegistrationCountsResponse struct {
+	Pending      int64 `json:"pending"`
+	Approved     int64 `json:"approved"`
+	Rejected     int64 `json:"rejected"`
+	Withdrawn    int64 `json:"withdrawn"`
+	Disqualified int64 `json:"disqualified"`
+	Active       int64 `json:"active"`
+	Total        int64 `json:"total"`
 }
 
 // ListResponse wraps a paginated list of tournaments.
@@ -120,8 +137,12 @@ type ListResponse struct {
 
 // StandingsRowResponse is one participant's record in the standings table.
 type StandingsRowResponse struct {
-	Position        int    `json:"position"`
-	ParticipantID   string `json:"participant_id"`
+	Position      int    `json:"position"`
+	ParticipantID string `json:"participant_id"`
+	// ParticipantName is the team name or player display name, resolved so
+	// clients never render raw participant UUIDs. Empty when the participant
+	// record can no longer be found.
+	ParticipantName string `json:"participant_name"`
 	Played          int    `json:"played"`
 	Wins            int    `json:"wins"`
 	Losses          int    `json:"losses"`

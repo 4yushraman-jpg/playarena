@@ -56,18 +56,28 @@ export const teamKeys = {
 
 // ── Tournaments ───────────────────────────────────────────────────────────────
 
+// NOTE on invalidation: TanStack's partial key matching compares every element
+// of the filter key, so a filter ending in `undefined` does NOT match a stored
+// key ending in a params object. Always invalidate with a params-less root key
+// (`lists`, `registrations`, `detail`) — never with `list(org)` / a key whose
+// trailing params slot is undefined.
 export const tournamentKeys = {
   all: (orgSlug: string) => ["tournaments", orgSlug] as const,
+  /** Root for every tournament list query — use for invalidation. */
+  lists: (orgSlug: string) => [...tournamentKeys.all(orgSlug), "list"] as const,
   list: (orgSlug: string, params?: TournamentListParams) =>
-    [...tournamentKeys.all(orgSlug), "list", params] as const,
+    [...tournamentKeys.lists(orgSlug), params ?? {}] as const,
   detail: (orgSlug: string, id: string) =>
     [...tournamentKeys.all(orgSlug), id] as const,
   standings: (orgSlug: string, id: string) =>
     [...tournamentKeys.detail(orgSlug, id), "standings"] as const,
-  registrations: (orgSlug: string, tournamentId: string, params?: RegistrationListParams) =>
-    [...tournamentKeys.detail(orgSlug, tournamentId), "registrations", params] as const,
+  /** Root for everything registration-scoped under a tournament — use for invalidation. */
+  registrations: (orgSlug: string, tournamentId: string) =>
+    [...tournamentKeys.detail(orgSlug, tournamentId), "registrations"] as const,
+  registrationList: (orgSlug: string, tournamentId: string, params?: RegistrationListParams) =>
+    [...tournamentKeys.registrations(orgSlug, tournamentId), "list", params ?? {}] as const,
   registration: (orgSlug: string, tournamentId: string, registrationId: string) =>
-    [...tournamentKeys.detail(orgSlug, tournamentId), "registrations", registrationId] as const,
+    [...tournamentKeys.registrations(orgSlug, tournamentId), "detail", registrationId] as const,
 }
 
 // ── Matches ───────────────────────────────────────────────────────────────────

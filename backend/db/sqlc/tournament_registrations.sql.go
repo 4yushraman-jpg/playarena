@@ -29,19 +29,28 @@ func (q *Queries) CountActiveRegistrations(ctx context.Context, tournamentID pgt
 
 const countRegistrationsByTournament = `-- name: CountRegistrationsByTournament :one
 SELECT COUNT(*)
-FROM   tournament_registrations
-WHERE  tournament_id = $1
-  AND  ($2::text IS NULL OR status::text = $2)
+FROM   tournament_registrations tr
+WHERE  tr.tournament_id = $1
+  AND  ($2::text IS NULL OR tr.status::text = $2)
+  AND  ($3::uuid   IS NULL OR tr.team_id     = $3)
+  AND  ($4::uuid IS NULL OR tr.player_id   = $4)
 `
 
 type CountRegistrationsByTournamentParams struct {
 	TournamentID pgtype.UUID `json:"tournament_id"`
 	StatusFilter *string     `json:"status_filter"`
+	TeamFilter   pgtype.UUID `json:"team_filter"`
+	PlayerFilter pgtype.UUID `json:"player_filter"`
 }
 
 // Total count matching the same filters as ListRegistrationsByTournamentPaginated.
 func (q *Queries) CountRegistrationsByTournament(ctx context.Context, arg CountRegistrationsByTournamentParams) (int64, error) {
-	row := q.db.QueryRow(ctx, countRegistrationsByTournament, arg.TournamentID, arg.StatusFilter)
+	row := q.db.QueryRow(ctx, countRegistrationsByTournament,
+		arg.TournamentID,
+		arg.StatusFilter,
+		arg.TeamFilter,
+		arg.PlayerFilter,
+	)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
@@ -307,28 +316,59 @@ func (q *Queries) ListApprovedRegistrationsForStandings(ctx context.Context, tou
 }
 
 const listRegistrationsByTournamentPaginated = `-- name: ListRegistrationsByTournamentPaginated :many
-SELECT id, tournament_id, organization_id, team_id, player_id, seed_number, status, registered_by, registered_at, approved_by, approved_at, notes, metadata, created_at, updated_at
-FROM   tournament_registrations
-WHERE  tournament_id = $1
-  AND  ($2::text IS NULL OR status::text = $2)
-ORDER  BY registered_at ASC
-LIMIT  $4
-OFFSET $3
+SELECT tr.id, tr.tournament_id, tr.organization_id, tr.team_id, tr.player_id, tr.seed_number, tr.status, tr.registered_by, tr.registered_at, tr.approved_by, tr.approved_at, tr.notes, tr.metadata, tr.created_at, tr.updated_at,
+       t.name         AS team_name,
+       p.display_name AS player_name
+FROM   tournament_registrations tr
+LEFT   JOIN teams   t ON t.id = tr.team_id
+LEFT   JOIN players p ON p.id = tr.player_id
+WHERE  tr.tournament_id = $1
+  AND  ($2::text IS NULL OR tr.status::text = $2)
+  AND  ($3::uuid   IS NULL OR tr.team_id     = $3)
+  AND  ($4::uuid IS NULL OR tr.player_id   = $4)
+ORDER  BY tr.registered_at ASC
+LIMIT  $6
+OFFSET $5
 `
 
 type ListRegistrationsByTournamentPaginatedParams struct {
 	TournamentID pgtype.UUID `json:"tournament_id"`
 	StatusFilter *string     `json:"status_filter"`
+	TeamFilter   pgtype.UUID `json:"team_filter"`
+	PlayerFilter pgtype.UUID `json:"player_filter"`
 	PageOffset   int32       `json:"page_offset"`
 	PageLimit    int32       `json:"page_limit"`
 }
 
-// Paginated listing of all registrations for a tournament.
-// Optional status filter; no status is excluded by default.
-func (q *Queries) ListRegistrationsByTournamentPaginated(ctx context.Context, arg ListRegistrationsByTournamentPaginatedParams) ([]TournamentRegistration, error) {
+type ListRegistrationsByTournamentPaginatedRow struct {
+	ID             pgtype.UUID        `json:"id"`
+	TournamentID   pgtype.UUID        `json:"tournament_id"`
+	OrganizationID pgtype.UUID        `json:"organization_id"`
+	TeamID         pgtype.UUID        `json:"team_id"`
+	PlayerID       pgtype.UUID        `json:"player_id"`
+	SeedNumber     *int16             `json:"seed_number"`
+	Status         RegistrationStatus `json:"status"`
+	RegisteredBy   pgtype.UUID        `json:"registered_by"`
+	RegisteredAt   pgtype.Timestamptz `json:"registered_at"`
+	ApprovedBy     pgtype.UUID        `json:"approved_by"`
+	ApprovedAt     pgtype.Timestamptz `json:"approved_at"`
+	Notes          *string            `json:"notes"`
+	Metadata       []byte             `json:"metadata"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
+	TeamName       *string            `json:"team_name"`
+	PlayerName     *string            `json:"player_name"`
+}
+
+// Paginated listing of all registrations for a tournament, enriched with the
+// participant's display name so clients never render raw UUIDs.
+// Optional status / team / player filters; nothing is excluded by default.
+func (q *Queries) ListRegistrationsByTournamentPaginated(ctx context.Context, arg ListRegistrationsByTournamentPaginatedParams) ([]ListRegistrationsByTournamentPaginatedRow, error) {
 	rows, err := q.db.Query(ctx, listRegistrationsByTournamentPaginated,
 		arg.TournamentID,
 		arg.StatusFilter,
+		arg.TeamFilter,
+		arg.PlayerFilter,
 		arg.PageOffset,
 		arg.PageLimit,
 	)
@@ -336,9 +376,9 @@ func (q *Queries) ListRegistrationsByTournamentPaginated(ctx context.Context, ar
 		return nil, err
 	}
 	defer rows.Close()
-	items := []TournamentRegistration{}
+	items := []ListRegistrationsByTournamentPaginatedRow{}
 	for rows.Next() {
-		var i TournamentRegistration
+		var i ListRegistrationsByTournamentPaginatedRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.TournamentID,
@@ -355,6 +395,8 @@ func (q *Queries) ListRegistrationsByTournamentPaginated(ctx context.Context, ar
 			&i.Metadata,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.TeamName,
+			&i.PlayerName,
 		); err != nil {
 			return nil, err
 		}

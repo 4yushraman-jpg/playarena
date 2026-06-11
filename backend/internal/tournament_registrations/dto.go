@@ -46,6 +46,11 @@ type ListParams struct {
 	Limit        int32
 	Offset       int32
 	StatusFilter *string
+	// TeamFilter / PlayerFilter narrow the list to a single participant.
+	// Used by clients to check whether a participant already holds a
+	// registration without paging through the full list.
+	TeamFilter   *string
+	PlayerFilter *string
 }
 
 // ── response DTOs ─────────────────────────────────────────────────────────────
@@ -58,7 +63,11 @@ type Response struct {
 	OrganizationID string  `json:"organization_id"`
 	TeamID         *string `json:"team_id,omitempty"`
 	PlayerID       *string `json:"player_id,omitempty"`
-	SeedNumber     *int16  `json:"seed_number,omitempty"`
+	// TeamName / PlayerName are joined display names. Populated on list
+	// responses so clients never render raw participant UUIDs.
+	TeamName   *string `json:"team_name,omitempty"`
+	PlayerName *string `json:"player_name,omitempty"`
+	SeedNumber *int16  `json:"seed_number,omitempty"`
 	Status         string  `json:"status"`
 	RegisteredBy   *string `json:"registered_by,omitempty"`
 	RegisteredAt   string  `json:"registered_at"`

@@ -1,7 +1,13 @@
 "use client"
 
 import api from "./client"
-import type { Tournament, TournamentListParams } from "@/types/api/tournaments"
+import type {
+  Tournament,
+  TournamentListParams,
+  CreateTournamentRequest,
+  UpdateTournamentRequest,
+  StandingsResponse,
+} from "@/types/api/tournaments"
 
 interface TournamentListResponse {
   tournaments: Tournament[]
@@ -16,4 +22,19 @@ export const tournamentsApi = {
       `/api/v1/organizations/${orgSlug}/tournaments`,
       { params },
     ),
+
+  getById: (orgSlug: string, id: string) =>
+    api.get<Tournament>(`/api/v1/organizations/${orgSlug}/tournaments/${id}`),
+
+  create: (orgSlug: string, body: CreateTournamentRequest) =>
+    api.post<Tournament>(`/api/v1/organizations/${orgSlug}/tournaments`, body),
+
+  update: (orgSlug: string, id: string, body: UpdateTournamentRequest) =>
+    api.patch<Tournament>(`/api/v1/organizations/${orgSlug}/tournaments/${id}`, body),
+
+  delete: (orgSlug: string, id: string) =>
+    api.delete(`/api/v1/organizations/${orgSlug}/tournaments/${id}`),
+
+  getStandings: (orgSlug: string, id: string) =>
+    api.get<StandingsResponse>(`/api/v1/organizations/${orgSlug}/tournaments/${id}/standings`),
 }

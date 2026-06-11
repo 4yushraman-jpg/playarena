@@ -61,6 +61,42 @@ func (q *Queries) CancelTournament(ctx context.Context, arg CancelTournamentPara
 	return i, err
 }
 
+const countRegistrationsByStatusForTournaments = `-- name: CountRegistrationsByStatusForTournaments :many
+SELECT tournament_id, status, COUNT(*) AS count
+FROM   tournament_registrations
+WHERE  tournament_id = ANY($1::uuid[])
+GROUP  BY tournament_id, status
+`
+
+type CountRegistrationsByStatusForTournamentsRow struct {
+	TournamentID pgtype.UUID        `json:"tournament_id"`
+	Status       RegistrationStatus `json:"status"`
+	Count        int64              `json:"count"`
+}
+
+// Aggregated per-status registration counts for a set of tournaments.
+// Drives the registration_counts block embedded in tournament responses so
+// clients never have to page through registrations to compute totals.
+func (q *Queries) CountRegistrationsByStatusForTournaments(ctx context.Context, tournamentIds []pgtype.UUID) ([]CountRegistrationsByStatusForTournamentsRow, error) {
+	rows, err := q.db.Query(ctx, countRegistrationsByStatusForTournaments, tournamentIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []CountRegistrationsByStatusForTournamentsRow{}
+	for rows.Next() {
+		var i CountRegistrationsByStatusForTournamentsRow
+		if err := rows.Scan(&i.TournamentID, &i.Status, &i.Count); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const countTournamentsByOrganization = `-- name: CountTournamentsByOrganization :one
 SELECT COUNT(*)
 FROM   tournaments
@@ -271,6 +307,70 @@ func (q *Queries) GetTournamentBySlug(ctx context.Context, arg GetTournamentBySl
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const listPlayerNamesByIDs = `-- name: ListPlayerNamesByIDs :many
+SELECT id, display_name
+FROM   players
+WHERE  id = ANY($1::uuid[])
+`
+
+type ListPlayerNamesByIDsRow struct {
+	ID          pgtype.UUID `json:"id"`
+	DisplayName string      `json:"display_name"`
+}
+
+// Batch name lookup used to label standings participants.
+func (q *Queries) ListPlayerNamesByIDs(ctx context.Context, playerIds []pgtype.UUID) ([]ListPlayerNamesByIDsRow, error) {
+	rows, err := q.db.Query(ctx, listPlayerNamesByIDs, playerIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListPlayerNamesByIDsRow{}
+	for rows.Next() {
+		var i ListPlayerNamesByIDsRow
+		if err := rows.Scan(&i.ID, &i.DisplayName); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listTeamNamesByIDs = `-- name: ListTeamNamesByIDs :many
+SELECT id, name
+FROM   teams
+WHERE  id = ANY($1::uuid[])
+`
+
+type ListTeamNamesByIDsRow struct {
+	ID   pgtype.UUID `json:"id"`
+	Name string      `json:"name"`
+}
+
+// Batch name lookup used to label standings participants.
+func (q *Queries) ListTeamNamesByIDs(ctx context.Context, teamIds []pgtype.UUID) ([]ListTeamNamesByIDsRow, error) {
+	rows, err := q.db.Query(ctx, listTeamNamesByIDs, teamIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListTeamNamesByIDsRow{}
+	for rows.Next() {
+		var i ListTeamNamesByIDsRow
+		if err := rows.Scan(&i.ID, &i.Name); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listTournamentsByOrganization = `-- name: ListTournamentsByOrganization :many

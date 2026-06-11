@@ -4,47 +4,11 @@ import { Trash2Icon, CheckIcon } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
 import { formatRelative } from "@/lib/format"
-import type { Notification, NotificationEventType } from "@/types/api/notifications"
-
-const EVENT_LABELS: Record<NotificationEventType, string> = {
-  match_created: "Match Created",
-  match_started: "Match Started",
-  match_completed: "Match Completed",
-  match_cancelled: "Match Cancelled",
-  match_abandoned: "Match Abandoned",
-  tournament_status_changed: "Tournament Updated",
-  registration_approved: "Registration Approved",
-  registration_rejected: "Registration Rejected",
-  registration_withdrawn: "Registration Withdrawn",
-}
-
-function getEventDescription(notification: Notification): string {
-  const payload = notification.payload
-  switch (notification.event_type) {
-    case "match_started":
-      return "A match has gone live. View the live score."
-    case "match_completed":
-      return "Match has ended. Check the final result."
-    case "match_cancelled":
-      return "A scheduled match has been cancelled."
-    case "match_abandoned":
-      return "A match was abandoned before completion."
-    case "match_created":
-      return "A new match has been scheduled."
-    case "tournament_status_changed": {
-      const status = (payload as { status?: string }).status
-      return status ? `Tournament status changed to ${status}.` : "Tournament status has changed."
-    }
-    case "registration_approved":
-      return "Your tournament registration has been approved."
-    case "registration_rejected":
-      return "Your tournament registration was not approved."
-    case "registration_withdrawn":
-      return "A registration has been withdrawn."
-    default:
-      return "You have a new notification."
-  }
-}
+import {
+  getNotificationDescription,
+  getNotificationLabel,
+} from "@/lib/notification-copy"
+import type { Notification } from "@/types/api/notifications"
 
 interface NotificationItemProps {
   notification: Notification
@@ -73,7 +37,7 @@ export function NotificationItem({
         isDeleting && "opacity-50",
       )}
       role="article"
-      aria-label={`${EVENT_LABELS[notification.event_type]}, ${isUnread ? "unread" : "read"}`}
+      aria-label={`${getNotificationLabel(notification.event_type)}, ${isUnread ? "unread" : "read"}`}
     >
       {/* Unread dot */}
       <div className="mt-1 shrink-0">
@@ -90,10 +54,10 @@ export function NotificationItem({
       {/* Content */}
       <div className="min-w-0 flex-1 space-y-0.5">
         <p className={cn("text-sm", isUnread ? "font-medium" : "font-normal text-muted-foreground")}>
-          {EVENT_LABELS[notification.event_type]}
+          {getNotificationLabel(notification.event_type)}
         </p>
         <p className="text-xs text-muted-foreground">
-          {getEventDescription(notification)}
+          {getNotificationDescription(notification)}
         </p>
         <p className="text-xs text-muted-foreground/70">
           {formatRelative(notification.created_at)}

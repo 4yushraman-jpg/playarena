@@ -153,11 +153,19 @@ function handleStreamEvent(
       break
     case "registration_approved":
     case "registration_rejected":
-    case "registration_withdrawn":
-      if (event.entity_id) {
-        queryClient.invalidateQueries({ queryKey: tournamentKeys.registrations(orgSlug, event.entity_id) })
+    case "registration_withdrawn": {
+      // entity_id is the registration ID; tournament_id is in the payload
+      const tournamentId = event.payload?.tournament_id as string | undefined
+      if (tournamentId) {
+        queryClient.invalidateQueries({
+          queryKey: tournamentKeys.registrations(orgSlug, tournamentId),
+        })
+        queryClient.invalidateQueries({
+          queryKey: tournamentKeys.detail(orgSlug, tournamentId),
+        })
       }
       break
+    }
     default:
       break
   }

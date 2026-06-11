@@ -19,22 +19,31 @@ WHERE  tournament_id = $1
 LIMIT  1;
 
 -- name: ListRegistrationsByTournamentPaginated :many
--- Paginated listing of all registrations for a tournament.
--- Optional status filter; no status is excluded by default.
-SELECT *
-FROM   tournament_registrations
-WHERE  tournament_id = sqlc.arg(tournament_id)
-  AND  (sqlc.narg(status_filter)::text IS NULL OR status::text = sqlc.narg(status_filter))
-ORDER  BY registered_at ASC
+-- Paginated listing of all registrations for a tournament, enriched with the
+-- participant's display name so clients never render raw UUIDs.
+-- Optional status / team / player filters; nothing is excluded by default.
+SELECT tr.*,
+       t.name         AS team_name,
+       p.display_name AS player_name
+FROM   tournament_registrations tr
+LEFT   JOIN teams   t ON t.id = tr.team_id
+LEFT   JOIN players p ON p.id = tr.player_id
+WHERE  tr.tournament_id = sqlc.arg(tournament_id)
+  AND  (sqlc.narg(status_filter)::text IS NULL OR tr.status::text = sqlc.narg(status_filter))
+  AND  (sqlc.narg(team_filter)::uuid   IS NULL OR tr.team_id     = sqlc.narg(team_filter))
+  AND  (sqlc.narg(player_filter)::uuid IS NULL OR tr.player_id   = sqlc.narg(player_filter))
+ORDER  BY tr.registered_at ASC
 LIMIT  sqlc.arg(page_limit)
 OFFSET sqlc.arg(page_offset);
 
 -- name: CountRegistrationsByTournament :one
 -- Total count matching the same filters as ListRegistrationsByTournamentPaginated.
 SELECT COUNT(*)
-FROM   tournament_registrations
-WHERE  tournament_id = sqlc.arg(tournament_id)
-  AND  (sqlc.narg(status_filter)::text IS NULL OR status::text = sqlc.narg(status_filter));
+FROM   tournament_registrations tr
+WHERE  tr.tournament_id = sqlc.arg(tournament_id)
+  AND  (sqlc.narg(status_filter)::text IS NULL OR tr.status::text = sqlc.narg(status_filter))
+  AND  (sqlc.narg(team_filter)::uuid   IS NULL OR tr.team_id     = sqlc.narg(team_filter))
+  AND  (sqlc.narg(player_filter)::uuid IS NULL OR tr.player_id   = sqlc.narg(player_filter));
 
 -- name: CountActiveRegistrations :one
 -- Counts pending + approved registrations against max_participants capacity.

@@ -175,7 +175,11 @@ func (s *Service) Create(ctx context.Context, orgSlug string, req CreateRequest,
 		}
 		return nil, err
 	}
-	return tournamentToResponse(t), nil
+	resp := tournamentToResponse(t)
+	// A new tournament has no registrations yet; attach explicit zero counts
+	// so the response shape matches get/list/update.
+	resp.RegistrationCounts = &RegistrationCountsResponse{}
+	return resp, nil
 }
 
 // List returns a paginated page of non-cancelled tournaments for an organization.
@@ -204,8 +208,13 @@ func (s *Service) List(ctx context.Context, orgSlug string, params ListParams) (
 	}
 
 	resp := make([]Response, len(ts))
+	ptrs := make([]*Response, len(ts))
 	for i := range ts {
 		resp[i] = *tournamentToResponse(&ts[i])
+		ptrs[i] = &resp[i]
+	}
+	if err := s.attachRegistrationCounts(ctx, ptrs...); err != nil {
+		return nil, err
 	}
 	return &ListResponse{
 		Tournaments: resp,
@@ -237,7 +246,11 @@ func (s *Service) GetByID(ctx context.Context, orgSlug, tournamentID string) (*R
 	if err != nil {
 		return nil, err
 	}
-	return tournamentToResponse(t), nil
+	resp := tournamentToResponse(t)
+	if err := s.attachRegistrationCounts(ctx, resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
 }
 
 // Update applies a partial update to a tournament.
@@ -423,7 +436,13 @@ func (s *Service) Update(ctx context.Context, orgSlug, tournamentID string, req 
 	// Synchronous post-commit drain.
 	s.notifSvc.DrainOutbox(ctx, org.ID, s.log)
 
-	return tournamentToResponse(updated), nil
+	// Clients write this response straight into their tournament-detail cache,
+	// so it must carry the same registration_counts shape as GetByID.
+	resp := tournamentToResponse(updated)
+	if err := s.attachRegistrationCounts(ctx, resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
 }
 
 // Delete soft-cancels the tournament (status → cancelled).
@@ -476,6 +495,97 @@ func (s *Service) Delete(ctx context.Context, orgSlug, tournamentID string, acto
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
+
+// attachRegistrationCounts populates RegistrationCounts on each response using
+// a single grouped query. Tournaments with no registrations get explicit zeros.
+func (s *Service) attachRegistrationCounts(ctx context.Context, resps ...*Response) error {
+	if len(resps) == 0 {
+		return nil
+	}
+
+	ids := make([]pgtype.UUID, 0, len(resps))
+	for _, r := range resps {
+		uid, err := pgutil.ParseUUID(r.ID)
+		if err != nil {
+			continue
+		}
+		ids = append(ids, uid)
+	}
+
+	rows, err := s.repo.CountRegistrationsByStatus(ctx, ids)
+	if err != nil {
+		return err
+	}
+
+	counts := make(map[string]*RegistrationCountsResponse, len(resps))
+	for _, row := range rows {
+		id := pgutil.UUIDToString(row.TournamentID)
+		c := counts[id]
+		if c == nil {
+			c = &RegistrationCountsResponse{}
+			counts[id] = c
+		}
+		switch row.Status {
+		case db.RegistrationStatusPending:
+			c.Pending = row.Count
+		case db.RegistrationStatusApproved:
+			c.Approved = row.Count
+		case db.RegistrationStatusRejected:
+			c.Rejected = row.Count
+		case db.RegistrationStatusWithdrawn:
+			c.Withdrawn = row.Count
+		case db.RegistrationStatusDisqualified:
+			c.Disqualified = row.Count
+		}
+	}
+
+	for _, r := range resps {
+		c := counts[r.ID]
+		if c == nil {
+			c = &RegistrationCountsResponse{}
+		}
+		c.Active = c.Pending + c.Approved
+		c.Total = c.Pending + c.Approved + c.Rejected + c.Withdrawn + c.Disqualified
+		r.RegistrationCounts = c
+	}
+	return nil
+}
+
+// resolveParticipantNames batch-resolves team and player display names for a
+// set of participant IDs. A participant ID appears in exactly one of the two
+// tables, so both lookups are merged into a single map.
+func (s *Service) resolveParticipantNames(ctx context.Context, participantIDs []string) (map[string]string, error) {
+	names := make(map[string]string, len(participantIDs))
+	if len(participantIDs) == 0 {
+		return names, nil
+	}
+
+	ids := make([]pgtype.UUID, 0, len(participantIDs))
+	for _, id := range participantIDs {
+		uid, err := pgutil.ParseUUID(id)
+		if err != nil {
+			continue
+		}
+		ids = append(ids, uid)
+	}
+
+	teams, err := s.repo.GetTeamNamesByIDs(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	for _, t := range teams {
+		names[pgutil.UUIDToString(t.ID)] = t.Name
+	}
+
+	players, err := s.repo.GetPlayerNamesByIDs(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range players {
+		names[pgutil.UUIDToString(p.ID)] = p.DisplayName
+	}
+	return names, nil
+}
 
 // snapshotTournamentStats upserts final standings into the rankings tables.
 // Called synchronously after a tournament transitions to completed.
@@ -796,11 +906,21 @@ func (s *Service) GetStandings(ctx context.Context, orgSlug, tournamentID string
 
 	rows := standings.Compute(matches, regs, settings)
 
+	participantIDs := make([]string, len(rows))
+	for i, row := range rows {
+		participantIDs[i] = row.ParticipantID
+	}
+	names, err := s.resolveParticipantNames(ctx, participantIDs)
+	if err != nil {
+		return nil, err
+	}
+
 	standingsResp := make([]StandingsRowResponse, len(rows))
 	for i, row := range rows {
 		standingsResp[i] = StandingsRowResponse{
 			Position:        row.Position,
 			ParticipantID:   row.ParticipantID,
+			ParticipantName: names[row.ParticipantID],
 			Played:          row.Played,
 			Wins:            row.Wins,
 			Losses:          row.Losses,

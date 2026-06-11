@@ -15,6 +15,19 @@ export type TournamentFormat =
 
 export type ParticipantType = "team" | "individual"
 
+// Per-status registration breakdown embedded in tournament responses.
+// `active` = pending + approved — the count the backend enforces against
+// max_participants. Always use `active` for capacity math, never `approved`.
+export interface RegistrationCounts {
+  pending: number
+  approved: number
+  rejected: number
+  withdrawn: number
+  disqualified: number
+  active: number
+  total: number
+}
+
 export interface Tournament {
   id: string
   organization_id: string
@@ -41,6 +54,8 @@ export interface Tournament {
   created_by: string | null
   created_at: string
   updated_at: string
+  // Present on create/get/list/update responses (omitted by older endpoints).
+  registration_counts?: RegistrationCounts
 }
 
 // ── Standings ─────────────────────────────────────────────────────────────────
@@ -48,6 +63,9 @@ export interface Tournament {
 export interface StandingsRow {
   position: number
   participant_id: string
+  // Team name or player display name resolved by the backend.
+  // Empty string when the participant record can no longer be found.
+  participant_name: string
   played: number
   wins: number
   losses: number

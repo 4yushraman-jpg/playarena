@@ -101,6 +101,22 @@ func (r *Repository) GetCompletedMatchesForStandings(ctx context.Context, tourna
 	})
 }
 
+// CountRegistrationsByStatus returns per-status registration counts for a set
+// of tournaments in a single grouped query.
+func (r *Repository) CountRegistrationsByStatus(ctx context.Context, tournamentIDs []pgtype.UUID) ([]db.CountRegistrationsByStatusForTournamentsRow, error) {
+	return r.queries.CountRegistrationsByStatusForTournaments(ctx, tournamentIDs)
+}
+
+// GetTeamNamesByIDs batch-resolves team display names.
+func (r *Repository) GetTeamNamesByIDs(ctx context.Context, ids []pgtype.UUID) ([]db.ListTeamNamesByIDsRow, error) {
+	return r.queries.ListTeamNamesByIDs(ctx, ids)
+}
+
+// GetPlayerNamesByIDs batch-resolves player display names.
+func (r *Repository) GetPlayerNamesByIDs(ctx context.Context, ids []pgtype.UUID) ([]db.ListPlayerNamesByIDsRow, error) {
+	return r.queries.ListPlayerNamesByIDs(ctx, ids)
+}
+
 // GetRegistrationsForStandings returns all approved registrations for a
 // tournament, ordered by registered_at ASC for deterministic tiebreaking.
 // No organization_id filter: registrations may come from any org in
