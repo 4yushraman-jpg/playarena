@@ -72,8 +72,11 @@ type Response struct {
 	// player was soft-deleted via the DELETE endpoint. The record is kept
 	// permanently; GET by ID returns it with this status so that historical
 	// team membership and match event data remain resolvable.
-	Status    string  `json:"status"`
-	Bio       *string `json:"bio,omitempty"`
+	Status string  `json:"status"`
+	Bio    *string `json:"bio,omitempty"`
+	// Visibility (GP-1): public | unlisted | private. Controls who may read the
+	// profile via the global GET /players/{id} endpoint.
+	Visibility string `json:"visibility"`
 	// AvatarURL is the CDN URL of the player's primary media attachment.
 	// Populated by GET /players/{id}; nil when no avatar has been uploaded.
 	AvatarURL *string `json:"avatar_url,omitempty"`

@@ -242,6 +242,21 @@ func (s *Service) Delete(ctx context.Context, slug string, actorID, actorOrgID s
 
 var reNonSlugChar = regexp.MustCompile(`[^a-z0-9]+`)
 
+// reservedSlugs are path segments that must never be produced as an org slug,
+// because they collide with non-org top-level routes (GP-1 added /me and
+// /players). A name that slugifies to one of these is prefixed with "org-".
+var reservedSlugs = map[string]struct{}{
+	"me":         {},
+	"player":     {},
+	"players":    {},
+	"onboarding": {},
+	"auth":       {},
+	"api":        {},
+	"login":      {},
+	"register":   {},
+	"admin":      {},
+}
+
 func generateSlug(name string) string {
 	s := strings.ToLower(strings.TrimSpace(name))
 	s = reNonSlugChar.ReplaceAllString(s, "-")
@@ -256,6 +271,9 @@ func generateSlug(name string) string {
 	}
 	if len(s) < 3 {
 		s = "org-x"
+	}
+	if _, reserved := reservedSlugs[s]; reserved {
+		s = "org-" + s
 	}
 	return s
 }

@@ -11,6 +11,8 @@ function makeMockJwt(overrides: Record<string, unknown> = {}) {
       email: "test@example.com",
       organization_id: "org-1",
       role: "org_admin",
+      scope: "organizer",
+      player_profile_id: null,
       exp: Math.floor(Date.now() / 1000) + 3600,
       ...overrides,
     }),
@@ -109,6 +111,8 @@ describe("useAuthGuard — P0-1 claims hydration", () => {
         email: "test@example.com",
         organizationId: "org-1",
         role: "org_admin",
+        scope: "organizer",
+        playerProfileId: null,
         exp: Math.floor(Date.now() / 1000) + 3600,
       },
       orgSlug: "test-org",
@@ -122,5 +126,21 @@ describe("useAuthGuard — P0-1 claims hydration", () => {
     // me() should not have been called because the token is still valid
     expect(vi.mocked(authApi.me)).not.toHaveBeenCalled()
     expect(useAuthStore.getState().claims?.email).toBe("test@example.com")
+  })
+
+  it("keeps onboarding sessions unscoped and does not resolve an org slug", async () => {
+    vi.mocked(tokenManager.getAccessToken).mockReturnValue(makeMockJwt({
+      organization_id: "",
+      role: "onboarding",
+    }))
+
+    const { result } = renderHook(() => useAuthGuard())
+
+    await waitFor(() => expect(result.current.isHydrating).toBe(false))
+
+    expect(useAuthStore.getState().claims?.role).toBe("onboarding")
+    expect(useAuthStore.getState().claims?.organizationId).toBeNull()
+    expect(useAuthStore.getState().orgSlug).toBeNull()
+    expect(vi.mocked(orgsApi.list)).not.toHaveBeenCalled()
   })
 })

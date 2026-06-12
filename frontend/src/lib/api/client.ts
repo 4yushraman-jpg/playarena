@@ -53,6 +53,34 @@ api.interceptors.request.use((config: InternalAxiosRequestConfig) => {
 
 // ── Response interceptor — handle auth errors ─────────────────────────────────
 
+// Reads organization_id from the stored access token (even when expired).
+// Multi-org users must re-assert their org context on refresh — the backend
+// returns 409 organization_required when it cannot resolve one automatically.
+function decodeTokenPayload(): Record<string, unknown> | null {
+  const token = tokenManager.getAccessToken()
+  if (!token) return null
+  try {
+    const payload = token.split(".")[1]
+    if (!payload) return null
+    return JSON.parse(atob(payload.replace(/-/g, "+").replace(/_/g, "/")))
+  } catch {
+    return null
+  }
+}
+
+function currentOrgIdFromToken(): string | null {
+  const p = decodeTokenPayload()
+  return (p?.organization_id as string) || null
+}
+
+// Reads the persona scope from the stored token so a silent refresh preserves
+// the current persona (GP-1). Without this, a player/platform token would be
+// re-resolved by the org-centric auto path on refresh.
+function currentScopeFromToken(): string | null {
+  const p = decodeTokenPayload()
+  return (p?.scope as string) || null
+}
+
 let refreshPromise: Promise<string | null> | null = null
 
 export async function attemptTokenRefresh(): Promise<string | null> {
@@ -63,9 +91,15 @@ export async function attemptTokenRefresh(): Promise<string | null> {
     if (!refreshToken) return null
 
     try {
+      const organizationId = currentOrgIdFromToken()
+      const scope = currentScopeFromToken()
       const { data } = await axios.post<TokenResponse>(
         `${BASE_URL}/api/v1/auth/refresh`,
-        { refresh_token: refreshToken },
+        {
+          refresh_token: refreshToken,
+          ...(organizationId ? { organization_id: organizationId } : {}),
+          ...(scope ? { scope } : {}),
+        },
         { headers: { "Content-Type": "application/json" } },
       )
       tokenManager.setAccessToken(data.access_token)

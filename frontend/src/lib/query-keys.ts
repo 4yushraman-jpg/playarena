@@ -23,6 +23,21 @@ import type { MemberListParams } from "@/types/api/members"
 import type { UserListParams } from "@/types/api/users"
 import type { MediaListParams } from "@/types/api/media"
 
+// ── Me / global PlayerProfile (GP-1) ──────────────────────────────────────────
+// NOT org-scoped. These keys must survive an org switch (do not clear on switch),
+// because the global player identity is independent of any organization.
+
+export const meKeys = {
+  all: () => ["me"] as const,
+  player: () => [...meKeys.all(), "player"] as const,
+}
+
+// Global (non-org) player profile read by id.
+export const playerProfileKeys = {
+  all: () => ["player-profile"] as const,
+  detail: (id: string) => [...playerProfileKeys.all(), id] as const,
+}
+
 // ── Organizations ─────────────────────────────────────────────────────────────
 
 export const orgKeys = {

@@ -8,6 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/4yushraman-jpg/playarena/internal/auth"
 	"github.com/4yushraman-jpg/playarena/internal/testutil/fixtures"
 )
 
@@ -52,6 +53,32 @@ func TestListUsers_RegularUser_Forbidden(t *testing.T) {
 	defer resp.Body.Close()
 	assertStatus(t, resp, 403)
 	assertErrorBody(t, resp, "access denied")
+}
+
+// TestListUsers_OnboardingToken_Forbidden verifies that an onboarding token
+// (empty organization_id, role "onboarding") is NOT treated as a platform
+// admin. Regression guard: IsPlatformUser must exclude the onboarding role,
+// otherwise zero-org users could list, edit, and deactivate any user.
+func TestListUsers_OnboardingToken_Forbidden(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ts := buildTestServer(t, testPool)
+
+	user := fixtures.CreateActiveUser(ctx, t, testPool)
+	t.Cleanup(func() { fixtures.CleanupUser(ctx, t, testPool, user.ID) })
+	other := fixtures.CreateActiveUser(ctx, t, testPool)
+	t.Cleanup(func() { fixtures.CleanupUser(ctx, t, testPool, other.ID) })
+
+	token := makeToken(t, uuidStr(user.ID), "", auth.OnboardingRole, user.Email, testJWTSecret)
+
+	resp := ts.get(t, "/api/v1/users", bearerHeader(token))
+	defer resp.Body.Close()
+	assertStatus(t, resp, 403)
+
+	// Reading another user's profile must also be forbidden (self-access only).
+	other403 := ts.get(t, "/api/v1/users/"+uuidStr(other.ID), bearerHeader(token))
+	defer other403.Body.Close()
+	assertStatus(t, other403, 403)
 }
 
 func TestListUsers_NoAuth(t *testing.T) {

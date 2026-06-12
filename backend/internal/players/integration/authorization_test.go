@@ -55,6 +55,26 @@ func TestPlayer_Delete_NoPermission(t *testing.T) {
 	assertStatus(t, resp, http.StatusForbidden)
 }
 
+// TestPlayer_List_OnboardingToken_Forbidden verifies that a zero-org user's
+// onboarding token cannot read another organization's data. Onboarding tokens
+// carry an empty org ID (the same shape as platform admin tokens) and must be
+// rejected by RequireOrgScope before reaching the tenant-exempt service layer.
+func TestPlayer_List_OnboardingToken_Forbidden(t *testing.T) {
+	ts := buildTestServer(t, testPool)
+	actor := setupUserAndOrg(t, ts, "org_owner")
+
+	ctx := context.Background()
+	zeroOrgUser := fixtures.CreateActiveUser(ctx, t, ts.pool)
+	t.Cleanup(func() { fixtures.CleanupUser(ctx, t, ts.pool, zeroOrgUser.ID) })
+
+	// Login without organization_id — zero-org users receive an onboarding token.
+	token := loginAs(t, ts, zeroOrgUser.Email, fixtures.KnownPasswordRaw, "")
+
+	resp := ts.get(t, playersURL(actor.orgSlug), bearerHeader(token))
+	defer resp.Body.Close()
+	assertStatus(t, resp, http.StatusForbidden)
+}
+
 // TestPlayer_Get_NoAuth verifies GET /{id} without a token returns 401.
 func TestPlayer_Get_NoAuth(t *testing.T) {
 	ts := buildTestServer(t, testPool)

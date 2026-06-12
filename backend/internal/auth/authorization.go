@@ -83,6 +83,21 @@ func (s *AuthorizationService) HasPermission(ctx context.Context, userID, orgID,
 	})
 }
 
+// IsZeroOrgUser reports whether the user has no active organization-scoped
+// grants. Used to permit first-organization onboarding without granting a
+// standing platform role.
+func (s *AuthorizationService) IsZeroOrgUser(ctx context.Context, userID string) (bool, error) {
+	uid, err := pgutil.ParseUUID(userID)
+	if err != nil {
+		return false, nil
+	}
+	orgs, err := s.queries.GetUserOrganizations(ctx, uid)
+	if err != nil {
+		return false, err
+	}
+	return len(orgs) == 0, nil
+}
+
 // GetPermissions returns the full list of permission slugs held by the user
 // in the given organization context.
 func (s *AuthorizationService) GetPermissions(ctx context.Context, userID, orgID string) ([]string, error) {

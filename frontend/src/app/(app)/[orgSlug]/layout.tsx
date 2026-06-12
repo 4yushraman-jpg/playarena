@@ -1,7 +1,8 @@
 "use client"
 
 import { useEffect, useSyncExternalStore } from "react"
-import { useParams } from "next/navigation"
+import { notFound, useParams } from "next/navigation"
+import { isReservedSlug } from "@/lib/reserved-slugs"
 import { OrgSidebar } from "@/components/layout/org-sidebar"
 import { OrgHeader } from "@/components/layout/org-header"
 import { useUIStore } from "@/stores/ui.store"
@@ -24,6 +25,10 @@ const getIsDesktopServer = () => true // SSR/hydration safe default
 export default function OrgLayout({ children }: { children: React.ReactNode }) {
   const params = useParams<{ orgSlug: string }>()
   const orgSlug = params.orgSlug
+  // Defense in depth: a reserved segment (e.g. /me) must never resolve as an org.
+  if (orgSlug && isReservedSlug(orgSlug)) {
+    notFound()
+  }
   const { sidebarOpen, setSidebarOpen } = useUIStore()
 
   // Subscribes to matchMedia changes without calling setState inside an effect.

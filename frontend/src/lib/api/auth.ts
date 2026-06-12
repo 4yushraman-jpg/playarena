@@ -28,6 +28,12 @@ export const authApi = {
   loginAny: (data: LoginRequest) =>
     api.post<TokenResponse | OrgRequiredResponse>(`${BASE}/login`, data),
 
+  refresh: (refreshToken: string, organizationId?: string) =>
+    api.post<TokenResponse>(`${BASE}/refresh`, {
+      refresh_token: refreshToken,
+      ...(organizationId ? { organization_id: organizationId } : {}),
+    }),
+
   register: (data: RegisterRequest) =>
     api.post<RegisterResponse>(`${BASE}/register`, data),
 

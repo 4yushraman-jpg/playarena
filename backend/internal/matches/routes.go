@@ -37,8 +37,9 @@ func RegisterRoutes(
 	h := NewHandler(svc, log)
 
 	r.Route("/api/v1/organizations/{slug}/matches", func(r chi.Router) {
-		// All match routes require a valid access token.
+		// All match routes require a valid access token with an org context.
 		r.Use(auth.RequireAuth(cfg))
+		r.Use(auth.RequireOrgScope())
 
 		// Create — requires match.create permission
 		r.With(auth.RequirePermission(authz, "match.create")).

@@ -15,16 +15,18 @@ import { PageSkeleton } from "@/components/ui/loading-skeleton"
 // each page load and orgSlug is not known until hydration runs.
 export default function RootPage() {
   const router = useRouter()
-  const { isHydrating, orgSlug } = useAuthGuard()
+  const { isHydrating, claims, orgSlug } = useAuthGuard()
 
   useEffect(() => {
     if (isHydrating) return
     if (orgSlug) {
       router.replace(`/${orgSlug}`)
+    } else if (claims?.role === "onboarding") {
+      router.replace("/onboarding")
     } else {
       router.replace("/login")
     }
-  }, [isHydrating, orgSlug, router])
+  }, [claims?.role, isHydrating, orgSlug, router])
 
   return (
     <div className="flex min-h-svh items-start justify-center p-8">

@@ -23,6 +23,9 @@ type LoginResponse struct {
 	RefreshToken string `json:"refresh_token"`
 	ExpiresIn    int64  `json:"expires_in"`
 	TokenType    string `json:"token_type"`
+	// Scope is the persona scope of the issued token (GP-1):
+	// player | organizer | onboarding | platform. Also present inside the JWT.
+	Scope string `json:"scope"`
 }
 
 // ---- refresh ----------------------------------------------------------------
@@ -35,6 +38,12 @@ type LoginResponse struct {
 type RefreshRequest struct {
 	RefreshToken   string `json:"refresh_token"   validate:"required"`
 	OrganizationID string `json:"organization_id" validate:"omitempty,uuid"`
+	// Scope optionally requests a specific persona for the new access token
+	// (GP-1 persona switch). When omitted, the persona is auto-resolved exactly
+	// as on login. Entitlement is re-verified before a token is minted.
+	// Valid values: player | organizer | onboarding | platform. Entitlement
+	// (not just shape) is enforced by the service layer.
+	Scope string `json:"scope" validate:"omitempty"`
 }
 
 // RefreshResponse is returned on a successful token refresh.
@@ -45,6 +54,8 @@ type RefreshResponse struct {
 	RefreshToken string `json:"refresh_token"`
 	ExpiresIn    int64  `json:"expires_in"`
 	TokenType    string `json:"token_type"`
+	// Scope is the persona scope of the issued token (GP-1).
+	Scope string `json:"scope"`
 }
 
 // ---- logout -----------------------------------------------------------------

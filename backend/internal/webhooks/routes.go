@@ -40,6 +40,7 @@ func RegisterRoutes(
 
 	r.Route("/api/v1/organizations/{slug}/webhooks", func(r chi.Router) {
 		r.Use(auth.RequireAuth(cfg))
+		r.Use(auth.RequireOrgScope())
 
 		r.With(auth.RequirePermission(authz, "webhook.create")).
 			Post("/", h.Create)

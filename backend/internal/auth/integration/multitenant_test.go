@@ -8,14 +8,8 @@ import (
 )
 
 // TestLogin_ZeroOrgs verifies that a user with no organization memberships
-// receives 409 with code "organization_required" and an empty organizations
-// list. This is the zero-element case of the multi-org 409 path: the service's
-// resolveOrgContext calls GetUserOrganizations, gets an empty slice, and returns
-// ErrOrganizationRequired{Organizations: nil}.
-//
-// At 100,000-user scale, newly registered users (pre-org-grant) or users whose
-// last org membership was revoked are real occurrences. This test verifies the
-// correct 409 response rather than an unexpected 500 or panic.
+// receives an onboarding token instead of the multi-org 409 response. Newly
+// registered users need an authenticated path to create their first org.
 func TestLogin_ZeroOrgs(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -31,17 +25,20 @@ func TestLogin_ZeroOrgs(t *testing.T) {
 		// no organization_id — server must resolve from memberships
 	})
 	defer resp.Body.Close()
-	assertStatus(t, resp, 409)
+	assertStatus(t, resp, 200)
 
-	var r orgRequiredResp
+	var r loginResp
 	decodeBody(t, resp, &r)
-	if r.Code != "organization_required" {
-		t.Errorf("zero-orgs 409: code got %q, want %q", r.Code, "organization_required")
+	if r.AccessToken == "" {
+		t.Fatal("zero-orgs onboarding: empty access_token")
 	}
-	// The organizations list must be empty (not absent). len handles both nil
-	// and empty-slice JSON representations after unmarshaling.
-	if len(r.Organizations) != 0 {
-		t.Errorf("zero-orgs 409: got %d organizations, want 0", len(r.Organizations))
+
+	me := apiMe(t, ts, r.AccessToken)
+	if me.OrganizationID != "" {
+		t.Errorf("zero-orgs onboarding: organization_id got %q, want empty", me.OrganizationID)
+	}
+	if me.Role != "onboarding" {
+		t.Errorf("zero-orgs onboarding: role got %q, want %q", me.Role, "onboarding")
 	}
 }
 

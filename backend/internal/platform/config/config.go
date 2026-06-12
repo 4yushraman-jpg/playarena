@@ -110,7 +110,8 @@ type Config struct {
 	EmailFromName string
 
 	// AppBaseURL is the frontend base URL used to construct verification and
-	// password-reset links. Must begin with "https://" in production.
+	// password-reset links. Sourced from FRONTEND_URL, with APP_BASE_URL kept as
+	// a backwards-compatible fallback. Must begin with "https://" in production.
 	// Example: "https://app.playarena.com"
 	AppBaseURL string
 
@@ -196,6 +197,15 @@ type Config struct {
 	// the internal observability server. Defaults to true in non-production
 	// environments.
 	PprofEnabled bool
+
+	// ── GP-1: player persona ──────────────────────────────────────────────────
+
+	// PlayerPersonaEnabled gates the GP-1 player-persona foundation: the
+	// self-profile endpoints (/api/v1/me/player, /api/v1/players/{id}) and the
+	// login/refresh player-scope resolution. When false (default), the runtime
+	// behaves exactly as before GP-1: no player tokens are minted and the
+	// self-profile routes are not mounted. Sourced from GP_PLAYER_PERSONA_ENABLED.
+	PlayerPersonaEnabled bool
 }
 
 // Load reads configuration from environment variables and returns a validated Config.
@@ -254,7 +264,7 @@ func Load() (*Config, error) {
 		EmailProvider:    getEnv("EMAIL_PROVIDER", "log"),
 		EmailFromAddress: os.Getenv("EMAIL_FROM_ADDRESS"),
 		EmailFromName:    getEnv("EMAIL_FROM_NAME", "PlayArena"),
-		AppBaseURL:       os.Getenv("APP_BASE_URL"),
+		AppBaseURL:       getEnv("FRONTEND_URL", os.Getenv("APP_BASE_URL")),
 
 		EmailSESRegion:    getEnv("EMAIL_SES_REGION", "us-east-1"),
 		EmailSESAccessKey: os.Getenv("EMAIL_SES_ACCESS_KEY"),
@@ -277,6 +287,8 @@ func Load() (*Config, error) {
 		AuditLogRetentionDays: getEnvInt("AUDIT_LOG_RETENTION_DAYS", 730),
 		DrainTimeoutSeconds:   getEnvInt("DRAIN_TIMEOUT_SECONDS", 5),
 		PprofEnabled:          getEnvBool("PPROF_ENABLED", true),
+
+		PlayerPersonaEnabled: getEnvBool("GP_PLAYER_PERSONA_ENABLED", false),
 	}
 
 	if err := cfg.validate(); err != nil {
@@ -339,11 +351,11 @@ func (c *Config) validate() error {
 		errs = append(errs, "EMAIL_FROM_ADDRESS is required")
 	}
 	if c.AppBaseURL == "" {
-		errs = append(errs, "APP_BASE_URL is required")
+		errs = append(errs, "FRONTEND_URL is required")
 	}
 	if c.IsProduction() {
 		if !strings.HasPrefix(c.AppBaseURL, "https://") {
-			errs = append(errs, "APP_BASE_URL must begin with https:// in production")
+			errs = append(errs, "FRONTEND_URL must begin with https:// in production")
 		}
 		if c.EmailProvider == "noop" || c.EmailProvider == "log" {
 			errs = append(errs, "EMAIL_PROVIDER must not be 'noop' or 'log' in production")

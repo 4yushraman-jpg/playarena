@@ -1,5 +1,8 @@
 import type { Role } from "../common"
 
+// Persona scope carried by the access token (GP-1).
+export type Scope = "player" | "organizer" | "onboarding" | "platform"
+
 // ── Requests ──────────────────────────────────────────────────────────────────
 
 export interface LoginRequest {
@@ -18,6 +21,8 @@ export interface RegisterRequest {
 export interface RefreshRequest {
   refresh_token: string
   organization_id?: string
+  // Optional persona scope to request on refresh (GP-1 persona switch).
+  scope?: Scope
 }
 
 export interface LogoutRequest {
@@ -44,6 +49,8 @@ export interface TokenResponse {
   refresh_token: string
   expires_in: number
   token_type: "Bearer"
+  // Persona scope of the issued token (GP-1). Also encoded inside the JWT.
+  scope?: Scope
 }
 
 export interface RegisterResponse {
@@ -79,15 +86,19 @@ export interface AuthUser {
   status: "active" | "pending_verification" | "suspended" | "inactive"
   role: Role
   organization_id: string
+  scope?: Scope
+  player_profile_id?: string
 }
 
 // Decoded JWT claims stored in Zustand.
-// Backend JWTClaims: { user_id, organization_id, role, email, exp }
-// organizationId is null for platform admins whose JWT carries no org context.
+// Backend JWTClaims: { user_id, organization_id, role, email, scope, player_profile_id, exp }
+// organizationId is null for platform/player/onboarding tokens whose JWT carries no org context.
 export interface JwtClaims {
   userId: string
   email: string
   organizationId: string | null
   role: Role
+  scope: Scope | null
+  playerProfileId: string | null
   exp: number
 }

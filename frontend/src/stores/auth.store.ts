@@ -1,6 +1,6 @@
 import { create } from "zustand"
 import { tokenManager } from "@/lib/api/client"
-import type { JwtClaims, OrgSummary, TokenResponse } from "@/types/api/auth"
+import type { JwtClaims, OrgSummary, Scope, TokenResponse } from "@/types/api/auth"
 import type { Role } from "@/types/common"
 
 function decodeJwt(token: string): JwtClaims | null {
@@ -13,6 +13,8 @@ function decodeJwt(token: string): JwtClaims | null {
       email: decoded.email,
       organizationId: decoded.organization_id || null,
       role: decoded.role as Role,
+      scope: (decoded.scope as Scope) || null,
+      playerProfileId: decoded.player_profile_id || null,
       exp: decoded.exp,
     }
   } catch {
@@ -106,3 +108,5 @@ export const selectIsAuthenticated = (s: AuthState) => s.claims !== null
 export const selectOrgId = (s: AuthState) => s.claims?.organizationId ?? null
 export const selectRole = (s: AuthState) => s.claims?.role ?? null
 export const selectUserId = (s: AuthState) => s.claims?.userId ?? null
+export const selectScope = (s: AuthState) => s.claims?.scope ?? null
+export const selectPlayerProfileId = (s: AuthState) => s.claims?.playerProfileId ?? null

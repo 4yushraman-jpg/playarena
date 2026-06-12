@@ -34,6 +34,7 @@ func RegisterRoutes(
 
 	r.Route("/api/v1/organizations/{slug}/members", func(r chi.Router) {
 		r.Use(auth.RequireAuth(cfg))
+		r.Use(auth.RequireOrgScope())
 
 		r.With(auth.RequirePermission(authz, "role.assign")).Get("/", h.List)
 		r.With(auth.RequirePermission(authz, "role.assign")).Get("/{userID}", h.GetMember)

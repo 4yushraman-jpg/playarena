@@ -18,7 +18,7 @@ func newTestSender(p *email.NoOpProvider) *email.Sender {
 	return email.NewSenderWithProvider(p, email.SenderConfig{
 		FromAddress: "noreply@test.example.com",
 		FromName:    "PlayArena Test",
-		AppBaseURL:  "http://localhost:8080",
+		AppBaseURL:  "http://localhost:3000",
 	}, discardLogger())
 }
 
@@ -112,7 +112,7 @@ func TestSender_SendVerificationEmail_ContainsToken(t *testing.T) {
 	}
 
 	m := p.Sent()[0]
-	const want = "http://localhost:8080/verify-email?token=verify-token-abc"
+	const want = "http://localhost:3000/verify-email?token=verify-token-abc"
 	if !containsString(m.TextBody, want) && !containsString(m.HTMLBody, want) {
 		t.Errorf("verify URL %q not found in body; text=%q html=%q", want, m.TextBody, m.HTMLBody)
 	}
@@ -151,7 +151,7 @@ func TestSender_SendPasswordResetEmail_ContainsToken(t *testing.T) {
 	}
 
 	m := p.Sent()[0]
-	const want = "http://localhost:8080/reset-password?token=reset-tok-xyz"
+	const want = "http://localhost:3000/reset-password?token=reset-tok-xyz"
 	if !containsString(m.TextBody, want) && !containsString(m.HTMLBody, want) {
 		t.Errorf("reset URL %q not found in body; text=%q html=%q", want, m.TextBody, m.HTMLBody)
 	}

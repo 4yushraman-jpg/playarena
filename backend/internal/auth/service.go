@@ -32,6 +32,8 @@ func NewService(repo *Repository, cfg *config.Config, reg *metrics.Registry) *Se
 // Multi-tenancy rules:
 //   - Platform admins (users with platform-scoped roles): omit organization_id
 //     to receive a platform-level access token (OrganizationID = "").
+//   - Zero-org users: omit organization_id to receive an onboarding token that
+//     can create the user's first organization.
 //   - Single-org users: organization_id is optional; selected automatically.
 //   - Multi-org users: organization_id is required; ErrOrganizationRequired
 //     is returned with the org list when it is missing.
@@ -62,16 +64,18 @@ func (s *Service) login(ctx context.Context, req LoginRequest, ipAddress *netip.
 		return nil, err
 	}
 
-	orgID, role, err := s.resolveOrgContext(ctx, user.ID, req.OrganizationID)
+	pc, err := s.resolvePrincipal(ctx, user.ID, req.OrganizationID)
 	if err != nil {
 		return nil, err
 	}
 
 	accessToken, err := GenerateAccessToken(
 		pgutil.UUIDToString(user.ID),
-		orgID,
-		role,
+		pc.OrgID,
+		pc.Role,
 		user.Email,
+		pc.Scope,
+		pc.PlayerProfileID,
 		s.config.JWTSecret,
 	)
 	if err != nil {
@@ -99,6 +103,7 @@ func (s *Service) login(ctx context.Context, req LoginRequest, ipAddress *netip.
 		RefreshToken: refreshTokenRaw,
 		ExpiresIn:    int64(accessTokenDuration.Seconds()),
 		TokenType:    "Bearer",
+		Scope:        pc.Scope,
 	}, nil
 }
 
@@ -192,7 +197,12 @@ func (s *Service) refresh(ctx context.Context, req RefreshRequest, ipAddress *ne
 		return nil, err
 	}
 
-	orgID, role, err := s.resolveOrgContext(ctx, user.ID, req.OrganizationID)
+	var pc principalContext
+	if req.Scope != "" {
+		pc, err = s.resolvePrincipalForScope(ctx, user.ID, req.Scope, req.OrganizationID)
+	} else {
+		pc, err = s.resolvePrincipal(ctx, user.ID, req.OrganizationID)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -216,9 +226,11 @@ func (s *Service) refresh(ctx context.Context, req RefreshRequest, ipAddress *ne
 
 	accessToken, err := GenerateAccessToken(
 		pgutil.UUIDToString(user.ID),
-		orgID,
-		role,
+		pc.OrgID,
+		pc.Role,
 		user.Email,
+		pc.Scope,
+		pc.PlayerProfileID,
 		s.config.JWTSecret,
 	)
 	if err != nil {
@@ -230,6 +242,7 @@ func (s *Service) refresh(ctx context.Context, req RefreshRequest, ipAddress *ne
 		RefreshToken: newRefreshTokenRaw,
 		ExpiresIn:    int64(accessTokenDuration.Seconds()),
 		TokenType:    "Bearer",
+		Scope:        pc.Scope,
 	}, nil
 }
 
@@ -457,27 +470,55 @@ func assertUserActive(user *db.User) error {
 	return nil
 }
 
-func (s *Service) resolveOrgContext(ctx context.Context, userID pgtype.UUID, orgIDHint string) (string, string, error) {
+// principalContext carries everything needed to mint an access token for a
+// resolved persona.
+type principalContext struct {
+	OrgID           string
+	Role            string
+	Scope           string
+	PlayerProfileID string
+}
+
+// resolvePrincipal performs persona-auto resolution (used by login and by
+// refresh when no explicit scope is requested):
+//   - explicit org hint        → organizer
+//   - platform role            → platform
+//   - 0 orgs + profile (flag)  → player
+//   - 0 orgs + no profile      → onboarding
+//   - 1 org                    → organizer (auto-selected)
+//   - N orgs                   → ErrOrganizationRequired
+func (s *Service) resolvePrincipal(ctx context.Context, userID pgtype.UUID, orgIDHint string) (principalContext, error) {
 	if orgIDHint != "" {
 		return s.resolveExplicitOrg(ctx, userID, orgIDHint)
 	}
 
 	platformRoles, err := s.repo.GetUserPlatformRoles(ctx, userID)
 	if err != nil {
-		return "", "", err
+		return principalContext{}, err
 	}
 	if len(platformRoles) > 0 {
-		return "", platformRoles[0].Slug, nil
+		return principalContext{Role: platformRoles[0].Slug, Scope: ScopePlatform}, nil
 	}
 
 	orgs, err := s.repo.GetUserOrganizations(ctx, userID)
 	if err != nil {
-		return "", "", err
+		return principalContext{}, err
 	}
 
 	switch len(orgs) {
 	case 0:
-		return "", "", &ErrOrganizationRequired{Organizations: nil}
+		// GP-1: a zero-org user WITH a profile becomes a player (flag-gated).
+		// When the flag is off, behaviour is unchanged: onboarding token.
+		if s.config.PlayerPersonaEnabled {
+			profileID, has, err := s.repo.GetPlayerProfileID(ctx, userID)
+			if err != nil {
+				return principalContext{}, err
+			}
+			if has {
+				return principalContext{Scope: ScopePlayer, PlayerProfileID: profileID}, nil
+			}
+		}
+		return principalContext{Role: OnboardingRole, Scope: ScopeOnboarding}, nil
 	case 1:
 		return s.resolveExplicitOrg(ctx, userID, pgutil.UUIDToString(orgs[0].ID))
 	default:
@@ -489,14 +530,68 @@ func (s *Service) resolveOrgContext(ctx context.Context, userID pgtype.UUID, org
 				Slug: o.Slug,
 			}
 		}
-		return "", "", &ErrOrganizationRequired{Organizations: summaries}
+		return principalContext{}, &ErrOrganizationRequired{Organizations: summaries}
 	}
 }
 
-func (s *Service) resolveExplicitOrg(ctx context.Context, userID pgtype.UUID, orgIDStr string) (string, string, error) {
+// resolvePrincipalForScope handles an explicit scope request on refresh. Every
+// path re-verifies entitlement before a token is minted; unentitled requests
+// return ErrScopeNotEntitled (HTTP 403).
+func (s *Service) resolvePrincipalForScope(ctx context.Context, userID pgtype.UUID, requestedScope, orgIDHint string) (principalContext, error) {
+	switch requestedScope {
+	case ScopeOrganizer:
+		if orgIDHint == "" {
+			return principalContext{}, ErrScopeNotEntitled
+		}
+		pc, err := s.resolveExplicitOrg(ctx, userID, orgIDHint)
+		if errors.Is(err, ErrOrganizationNotFound) {
+			return principalContext{}, ErrScopeNotEntitled
+		}
+		return pc, err
+	case ScopePlayer:
+		if !s.config.PlayerPersonaEnabled {
+			return principalContext{}, ErrScopeNotEntitled
+		}
+		profileID, has, err := s.repo.GetPlayerProfileID(ctx, userID)
+		if err != nil {
+			return principalContext{}, err
+		}
+		if !has {
+			return principalContext{}, ErrScopeNotEntitled
+		}
+		return principalContext{Scope: ScopePlayer, PlayerProfileID: profileID}, nil
+	case ScopePlatform:
+		platformRoles, err := s.repo.GetUserPlatformRoles(ctx, userID)
+		if err != nil {
+			return principalContext{}, err
+		}
+		if len(platformRoles) == 0 {
+			return principalContext{}, ErrScopeNotEntitled
+		}
+		return principalContext{Role: platformRoles[0].Slug, Scope: ScopePlatform}, nil
+	case ScopeOnboarding:
+		orgs, err := s.repo.GetUserOrganizations(ctx, userID)
+		if err != nil {
+			return principalContext{}, err
+		}
+		if len(orgs) > 0 {
+			return principalContext{}, ErrScopeNotEntitled
+		}
+		if _, has, err := s.repo.GetPlayerProfileID(ctx, userID); err != nil {
+			return principalContext{}, err
+		} else if has {
+			return principalContext{}, ErrScopeNotEntitled
+		}
+		return principalContext{Role: OnboardingRole, Scope: ScopeOnboarding}, nil
+	default:
+		return principalContext{}, ErrScopeNotEntitled
+	}
+}
+
+func (s *Service) resolveExplicitOrg(ctx context.Context, userID pgtype.UUID, orgIDStr string) (principalContext, error) {
 	orgUUID, err := pgutil.ParseUUID(orgIDStr)
 	if err != nil {
-		return "", "", ErrOrganizationNotFound
+		return principalContext{}, ErrOrganizationNotFound
 	}
 
 	roles, err := s.repo.GetUserRolesByOrganization(ctx, db.GetUserRolesByOrganizationParams{
@@ -504,13 +599,13 @@ func (s *Service) resolveExplicitOrg(ctx context.Context, userID pgtype.UUID, or
 		OrganizationID: orgUUID,
 	})
 	if err != nil {
-		return "", "", err
+		return principalContext{}, err
 	}
 	if len(roles) == 0 {
-		return "", "", ErrOrganizationNotFound
+		return principalContext{}, ErrOrganizationNotFound
 	}
 
-	return orgIDStr, roles[0].Slug, nil
+	return principalContext{OrgID: orgIDStr, Role: roles[0].Slug, Scope: ScopeOrganizer}, nil
 }
 
 func splitFullName(fullName string) (firstName, lastName string) {

@@ -38,8 +38,9 @@ func RegisterRoutes(
 	h := NewHandler(svc, log)
 
 	r.Route("/api/v1/organizations/{slug}/teams", func(r chi.Router) {
-		// All team routes require a valid access token.
+		// All team routes require a valid access token with an org context.
 		r.Use(auth.RequireAuth(cfg))
+		r.Use(auth.RequireOrgScope())
 
 		// ── team CRUD ────────────────────────────────────────────────────────
 

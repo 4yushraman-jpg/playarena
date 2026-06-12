@@ -15,6 +15,7 @@ const countPlayersByOrganization = `-- name: CountPlayersByOrganization :one
 SELECT COUNT(*)
 FROM   players
 WHERE  organization_id = $1
+  AND  archived_at IS NULL
   AND  ($2::text IS NOT NULL OR status != 'inactive')
   AND  ($2::text IS NULL     OR status::text = $2)
   AND  ($3::text  IS NULL OR display_name ILIKE '%' || $3 || '%')
@@ -35,6 +36,77 @@ func (q *Queries) CountPlayersByOrganization(ctx context.Context, arg CountPlaye
 	return count, err
 }
 
+const createGlobalPlayerProfile = `-- name: CreateGlobalPlayerProfile :one
+INSERT INTO players (
+    user_id,
+    display_name,
+    jersey_number,
+    position,
+    height_cm,
+    weight_kg,
+    dominant_hand,
+    nationality,
+    date_of_birth,
+    bio,
+    visibility
+)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+RETURNING id, organization_id, user_id, display_name, jersey_number, position, height_cm, weight_kg, dominant_hand, nationality, date_of_birth, status, bio, metadata, created_at, updated_at, visibility, archived_at
+`
+
+type CreateGlobalPlayerProfileParams struct {
+	UserID       pgtype.UUID `json:"user_id"`
+	DisplayName  string      `json:"display_name"`
+	JerseyNumber *string     `json:"jersey_number"`
+	Position     *string     `json:"position"`
+	HeightCm     *int16      `json:"height_cm"`
+	WeightKg     *int16      `json:"weight_kg"`
+	DominantHand *string     `json:"dominant_hand"`
+	Nationality  *string     `json:"nationality"`
+	DateOfBirth  pgtype.Date `json:"date_of_birth"`
+	Bio          *string     `json:"bio"`
+	Visibility   string      `json:"visibility"`
+}
+
+// Owner-created profile: organization_id is NULL (global, user-owned).
+func (q *Queries) CreateGlobalPlayerProfile(ctx context.Context, arg CreateGlobalPlayerProfileParams) (Player, error) {
+	row := q.db.QueryRow(ctx, createGlobalPlayerProfile,
+		arg.UserID,
+		arg.DisplayName,
+		arg.JerseyNumber,
+		arg.Position,
+		arg.HeightCm,
+		arg.WeightKg,
+		arg.DominantHand,
+		arg.Nationality,
+		arg.DateOfBirth,
+		arg.Bio,
+		arg.Visibility,
+	)
+	var i Player
+	err := row.Scan(
+		&i.ID,
+		&i.OrganizationID,
+		&i.UserID,
+		&i.DisplayName,
+		&i.JerseyNumber,
+		&i.Position,
+		&i.HeightCm,
+		&i.WeightKg,
+		&i.DominantHand,
+		&i.Nationality,
+		&i.DateOfBirth,
+		&i.Status,
+		&i.Bio,
+		&i.Metadata,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Visibility,
+		&i.ArchivedAt,
+	)
+	return i, err
+}
+
 const createPlayer = `-- name: CreatePlayer :one
 INSERT INTO players (
     organization_id,
@@ -50,7 +122,7 @@ INSERT INTO players (
     bio
 )
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-RETURNING id, organization_id, user_id, display_name, jersey_number, position, height_cm, weight_kg, dominant_hand, nationality, date_of_birth, status, bio, metadata, created_at, updated_at
+RETURNING id, organization_id, user_id, display_name, jersey_number, position, height_cm, weight_kg, dominant_hand, nationality, date_of_birth, status, bio, metadata, created_at, updated_at, visibility, archived_at
 `
 
 type CreatePlayerParams struct {
@@ -101,13 +173,15 @@ func (q *Queries) CreatePlayer(ctx context.Context, arg CreatePlayerParams) (Pla
 		&i.Metadata,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Visibility,
+		&i.ArchivedAt,
 	)
 	return i, err
 }
 
 const getPlayerByID = `-- name: GetPlayerByID :one
 
-SELECT id, organization_id, user_id, display_name, jersey_number, position, height_cm, weight_kg, dominant_hand, nationality, date_of_birth, status, bio, metadata, created_at, updated_at
+SELECT id, organization_id, user_id, display_name, jersey_number, position, height_cm, weight_kg, dominant_hand, nationality, date_of_birth, status, bio, metadata, created_at, updated_at, visibility, archived_at
 FROM   players
 WHERE  id              = $1
   AND  organization_id = $2
@@ -141,14 +215,91 @@ func (q *Queries) GetPlayerByID(ctx context.Context, arg GetPlayerByIDParams) (P
 		&i.Metadata,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Visibility,
+		&i.ArchivedAt,
+	)
+	return i, err
+}
+
+const getPlayerProfileByID = `-- name: GetPlayerProfileByID :one
+SELECT id, organization_id, user_id, display_name, jersey_number, position, height_cm, weight_kg, dominant_hand, nationality, date_of_birth, status, bio, metadata, created_at, updated_at, visibility, archived_at
+FROM   players
+WHERE  id = $1
+  AND  archived_at IS NULL
+LIMIT  1
+`
+
+// A single profile by id, excluding archived duplicates. Used by the global
+// read endpoint (visibility filtering is applied in the service layer).
+func (q *Queries) GetPlayerProfileByID(ctx context.Context, id pgtype.UUID) (Player, error) {
+	row := q.db.QueryRow(ctx, getPlayerProfileByID, id)
+	var i Player
+	err := row.Scan(
+		&i.ID,
+		&i.OrganizationID,
+		&i.UserID,
+		&i.DisplayName,
+		&i.JerseyNumber,
+		&i.Position,
+		&i.HeightCm,
+		&i.WeightKg,
+		&i.DominantHand,
+		&i.Nationality,
+		&i.DateOfBirth,
+		&i.Status,
+		&i.Bio,
+		&i.Metadata,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Visibility,
+		&i.ArchivedAt,
+	)
+	return i, err
+}
+
+const getPlayerProfileByUserID = `-- name: GetPlayerProfileByUserID :one
+
+SELECT id, organization_id, user_id, display_name, jersey_number, position, height_cm, weight_kg, dominant_hand, nationality, date_of_birth, status, bio, metadata, created_at, updated_at, visibility, archived_at
+FROM   players
+WHERE  user_id = $1
+  AND  archived_at IS NULL
+LIMIT  1
+`
+
+// ── GP-1: global PlayerProfile (user-owned) ────────────────────────────────
+// The caller's canonical (non-archived) profile, regardless of org.
+// One User -> One PlayerProfile is enforced by uq_players_user_id.
+func (q *Queries) GetPlayerProfileByUserID(ctx context.Context, userID pgtype.UUID) (Player, error) {
+	row := q.db.QueryRow(ctx, getPlayerProfileByUserID, userID)
+	var i Player
+	err := row.Scan(
+		&i.ID,
+		&i.OrganizationID,
+		&i.UserID,
+		&i.DisplayName,
+		&i.JerseyNumber,
+		&i.Position,
+		&i.HeightCm,
+		&i.WeightKg,
+		&i.DominantHand,
+		&i.Nationality,
+		&i.DateOfBirth,
+		&i.Status,
+		&i.Bio,
+		&i.Metadata,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Visibility,
+		&i.ArchivedAt,
 	)
 	return i, err
 }
 
 const listPlayersByOrganization = `-- name: ListPlayersByOrganization :many
-SELECT id, organization_id, user_id, display_name, jersey_number, position, height_cm, weight_kg, dominant_hand, nationality, date_of_birth, status, bio, metadata, created_at, updated_at
+SELECT id, organization_id, user_id, display_name, jersey_number, position, height_cm, weight_kg, dominant_hand, nationality, date_of_birth, status, bio, metadata, created_at, updated_at, visibility, archived_at
 FROM   players
 WHERE  organization_id = $1
+  AND  archived_at IS NULL
 ORDER  BY display_name ASC
 `
 
@@ -178,6 +329,8 @@ func (q *Queries) ListPlayersByOrganization(ctx context.Context, organizationID 
 			&i.Metadata,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.Visibility,
+			&i.ArchivedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -190,9 +343,10 @@ func (q *Queries) ListPlayersByOrganization(ctx context.Context, organizationID 
 }
 
 const listPlayersPaginated = `-- name: ListPlayersPaginated :many
-SELECT id, organization_id, user_id, display_name, jersey_number, position, height_cm, weight_kg, dominant_hand, nationality, date_of_birth, status, bio, metadata, created_at, updated_at
+SELECT id, organization_id, user_id, display_name, jersey_number, position, height_cm, weight_kg, dominant_hand, nationality, date_of_birth, status, bio, metadata, created_at, updated_at, visibility, archived_at
 FROM   players
 WHERE  organization_id = $1
+  AND  archived_at IS NULL
   AND  ($2::text IS NOT NULL OR status != 'inactive')
   AND  ($2::text IS NULL     OR status::text = $2)
   AND  ($3::text  IS NULL OR display_name ILIKE '%' || $3 || '%')
@@ -245,6 +399,8 @@ func (q *Queries) ListPlayersPaginated(ctx context.Context, arg ListPlayersPagin
 			&i.Metadata,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.Visibility,
+			&i.ArchivedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -262,7 +418,7 @@ SET    status     = 'inactive',
        updated_at = NOW()
 WHERE  id              = $1
   AND  organization_id = $2
-RETURNING id, organization_id, user_id, display_name, jersey_number, position, height_cm, weight_kg, dominant_hand, nationality, date_of_birth, status, bio, metadata, created_at, updated_at
+RETURNING id, organization_id, user_id, display_name, jersey_number, position, height_cm, weight_kg, dominant_hand, nationality, date_of_birth, status, bio, metadata, created_at, updated_at, visibility, archived_at
 `
 
 type SoftDeletePlayerParams struct {
@@ -292,6 +448,83 @@ func (q *Queries) SoftDeletePlayer(ctx context.Context, arg SoftDeletePlayerPara
 		&i.Metadata,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Visibility,
+		&i.ArchivedAt,
+	)
+	return i, err
+}
+
+const updateOwnPlayerProfile = `-- name: UpdateOwnPlayerProfile :one
+UPDATE players
+SET    display_name  = $3,
+       jersey_number = $4,
+       position      = $5,
+       height_cm     = $6,
+       weight_kg     = $7,
+       dominant_hand = $8,
+       nationality   = $9,
+       date_of_birth = $10,
+       bio           = $11,
+       visibility    = $12,
+       updated_at    = NOW()
+WHERE  id      = $1
+  AND  user_id = $2
+  AND  archived_at IS NULL
+RETURNING id, organization_id, user_id, display_name, jersey_number, position, height_cm, weight_kg, dominant_hand, nationality, date_of_birth, status, bio, metadata, created_at, updated_at, visibility, archived_at
+`
+
+type UpdateOwnPlayerProfileParams struct {
+	ID           pgtype.UUID `json:"id"`
+	UserID       pgtype.UUID `json:"user_id"`
+	DisplayName  string      `json:"display_name"`
+	JerseyNumber *string     `json:"jersey_number"`
+	Position     *string     `json:"position"`
+	HeightCm     *int16      `json:"height_cm"`
+	WeightKg     *int16      `json:"weight_kg"`
+	DominantHand *string     `json:"dominant_hand"`
+	Nationality  *string     `json:"nationality"`
+	DateOfBirth  pgtype.Date `json:"date_of_birth"`
+	Bio          *string     `json:"bio"`
+	Visibility   string      `json:"visibility"`
+}
+
+// Identity-field update by the owner. organization_id / user_id / status are
+// intentionally NOT mutable here. The WHERE clause binds the row to its owner.
+func (q *Queries) UpdateOwnPlayerProfile(ctx context.Context, arg UpdateOwnPlayerProfileParams) (Player, error) {
+	row := q.db.QueryRow(ctx, updateOwnPlayerProfile,
+		arg.ID,
+		arg.UserID,
+		arg.DisplayName,
+		arg.JerseyNumber,
+		arg.Position,
+		arg.HeightCm,
+		arg.WeightKg,
+		arg.DominantHand,
+		arg.Nationality,
+		arg.DateOfBirth,
+		arg.Bio,
+		arg.Visibility,
+	)
+	var i Player
+	err := row.Scan(
+		&i.ID,
+		&i.OrganizationID,
+		&i.UserID,
+		&i.DisplayName,
+		&i.JerseyNumber,
+		&i.Position,
+		&i.HeightCm,
+		&i.WeightKg,
+		&i.DominantHand,
+		&i.Nationality,
+		&i.DateOfBirth,
+		&i.Status,
+		&i.Bio,
+		&i.Metadata,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Visibility,
+		&i.ArchivedAt,
 	)
 	return i, err
 }
@@ -311,7 +544,7 @@ SET    display_name  = $3,
        updated_at    = NOW()
 WHERE  id              = $1
   AND  organization_id = $2
-RETURNING id, organization_id, user_id, display_name, jersey_number, position, height_cm, weight_kg, dominant_hand, nationality, date_of_birth, status, bio, metadata, created_at, updated_at
+RETURNING id, organization_id, user_id, display_name, jersey_number, position, height_cm, weight_kg, dominant_hand, nationality, date_of_birth, status, bio, metadata, created_at, updated_at, visibility, archived_at
 `
 
 type UpdatePlayerParams struct {
@@ -365,6 +598,8 @@ func (q *Queries) UpdatePlayer(ctx context.Context, arg UpdatePlayerParams) (Pla
 		&i.Metadata,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Visibility,
+		&i.ArchivedAt,
 	)
 	return i, err
 }

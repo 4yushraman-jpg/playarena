@@ -9,6 +9,7 @@ export function hasPermission(role: Role | null, perm: Permission): boolean {
 }
 
 export const ROLE_LABELS: Record<Role, string> = {
+  onboarding: "Onboarding",
   platform_admin: "Platform Admin",
   org_owner: "Owner",
   org_admin: "Admin",
@@ -19,6 +20,7 @@ export const ROLE_LABELS: Record<Role, string> = {
 }
 
 export const ROLE_VARIANTS: Record<Role, "default" | "secondary" | "outline"> = {
+  onboarding: "outline",
   platform_admin: "default",
   org_owner: "default",
   org_admin: "secondary",

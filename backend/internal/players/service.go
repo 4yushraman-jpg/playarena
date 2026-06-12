@@ -402,6 +402,7 @@ func playerToResponse(p *db.Player) *Response {
 		DateOfBirth:    dob,
 		Status:         string(p.Status),
 		Bio:            p.Bio,
+		Visibility:     p.Visibility,
 		CreatedAt:      p.CreatedAt.Time.UTC().Format("2006-01-02T15:04:05Z"),
 		UpdatedAt:      p.UpdatedAt.Time.UTC().Format("2006-01-02T15:04:05Z"),
 	}

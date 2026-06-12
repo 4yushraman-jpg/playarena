@@ -39,8 +39,9 @@ func RegisterRoutes(
 	h := NewHandler(svc, log)
 
 	r.Route("/api/v1/organizations/{slug}/tournaments", func(r chi.Router) {
-		// All tournament routes require a valid access token.
+		// All tournament routes require a valid access token with an org context.
 		r.Use(auth.RequireAuth(cfg))
+		r.Use(auth.RequireOrgScope())
 
 		// Create — requires tournament.create permission
 		r.With(auth.RequirePermission(authz, "tournament.create")).

@@ -48,6 +48,14 @@ var (
 
 	// Organization errors
 	ErrOrganizationNotFound = errors.New("organization not found or access denied")
+
+	// Scope errors (GP-1)
+	//
+	// ErrScopeNotEntitled is returned by Refresh when the caller requests a
+	// persona scope they are not entitled to (e.g. player scope without a
+	// profile, organizer scope without a grant, platform scope without a
+	// platform role). Mapped to HTTP 403.
+	ErrScopeNotEntitled = errors.New("not entitled to requested scope")
 )
 
 // ErrOrganizationRequired is returned when a user belongs to multiple

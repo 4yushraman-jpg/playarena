@@ -145,13 +145,15 @@ func (h *Handler) Me(w http.ResponseWriter, r *http.Request) {
 	}
 
 	response.Write(w, http.StatusOK, meResponse{
-		ID:             profile.ID,
-		Email:          profile.Email,
-		Username:       profile.Username,
-		FullName:       profile.FullName,
-		Status:         profile.Status,
-		Role:           principal.Role,
-		OrganizationID: principal.OrganizationID,
+		ID:              profile.ID,
+		Email:           profile.Email,
+		Username:        profile.Username,
+		FullName:        profile.FullName,
+		Status:          profile.Status,
+		Role:            principal.Role,
+		OrganizationID:  principal.OrganizationID,
+		Scope:           principal.Scope,
+		PlayerProfileID: principal.PlayerProfileID,
 	})
 }
 
@@ -402,13 +404,15 @@ type orgRequiredBody struct {
 }
 
 type meResponse struct {
-	ID             string `json:"id"`
-	Email          string `json:"email"`
-	Username       string `json:"username"`
-	FullName       string `json:"full_name"`
-	Status         string `json:"status"`
-	Role           string `json:"role"`
-	OrganizationID string `json:"organization_id"`
+	ID              string `json:"id"`
+	Email           string `json:"email"`
+	Username        string `json:"username"`
+	FullName        string `json:"full_name"`
+	Status          string `json:"status"`
+	Role            string `json:"role"`
+	OrganizationID  string `json:"organization_id"`
+	Scope           string `json:"scope"`
+	PlayerProfileID string `json:"player_profile_id,omitempty"`
 }
 
 // ---- error mapping ----------------------------------------------------------
@@ -458,6 +462,8 @@ func (h *Handler) writeAuthError(w http.ResponseWriter, r *http.Request, err err
 		response.Error(w, http.StatusUnprocessableEntity, "password exceeds maximum length")
 	case errors.Is(err, ErrOrganizationNotFound):
 		response.Error(w, http.StatusUnprocessableEntity, "organization not found or access denied")
+	case errors.Is(err, ErrScopeNotEntitled):
+		response.Error(w, http.StatusForbidden, "not entitled to requested scope")
 	default:
 		h.log.ErrorContext(r.Context(), "auth.unexpected_error",
 			slog.Any("error", err),
@@ -549,6 +555,8 @@ func errorKind(err error) string {
 		return "password_too_long"
 	case errors.Is(err, ErrOrganizationNotFound):
 		return "organization_not_found"
+	case errors.Is(err, ErrScopeNotEntitled):
+		return "scope_not_entitled"
 	default:
 		return "internal_error"
 	}

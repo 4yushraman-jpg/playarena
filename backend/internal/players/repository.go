@@ -101,6 +101,60 @@ func (r *Repository) GetPrimaryMediaURL(ctx context.Context, playerID, orgID pgt
 	return &fileURL, nil
 }
 
+// ── GP-1: global PlayerProfile (user-owned) ───────────────────────────────────
+
+// GetProfileByUserID returns the caller's canonical (non-archived) profile.
+// Returns ErrPlayerNotFound when the user has no profile.
+func (r *Repository) GetProfileByUserID(ctx context.Context, userID pgtype.UUID) (*db.Player, error) {
+	p, err := r.queries.GetPlayerProfileByUserID(ctx, userID)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, ErrPlayerNotFound
+		}
+		return nil, err
+	}
+	return &p, nil
+}
+
+// GetProfileByID returns a single non-archived profile by id, regardless of org.
+// Visibility filtering is the caller's responsibility.
+func (r *Repository) GetProfileByID(ctx context.Context, id pgtype.UUID) (*db.Player, error) {
+	p, err := r.queries.GetPlayerProfileByID(ctx, id)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, ErrPlayerNotFound
+		}
+		return nil, err
+	}
+	return &p, nil
+}
+
+// CreateGlobalProfile inserts an owner-created, org-less PlayerProfile.
+// A duplicate (the user already has a canonical profile) maps to ErrProfileExists.
+func (r *Repository) CreateGlobalProfile(ctx context.Context, params db.CreateGlobalPlayerProfileParams) (*db.Player, error) {
+	p, err := r.queries.CreateGlobalPlayerProfile(ctx, params)
+	if err != nil {
+		if pgutil.IsUniqueViolation(err, "uq_players_user_id") {
+			return nil, ErrProfileExists
+		}
+		return nil, err
+	}
+	return &p, nil
+}
+
+// UpdateOwnProfile applies an identity-field update bound to the owner.
+// Returns ErrPlayerNotFound when no canonical profile exists for the user.
+func (r *Repository) UpdateOwnProfile(ctx context.Context, params db.UpdateOwnPlayerProfileParams) (*db.Player, error) {
+	p, err := r.queries.UpdateOwnPlayerProfile(ctx, params)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, ErrPlayerNotFound
+		}
+		return nil, err
+	}
+	return &p, nil
+}
+
 // ── transactional writes ──────────────────────────────────────────────────────
 
 type createPlayerTxParams struct {

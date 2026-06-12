@@ -1,8 +1,11 @@
 package organizations_integration_test
 
 import (
+	"context"
 	"net/http"
 	"testing"
+
+	"github.com/4yushraman-jpg/playarena/internal/testutil/fixtures"
 )
 
 // TestOrg_Create_Success verifies that POST /api/v1/organizations with a valid
@@ -32,6 +35,38 @@ func TestOrg_Create_Success(t *testing.T) {
 	if body.Status != "active" {
 		t.Errorf("status: got %q, want %q", body.Status, "active")
 	}
+}
+
+// TestOrg_Create_OnboardingUserCanCreateFirstOrg verifies the zero-org
+// onboarding path: login issues an onboarding token, and that token may create
+// exactly the user's first organization.
+func TestOrg_Create_OnboardingUserCanCreateFirstOrg(t *testing.T) {
+	ts := buildTestServer(t, testPool)
+	ctx := context.Background()
+	user := fixtures.CreateActiveUser(ctx, t, testPool)
+	t.Cleanup(func() { fixtures.CleanupUser(ctx, t, testPool, user.ID) })
+
+	token := loginAs(t, ts, user.Email, fixtures.KnownPasswordRaw, "")
+
+	resp := ts.postWithHeaders(t, "/api/v1/organizations", map[string]any{
+		"name": "First Onboarding Club",
+		"type": "club",
+	}, bearerHeader(token))
+	defer resp.Body.Close()
+	assertStatus(t, resp, http.StatusCreated)
+
+	var body orgResponse
+	decodeBody(t, resp, &body)
+	if body.ID == "" || body.Slug == "" {
+		t.Fatalf("onboarding create: expected id and slug, got %#v", body)
+	}
+
+	second := ts.postWithHeaders(t, "/api/v1/organizations", map[string]any{
+		"name": "Second Onboarding Club",
+		"type": "club",
+	}, bearerHeader(token))
+	defer second.Body.Close()
+	assertStatus(t, second, http.StatusForbidden)
 }
 
 // TestOrg_Create_SlugCollision verifies that two organizations with the same

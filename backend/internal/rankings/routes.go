@@ -30,6 +30,7 @@ func RegisterRoutes(
 
 	r.Route("/api/v1/organizations/{slug}/rankings", func(r chi.Router) {
 		r.Use(auth.RequireAuth(cfg))
+		r.Use(auth.RequireOrgScope())
 		r.Get("/players", h.ListPlayerRankings)
 		r.Get("/teams", h.ListTeamRankings)
 	})

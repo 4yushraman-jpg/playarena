@@ -16,6 +16,7 @@ export interface ApiErrorResponse {
 // ── RBAC ─────────────────────────────────────────────────────────────────────
 
 export type Role =
+  | "onboarding"
   | "platform_admin"
   | "org_owner"
   | "org_admin"
@@ -55,6 +56,7 @@ export type Permission =
 // Permissions granted to each role — mirrors the backend permission matrix exactly.
 // Used for client-side UI gating only; the backend still enforces authorization.
 export const ROLE_PERMISSIONS: Record<Role, Permission[] | ["*"]> = {
+  onboarding: ["organization.create"],
   platform_admin: ["*"],
   org_owner: [
     "organization.update", "organization.delete",

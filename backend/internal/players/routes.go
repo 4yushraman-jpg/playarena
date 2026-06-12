@@ -34,8 +34,9 @@ func RegisterRoutes(
 	h := NewHandler(svc, log)
 
 	r.Route("/api/v1/organizations/{slug}/players", func(r chi.Router) {
-		// All player routes require a valid access token.
+		// All player routes require a valid access token with an org context.
 		r.Use(auth.RequireAuth(cfg))
+		r.Use(auth.RequireOrgScope())
 
 		// Create — requires player.create permission
 		r.With(auth.RequirePermission(authz, "player.create")).

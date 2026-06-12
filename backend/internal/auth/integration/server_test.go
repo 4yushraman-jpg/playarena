@@ -47,7 +47,7 @@ type testServer struct {
 func testConfig() *config.Config {
 	return &config.Config{
 		AppEnv:                 "development",
-		AppBaseURL:             "http://localhost:8080",
+		AppBaseURL:             "http://localhost:3000",
 		DatabaseURL:            "postgres://integration-test:placeholder/playarena_test",
 		JWTSecret:              testJWTSecret,
 		CORSAllowedOrigins:     []string{testAllowedOrigin},

@@ -19,7 +19,7 @@ services:
     restart: unless-stopped
 
   migrations:
-    image: migrate/migrate:v4
+    image: migrate/migrate:v4.18.3
     container_name: playarena-migrations
     depends_on:
       postgres:
@@ -63,8 +63,8 @@ services:
       EMAIL_FROM_NAME: PlayArena
       EMAIL_SMTP_HOST: mailhog
       EMAIL_SMTP_PORT: "1025"
-      APP_BASE_URL: http://localhost:8080
-      WEBHOOK_SECRET_KEY: dev-webhook-key-32bytes-padded===
+      FRONTEND_URL: http://localhost:3000
+      WEBHOOK_SECRET_KEY: Nwqk0x4e2d4i7j3mR1mW4pQvX7fN1mQ0J6o9m4g3s2U=
       STORAGE_BACKEND: local
       STORAGE_LOCAL_PATH: /app/uploads
       STORAGE_LOCAL_BASE_URL: http://localhost:8080/media/files

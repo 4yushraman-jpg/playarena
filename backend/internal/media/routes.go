@@ -41,6 +41,7 @@ func RegisterRoutes(
 
 	r.Route("/api/v1/organizations/{slug}/media", func(r chi.Router) {
 		r.Use(auth.RequireAuth(cfg))
+		r.Use(auth.RequireOrgScope())
 
 		// Upload — requires media.upload
 		r.With(auth.RequirePermission(authz, "media.upload")).

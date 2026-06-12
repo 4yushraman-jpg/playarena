@@ -33,12 +33,16 @@ export function useAuthGuard() {
     if (accessToken && claims) {
       const msUntilExpiry = claims.exp * 1000 - Date.now()
       if (msUntilExpiry > 60_000) {
+        if (!claims.organizationId) {
+          setHydrating(false)
+          return
+        }
         // Resolve org slug if not yet known
         if (!orgSlug) {
           orgsApi
-            .list({ limit: 1 })
+            .list({ limit: 200 })
             .then(({ data }) => {
-              const slug = data.organizations[0]?.slug
+              const slug = data.organizations.find((org) => org.id === claims.organizationId)?.slug
               if (slug) setOrgSlug(slug)
             })
             .catch(() => {})
@@ -57,9 +61,11 @@ export function useAuthGuard() {
       .me()
       .then(() => {
         hydrateClaims()
+        const hydratedClaims = useAuthStore.getState().claims
+        if (!hydratedClaims?.organizationId) return
         if (!orgSlug) {
-          return orgsApi.list({ limit: 1 }).then(({ data }) => {
-            const slug = data.organizations[0]?.slug
+          return orgsApi.list({ limit: 200 }).then(({ data }) => {
+            const slug = data.organizations.find((org) => org.id === hydratedClaims.organizationId)?.slug
             if (slug) setOrgSlug(slug)
           })
         }

@@ -97,6 +97,20 @@ func (r *Repository) GetUserByID(ctx context.Context, userID pgtype.UUID) (*db.U
 	return &user, nil
 }
 
+// GetPlayerProfileID returns the canonical (non-archived) PlayerProfile id for a
+// user, or ("", false, nil) when the user has no profile. Used for GP-1 player
+// persona resolution during login/refresh.
+func (r *Repository) GetPlayerProfileID(ctx context.Context, userID pgtype.UUID) (string, bool, error) {
+	profile, err := r.queries.GetPlayerProfileByUserID(ctx, userID)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	return pgutil.UUIDToString(profile.ID), true, nil
+}
+
 // CreateEmailVerificationToken invalidates all existing unused verification
 // tokens for the user and inserts the new token atomically. The invalidation
 // prevents token accumulation (P2-5): without it, every resend call leaves an

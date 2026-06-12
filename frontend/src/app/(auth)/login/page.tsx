@@ -36,10 +36,15 @@ export default function LoginPage() {
     try {
       const { data } = await authApi.login(values)
       setSession(data)
-      // Fetch the org list to resolve the slug for URL navigation.
-      // JWT is now org-scoped so the list returns exactly one org.
-      const { data: orgs } = await orgsApi.list({ limit: 1 })
-      const slug = orgs.organizations[0]?.slug
+      const claims = useAuthStore.getState().claims
+      if (!claims?.organizationId) {
+        router.push(claims?.role === "onboarding" ? "/onboarding" : "/")
+        return
+      }
+
+      // Resolve the slug for the org id embedded in the token.
+      const { data: orgs } = await orgsApi.list({ limit: 200 })
+      const slug = orgs.organizations.find((org) => org.id === claims.organizationId)?.slug
       if (slug) {
         setOrgSlug(slug)
         router.push(`/${slug}`)

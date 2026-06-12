@@ -25,14 +25,18 @@ const (
 )
 
 // GenerateAccessToken issues a signed HS256 JWT for the given principal.
-// organizationID is empty for platform-level tokens (super-admins).
-func GenerateAccessToken(userID, organizationID, role, email, jwtSecret string) (string, error) {
+// organizationID is empty for platform/player/onboarding tokens.
+// scope is the explicit persona scope (player|organizer|onboarding|platform).
+// playerProfileID is set only for player-scope tokens.
+func GenerateAccessToken(userID, organizationID, role, email, scope, playerProfileID, jwtSecret string) (string, error) {
 	now := time.Now()
 	claims := JWTClaims{
-		UserID:         userID,
-		OrganizationID: organizationID,
-		Role:           role,
-		Email:          email,
+		UserID:          userID,
+		OrganizationID:  organizationID,
+		Role:            role,
+		Email:           email,
+		Scope:           scope,
+		PlayerProfileID: playerProfileID,
 		RegisteredClaims: jwt.RegisteredClaims{
 			Issuer:    jwtIssuer,
 			Subject:   userID,

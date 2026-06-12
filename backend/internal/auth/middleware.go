@@ -45,10 +45,12 @@ func RequireAuth(cfg *config.Config) func(http.Handler) http.Handler {
 			}
 
 			principal := &AuthUser{
-				UserID:         claims.UserID,
-				OrganizationID: claims.OrganizationID,
-				Role:           claims.Role,
-				Email:          claims.Email,
+				UserID:          claims.UserID,
+				OrganizationID:  claims.OrganizationID,
+				Role:            claims.Role,
+				Email:           claims.Email,
+				Scope:           DeriveScope(claims),
+				PlayerProfileID: claims.PlayerProfileID,
 			}
 
 			ctx := context.WithValue(r.Context(), ctxKeyAuthUser, principal)
@@ -63,6 +65,67 @@ func RequireAuth(cfg *config.Config) func(http.Handler) http.Handler {
 func GetAuthUser(ctx context.Context) *AuthUser {
 	u, _ := ctx.Value(ctxKeyAuthUser).(*AuthUser)
 	return u
+}
+
+// ---- Org-scope guard middleware -----------------------------------------------
+
+// RequireOrgScope returns a middleware that admits only org-acting principals
+// into org-scoped route trees.
+//
+// GP-1: only organizer and platform scopes may pass. Platform admins administer
+// all orgs (org services exempt them from tenant ownership checks); organizers
+// act within their own org. Player and onboarding tokens carry an empty
+// OrganizationID — the same shape org services treat as a platform-admin
+// exemption — so they MUST never reach those services. Mount this after
+// RequireAuth on every route tree under /api/v1/organizations/{slug}/.
+func RequireOrgScope() func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			principal := GetAuthUser(r.Context())
+			if principal == nil {
+				response.Error(w, http.StatusUnauthorized, "authorization required")
+				return
+			}
+			if principal.Scope != ScopeOrganizer && principal.Scope != ScopePlatform {
+				response.Error(w, http.StatusForbidden, "insufficient permissions")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// RequireScope returns a middleware that passes only when the authenticated
+// principal's scope is one of the allowed scopes. Returns 401 when unauthenticated
+// and 403 when the scope is not permitted.
+func RequireScope(allowed ...string) func(http.Handler) http.Handler {
+	allowedSet := make(map[string]struct{}, len(allowed))
+	for _, s := range allowed {
+		allowedSet[s] = struct{}{}
+	}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			principal := GetAuthUser(r.Context())
+			if principal == nil {
+				response.Error(w, http.StatusUnauthorized, "authorization required")
+				return
+			}
+			if _, ok := allowedSet[principal.Scope]; !ok {
+				response.Error(w, http.StatusForbidden, "insufficient permissions")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// RequirePlayerScope admits only player-scope principals. Reserved for
+// player-only feature routes. GP-1 self-profile routes use service-layer
+// ownership checks (user_id == actor) rather than scope gating, so that an
+// organizer/onboarding/platform user can still create and view their own
+// profile.
+func RequirePlayerScope() func(http.Handler) http.Handler {
+	return RequireScope(ScopePlayer)
 }
 
 // ---- Role authorization middleware ------------------------------------------
@@ -124,6 +187,24 @@ func RequirePermission(authz *AuthorizationService, permSlug string) func(http.H
 			if principal == nil {
 				response.Error(w, http.StatusUnauthorized, "authorization required")
 				return
+			}
+
+			if permSlug == "organization.create" &&
+				principal.OrganizationID == "" &&
+				principal.Role == OnboardingRole {
+				ok, err := authz.IsZeroOrgUser(r.Context(), principal.UserID)
+				if err != nil {
+					slog.ErrorContext(r.Context(), "auth.require_permission.onboarding_error",
+						slog.Any("error", err),
+						slog.String("request_id", chimw.GetReqID(r.Context())),
+					)
+					response.Error(w, http.StatusInternalServerError, "internal server error")
+					return
+				}
+				if ok {
+					next.ServeHTTP(w, r)
+					return
+				}
 			}
 
 			ok, err := authz.HasPermission(r.Context(), principal.UserID, principal.OrganizationID, permSlug)

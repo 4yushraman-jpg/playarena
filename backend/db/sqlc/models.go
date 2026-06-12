@@ -1170,7 +1170,8 @@ type Permission struct {
 
 // Athletic profile scoped to an organization. Decoupled from users: one user can have multiple player profiles across orgs, and historical/scouted players may have no platform account at all. ON DELETE CASCADE: removing an org removes all its player records. ON DELETE SET NULL on user_id: deleting a user account does not erase the player record.
 type Player struct {
-	ID             pgtype.UUID `json:"id"`
+	ID pgtype.UUID `json:"id"`
+	// Nullable from GP-1. NULL = global, user-owned profile with no origin org. Non-NULL = legacy org-created profile. Ownership semantics removed in a later phase.
 	OrganizationID pgtype.UUID `json:"organization_id"`
 	// Links this player profile to a platform user account. NULL for unregistered or historical players. One user may have N player profiles (different orgs, different sports).
 	UserID pgtype.UUID `json:"user_id"`
@@ -1191,6 +1192,10 @@ type Player struct {
 	Metadata  []byte             `json:"metadata"`
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+	// public | unlisted | private. Default private (privacy-safe). Consumed by global profile reads.
+	Visibility string `json:"visibility"`
+	// Non-NULL marks a non-canonical duplicate identity (legacy multi-org rows for one user). Archived rows are read-only, non-ranking, retained for history. Never merged (no-claim policy).
+	ArchivedAt pgtype.Timestamptz `json:"archived_at"`
 }
 
 // Final standings result for one player in one completed tournament. Snapshotted at tournament completion. Source for all-time player rankings.

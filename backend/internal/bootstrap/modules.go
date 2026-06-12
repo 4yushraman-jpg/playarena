@@ -11,11 +11,11 @@ import (
 	"github.com/4yushraman-jpg/playarena/internal/auth"
 	"github.com/4yushraman-jpg/playarena/internal/email"
 	"github.com/4yushraman-jpg/playarena/internal/health"
-	"github.com/4yushraman-jpg/playarena/internal/members"
 	"github.com/4yushraman-jpg/playarena/internal/match_events"
 	"github.com/4yushraman-jpg/playarena/internal/matches"
 	"github.com/4yushraman-jpg/playarena/internal/media"
 	mediastorage "github.com/4yushraman-jpg/playarena/internal/media/storage"
+	"github.com/4yushraman-jpg/playarena/internal/members"
 	"github.com/4yushraman-jpg/playarena/internal/notifications"
 	"github.com/4yushraman-jpg/playarena/internal/notifworker"
 	"github.com/4yushraman-jpg/playarena/internal/organizations"
@@ -23,9 +23,9 @@ import (
 	"github.com/4yushraman-jpg/playarena/internal/platform/metrics"
 	"github.com/4yushraman-jpg/playarena/internal/platform/middleware"
 	"github.com/4yushraman-jpg/playarena/internal/players"
+	"github.com/4yushraman-jpg/playarena/internal/rankings"
 	"github.com/4yushraman-jpg/playarena/internal/realtime"
 	"github.com/4yushraman-jpg/playarena/internal/teams"
-	"github.com/4yushraman-jpg/playarena/internal/rankings"
 	"github.com/4yushraman-jpg/playarena/internal/tournament_registrations"
 	"github.com/4yushraman-jpg/playarena/internal/tournaments"
 	"github.com/4yushraman-jpg/playarena/internal/users"
@@ -107,6 +107,8 @@ func registerModules(
 		organizations.RegisterRoutes(r, pool, cfg, log, authz)
 		members.RegisterRoutes(r, pool, cfg, log, authz)
 		players.RegisterRoutes(r, pool, cfg, log, authz)
+		// GP-1: global PlayerProfile self-service (flag-gated inside).
+		players.RegisterMeRoutes(r, pool, cfg, log)
 		teams.RegisterRoutes(r, pool, cfg, log, authz)
 		tournaments.RegisterRoutes(r, pool, cfg, log, authz, notifSvc, rankingsRepo)
 		tournament_registrations.RegisterRoutes(r, pool, cfg, log, authz, notifSvc)

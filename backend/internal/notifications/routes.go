@@ -45,6 +45,7 @@ func RegisterRoutes(
 
 		r.Group(func(r chi.Router) {
 			r.Use(auth.RequireAuth(cfg))
+			r.Use(auth.RequireOrgScope())
 
 			// Preferences sub-routes — must be registered before /{id} to avoid
 			// chi routing "preferences" as a UUID param.

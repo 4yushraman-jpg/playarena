@@ -45,6 +45,8 @@ beforeEach(() => {
       email: "user@example.com",
       organizationId: "org-1",
       role: "org_admin",
+      scope: "organizer",
+      playerProfileId: null,
       exp: Math.floor(Date.now() / 1000) + 3600,
     },
     orgSlug: "test-org",

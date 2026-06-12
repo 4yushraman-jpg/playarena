@@ -66,7 +66,7 @@ func TestRegister_VerificationEmailContainsLink(t *testing.T) {
 		t.Fatal("no verification email delivered")
 	}
 	m := msgs[0]
-	const wantPrefix = "http://localhost:8080/verify-email?token="
+	const wantPrefix = "http://localhost:3000/verify-email?token="
 	found := strings.Contains(m.TextBody, wantPrefix) || strings.Contains(m.HTMLBody, wantPrefix)
 	if !found {
 		t.Errorf("verify link not found in email body; text=%q", m.TextBody)
