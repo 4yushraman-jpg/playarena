@@ -4,6 +4,7 @@ export type MatchStatus =
   | "completed"
   | "cancelled"
   | "abandoned"
+  | "walkover"
 
 export interface Match {
   id: string
@@ -73,6 +74,13 @@ export interface UpdateMatchRequest {
   winner_team_id?: string | null
   winner_player_id?: string | null
   notes?: string | null
+}
+
+// Award an administrative win when one side does not appear. The winner string
+// names the present side; the backend resolves it to the concrete participant.
+export interface WalkoverRequest {
+  winner: "home" | "away"
+  reason: string
 }
 
 export interface MatchListParams {

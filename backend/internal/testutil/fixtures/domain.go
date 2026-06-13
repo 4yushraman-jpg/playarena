@@ -373,6 +373,29 @@ func CreateCompletedMatch(ctx context.Context, t testing.TB, pool *pgxpool.Pool,
 	return m
 }
 
+// CreateWalkoverMatch inserts a match and sets it to the walkover terminal
+// state: status='walkover', is_walkover=TRUE, 0-0 forfeit score, and the given
+// winner team. Mirrors the result the SetMatchWalkover query produces, so it can
+// be used to seed standings/inclusion tests without driving the HTTP endpoint.
+func CreateWalkoverMatch(ctx context.Context, t testing.TB, pool *pgxpool.Pool, orgID, tournamentID, homeTeamID, awayTeamID, winnerTeamID pgtype.UUID) db.Match {
+	t.Helper()
+	m := CreateScheduledMatch(ctx, t, pool, orgID, tournamentID, homeTeamID, awayTeamID)
+	if _, err := pool.Exec(ctx, `
+		UPDATE matches
+		SET    status = 'walkover', is_walkover = TRUE,
+		       started_at = NULL, ended_at = NOW(),
+		       home_score = 0, away_score = 0, winner_team_id = $2
+		WHERE  id = $1`,
+		m.ID, winnerTeamID,
+	); err != nil {
+		t.Fatalf("fixtures.CreateWalkoverMatch: %v", err)
+	}
+	m.Status = db.MatchStatusWalkover
+	m.IsWalkover = true
+	m.WinnerTeamID = winnerTeamID
+	return m
+}
+
 // CreateMatchEvent inserts a match event directly via SQL. The sequence number
 // is computed as MAX(sequence_number)+1 for the match, so callers may call this
 // sequentially without a lock (suitable for fixture setup, not concurrency tests).

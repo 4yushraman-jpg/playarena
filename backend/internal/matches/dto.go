@@ -56,6 +56,24 @@ type UpdateRequest struct {
 	Notes          *string `json:"notes"`
 }
 
+// WalkoverRequest is the payload for
+// POST /api/v1/organizations/{slug}/matches/{id}/walkover.
+//
+// A walkover records an administrative win when one side does not appear (or
+// withdraws). It is a distinct, single-purpose operation rather than a generic
+// PATCH so the invariants (winner required, score forced to 0-0, is_walkover
+// flipped, ended_at stamped, reason recorded) stay in one place.
+//
+//   - winner: which present side is awarded the match ("home" or "away"). The
+//     service resolves this to the concrete team/player id from the match row,
+//     so the client never sends a participant UUID.
+//   - reason: required human explanation (e.g. "Away team no-show"). Stored on
+//     the match notes and in the audit trail.
+type WalkoverRequest struct {
+	Winner string `json:"winner" validate:"required,oneof=home away"`
+	Reason string `json:"reason" validate:"required"`
+}
+
 // ── response DTOs ─────────────────────────────────────────────────────────────
 
 // Response is the unified match representation returned by all endpoints.

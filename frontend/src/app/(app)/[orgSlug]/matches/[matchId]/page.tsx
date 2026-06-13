@@ -56,8 +56,11 @@ export default function MatchDetailPage() {
   const homeName = resolve(isTeam ? homeId : null, isTeam ? null : homeId)
   const awayName = resolve(isTeam ? awayId : null, isTeam ? null : awayId)
   const isCompleted = match.status === "completed"
-  const homeWon = isCompleted && winnerId != null && winnerId === homeId
-  const awayWon = isCompleted && winnerId != null && winnerId === awayId
+  const isWalkover = match.status === "walkover"
+  // A walkover concludes the match with a winner but no meaningful score.
+  const isConcluded = isCompleted || isWalkover
+  const homeWon = isConcluded && winnerId != null && winnerId === homeId
+  const awayWon = isConcluded && winnerId != null && winnerId === awayId
   const isDraw = isCompleted && !match.is_walkover && winnerId == null
 
   return (
@@ -88,12 +91,14 @@ export default function MatchDetailPage() {
         )}
       </div>
 
-      {/* Actions (scheduled fixtures only) */}
+      {/* Actions (edit/cancel for scheduled; walkover for scheduled or live) */}
       <MatchActions
         match={match}
         orgSlug={orgSlug}
         canUpdate={canUpdate}
         canDelete={canDelete}
+        homeName={homeName}
+        awayName={awayName}
       />
 
       {/* Scoreboard */}
@@ -106,6 +111,10 @@ export default function MatchDetailPage() {
                 <span className="tabular-nums text-3xl font-bold">
                   {match.home_score} <span className="text-muted-foreground">–</span>{" "}
                   {match.away_score}
+                </span>
+              ) : isWalkover ? (
+                <span className="text-2xl font-bold uppercase tracking-wide text-amber-600 dark:text-amber-400">
+                  W/O
                 </span>
               ) : (
                 <span className="text-sm font-medium uppercase tracking-wide text-muted-foreground">
@@ -158,10 +167,10 @@ export default function MatchDetailPage() {
               label="Venue"
               value={match.venue || "—"}
             />
-            {isCompleted && !isDraw && (winnerId === homeId || winnerId === awayId) && (
+            {isConcluded && !isDraw && (winnerId === homeId || winnerId === awayId) && (
               <DetailRow
                 icon={<TrophyIcon className="size-3.5" />}
-                label="Winner"
+                label={isWalkover ? "Winner (walkover)" : "Winner"}
                 value={winnerId === homeId ? homeName : awayName}
               />
             )}

@@ -178,6 +178,45 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 	response.Write(w, http.StatusOK, m)
 }
 
+// Walkover handles POST /api/v1/organizations/{slug}/matches/{id}/walkover.
+// Awards an administrative win to the present side when its opponent does not
+// appear. Gated on match.update — the same permission as scoring/completion.
+func (h *Handler) Walkover(w http.ResponseWriter, r *http.Request) {
+	slug := chi.URLParam(r, "slug")
+	id := chi.URLParam(r, "id")
+
+	var req WalkoverRequest
+	if err := validator.DecodeJSON(r, &req); err != nil {
+		h.writeDecodeError(w, err)
+		return
+	}
+
+	principal := auth.GetAuthUser(r.Context())
+	if principal == nil {
+		response.Error(w, http.StatusUnauthorized, "authorization required")
+		return
+	}
+
+	m, err := h.svc.Walkover(r.Context(), slug, id, req, principal.UserID, principal.OrganizationID)
+	if err != nil {
+		h.log.WarnContext(r.Context(), "matches.walkover.failed",
+			slog.String("org_slug", slug),
+			slog.String("match_id", id),
+			slog.String("error_kind", errKind(err)),
+			slog.String("request_id", chimw.GetReqID(r.Context())),
+		)
+		h.writeMatchError(w, r, err)
+		return
+	}
+
+	h.log.InfoContext(r.Context(), "matches.walkover.success",
+		slog.String("match_id", m.ID),
+		slog.String("org_slug", slug),
+		slog.String("request_id", chimw.GetReqID(r.Context())),
+	)
+	response.Write(w, http.StatusOK, m)
+}
+
 // GetScore handles GET /api/v1/organizations/{slug}/matches/{id}/score.
 // Derives the current score from the effective event log.  No permission beyond
 // RequireAuth is required — scores are publicly readable by any authenticated
@@ -256,7 +295,9 @@ func (h *Handler) writeMatchError(w http.ResponseWriter, r *http.Request, err er
 	case errors.Is(err, ErrForbidden):
 		response.Error(w, http.StatusForbidden, err.Error())
 	case errors.Is(err, ErrInvalidStatus), errors.Is(err, ErrInvalidTournamentID),
-		errors.Is(err, ErrInvalidTimestamp):
+		errors.Is(err, ErrInvalidTimestamp),
+		errors.Is(err, ErrInvalidWalkoverWinner),
+		errors.Is(err, ErrWalkoverReasonRequired):
 		response.Error(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, ErrTournamentNotOngoing),
 		errors.Is(err, ErrMixedParticipantTypes),
@@ -269,7 +310,8 @@ func (h *Handler) writeMatchError(w http.ResponseWriter, r *http.Request, err er
 		errors.Is(err, ErrWinnerScoreMismatch),
 		errors.Is(err, ErrInvalidStatusTransition),
 		errors.Is(err, ErrMatchNotUpdatable),
-		errors.Is(err, ErrMatchAlreadyCancelled):
+		errors.Is(err, ErrMatchAlreadyCancelled),
+		errors.Is(err, ErrWalkoverNeedsParticipants):
 		response.Error(w, http.StatusUnprocessableEntity, err.Error())
 	default:
 		h.log.ErrorContext(r.Context(), "matches.unexpected_error",
@@ -335,6 +377,12 @@ func errKind(err error) string {
 		return "match_not_updatable"
 	case errors.Is(err, ErrMatchAlreadyCancelled):
 		return "match_already_cancelled"
+	case errors.Is(err, ErrInvalidWalkoverWinner):
+		return "invalid_walkover_winner"
+	case errors.Is(err, ErrWalkoverReasonRequired):
+		return "walkover_reason_required"
+	case errors.Is(err, ErrWalkoverNeedsParticipants):
+		return "walkover_needs_participants"
 	case errors.Is(err, ErrInvalidTimestamp):
 		return "invalid_timestamp"
 	case errors.Is(err, ErrInvalidTournamentID):

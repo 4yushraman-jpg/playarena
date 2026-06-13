@@ -210,6 +210,55 @@ func TestTournament_Standings_EmptyOngoing(t *testing.T) {
 	}
 }
 
+// TestTournament_Standings_IncludesWalkover is the FE-8A regression test for the
+// standings-visibility bug: a walkover is a terminal match with a 0-0 forfeit
+// result and MUST appear in standings as a win/loss, exactly like a scored
+// completion. Before the ListCompletedMatchesByTournament query was widened to
+// status IN ('completed','walkover'), the walkover winner showed zero wins.
+func TestTournament_Standings_IncludesWalkover(t *testing.T) {
+	ts := buildTestServer(t, testPool)
+	actor := setupUserAndOrg(t, ts, "org_owner")
+
+	ctx := context.Background()
+	orgUID := mustUUID(t, actor.orgID)
+	setup := fixtures.CreateOngoingTournamentWithTeams(ctx, t, ts.pool, orgUID)
+	trmtID := pgutil.UUIDToString(setup.Tournament.ID)
+	homeTeamID := pgutil.UUIDToString(setup.HomeTeam.ID)
+	awayTeamID := pgutil.UUIDToString(setup.AwayTeam.ID)
+
+	// Home team awarded the win by walkover.
+	fixtures.CreateWalkoverMatch(ctx, t, ts.pool, orgUID,
+		setup.Tournament.ID, setup.HomeTeam.ID, setup.AwayTeam.ID, setup.HomeTeam.ID)
+
+	resp := ts.get(t, standingsURL(actor.orgSlug, trmtID), bearerHeader(actor.token))
+	defer resp.Body.Close()
+	assertStatus(t, resp, http.StatusOK)
+
+	var got standingsResponse
+	decodeBody(t, resp, &got)
+
+	rows := make(map[string]standingsRowResp, len(got.Standings))
+	for _, r := range got.Standings {
+		rows[r.ParticipantID] = r
+	}
+
+	home, ok := rows[homeTeamID]
+	if !ok {
+		t.Fatalf("home team missing from standings; rows: %+v", got.Standings)
+	}
+	if home.Wins != 1 || home.Played != 1 || home.Points != 3 {
+		t.Errorf("walkover winner standings: wins=%d played=%d points=%d, want 1/1/3 (walkover invisible to standings?)",
+			home.Wins, home.Played, home.Points)
+	}
+	away, ok := rows[awayTeamID]
+	if !ok {
+		t.Fatalf("away team missing from standings; rows: %+v", got.Standings)
+	}
+	if away.Losses != 1 || away.Played != 1 {
+		t.Errorf("walkover loser standings: losses=%d played=%d, want 1/1", away.Losses, away.Played)
+	}
+}
+
 // TestTournament_Get_NotFound verifies GET with a non-existent UUID returns 404.
 func TestTournament_Get_NotFound(t *testing.T) {
 	ts := buildTestServer(t, testPool)

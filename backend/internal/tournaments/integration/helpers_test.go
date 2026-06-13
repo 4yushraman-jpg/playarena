@@ -41,9 +41,20 @@ type tournamentListResponse struct {
 }
 
 type standingsResponse struct {
-	TournamentID string `json:"tournament_id"`
-	Status       string `json:"status"`
-	Format       string `json:"format"`
+	TournamentID string             `json:"tournament_id"`
+	Status       string             `json:"status"`
+	Format       string             `json:"format"`
+	Standings    []standingsRowResp `json:"standings"`
+}
+
+type standingsRowResp struct {
+	Position      int    `json:"position"`
+	ParticipantID string `json:"participant_id"`
+	Played        int    `json:"played"`
+	Wins          int    `json:"wins"`
+	Losses        int    `json:"losses"`
+	Draws         int    `json:"draws"`
+	Points        int    `json:"points"`
 }
 
 type errResp struct {

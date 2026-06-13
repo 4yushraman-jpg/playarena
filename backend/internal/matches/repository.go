@@ -461,6 +461,110 @@ func (r *Repository) CancelWithAudit(ctx context.Context, p cancelMatchTxParams)
 	return tx.Commit(ctx)
 }
 
+type walkoverMatchTxParams struct {
+	id             pgtype.UUID
+	orgID          pgtype.UUID
+	tournamentID   pgtype.UUID
+	winnerTeamID   pgtype.UUID
+	winnerPlayerID pgtype.UUID
+	reason         *string
+	actorID        pgtype.UUID
+	oldData        []byte
+	previousStatus db.MatchStatus
+}
+
+// WalkoverWithAudit atomically awards a walkover, writes an update audit record,
+// and enqueues a match-conclusion outbox entry.
+//
+// A FOR SHARE lock on the tournament row guards against a concurrent tournament
+// cancellation; the tournament must be ongoing. The SetMatchWalkover CAS guard
+// (status = previousStatus) makes concurrent walkover/transition attempts safe:
+// only the first commits; later attempts match 0 rows → ErrMatchNotUpdatable.
+// This is the same race protection used by UpdateWithAudit and CancelWithAudit.
+func (r *Repository) WalkoverWithAudit(ctx context.Context, p walkoverMatchTxParams) (*db.Match, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	qtx := r.queries.WithTx(tx)
+
+	// Lock the tournament row: a walkover advances a match's lifecycle, so the
+	// parent tournament must still be ongoing and must not be racing a cancel.
+	status, err := qtx.LockTournamentForShare(ctx, db.LockTournamentForShareParams{
+		ID:             p.tournamentID,
+		OrganizationID: p.orgID,
+	})
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, ErrTournamentNotFound
+		}
+		return nil, err
+	}
+	if status != db.TournamentStatusOngoing {
+		return nil, ErrTournamentNotOngoing
+	}
+
+	m, err := qtx.SetMatchWalkover(ctx, db.SetMatchWalkoverParams{
+		ID:             p.id,
+		OrganizationID: p.orgID,
+		WinnerTeamID:   p.winnerTeamID,
+		WinnerPlayerID: p.winnerPlayerID,
+		Notes:          p.reason,
+		Status:         p.previousStatus, // CAS guard: $6 = previous_status
+	})
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			// CAS failed: status changed between the service read and this tx.
+			return nil, ErrMatchNotUpdatable
+		}
+		return nil, err
+	}
+
+	newData, err := matchToAuditJSON(&m)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := qtx.CreateAuditLog(ctx, db.CreateAuditLogParams{
+		OrganizationID: m.OrganizationID,
+		UserID:         p.actorID,
+		Action:         db.AuditActionUpdate,
+		EntityType:     "matches",
+		EntityID:       m.ID,
+		OldData:        p.oldData,
+		NewData:        newData,
+	}); err != nil {
+		return nil, err
+	}
+
+	// A walkover is a match conclusion. There is no dedicated walkover event in
+	// the notification enum, so reuse match_completed; the payload carries
+	// is_walkover and the walkover status so consumers can distinguish it.
+	if err := trigger.WriteOutboxEntry(ctx, qtx, trigger.OutboxParams{
+		OrganizationID: m.OrganizationID,
+		EventType:      db.NotificationEventTypeMatchCompleted,
+		ActorID:        p.actorID,
+		EntityType:     "matches",
+		EntityID:       m.ID,
+		Payload: map[string]any{
+			"match_id":        pgutil.UUIDToString(m.ID),
+			"tournament_id":   pgutil.UUIDToString(m.TournamentID),
+			"previous_status": string(p.previousStatus),
+			"new_status":      string(m.Status),
+			"is_walkover":     true,
+		},
+	}); err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 func matchToAuditJSON(m *db.Match) ([]byte, error) {

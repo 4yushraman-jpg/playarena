@@ -76,6 +76,33 @@ WHERE  id              = $1
   AND  status          = $20
 RETURNING *;
 
+-- name: SetMatchWalkover :one
+-- Awards a walkover: a terminal match with a result but no event log.
+-- Sets status='walkover', is_walkover=TRUE, the winner, and a 0-0 forfeit score.
+-- The winner ($3/$4) is resolved by the service to one of the match participants,
+-- satisfying chk_matches_winner_is_team/player_participant and
+-- chk_matches_walkover_has_winner. ended_at is stamped now, guarded by
+-- GREATEST(..., started_at + 1ms) so a live → walkover never violates
+-- chk_matches_ended_after_started; when started_at is NULL (scheduled → walkover)
+-- GREATEST ignores the NULL and returns NOW().
+-- CAS guard: AND status = $6 (previous_status) ensures a concurrent transition
+-- that already moved the match to a terminal state causes this UPDATE to match
+-- 0 rows, returning ErrNoRows → ErrMatchNotUpdatable in the repository.
+UPDATE matches
+SET    status           = 'walkover',
+       is_walkover      = TRUE,
+       winner_team_id   = $3,
+       winner_player_id = $4,
+       home_score       = 0,
+       away_score       = 0,
+       ended_at         = GREATEST(NOW(), started_at + INTERVAL '1 millisecond'),
+       notes            = $5,
+       updated_at       = NOW()
+WHERE  id              = $1
+  AND  organization_id = $2
+  AND  status          = $6
+RETURNING *;
+
 -- name: CancelMatch :one
 -- Soft-cancel: sets status to 'cancelled'. Records are never hard-deleted so
 -- that future match_events and audit_log references remain resolvable.
@@ -135,7 +162,11 @@ WHERE  id              = $1
 FOR    SHARE;
 
 -- name: ListCompletedMatchesByTournament :many
--- Returns all completed matches for a tournament, in creation order.
+-- Returns all matches with a final result for a tournament, in creation order.
+-- This means status IN ('completed','walkover'): a walkover is a terminal match
+-- with a 0-0 forfeit result and is_walkover=TRUE, so it MUST feed standings just
+-- like a scored completion. Omitting walkovers here silently drops forfeit
+-- results from the table (FE-8A standings-corruption bug).
 -- Used exclusively by the standings engine — standing computation MUST NOT
 -- read match_events; it reads only these pre-snapshotted score columns.
 -- Both organization_id and tournament_id are required to enforce multi-tenant
@@ -153,5 +184,5 @@ SELECT id,
 FROM   matches
 WHERE  tournament_id   = sqlc.arg(tournament_id)
   AND  organization_id = sqlc.arg(organization_id)
-  AND  status          = 'completed'
+  AND  status          IN ('completed', 'walkover')
 ORDER  BY created_at ASC;

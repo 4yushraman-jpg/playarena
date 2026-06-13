@@ -35,11 +35,14 @@ var allowedTransitions = map[db.MatchStatus][]db.MatchStatus{
 }
 
 // terminalStatuses is the set of states from which no further transitions
-// are permitted (used by the Update guard check).
+// are permitted (used by the Update/Delete/Walkover guard checks).
+// walkover is terminal: a walkover match cannot be edited, cancelled, or
+// re-walked-over (walkover reversal is intentionally unsupported in FE-8A).
 var terminalStatuses = map[db.MatchStatus]bool{
 	db.MatchStatusCompleted: true,
 	db.MatchStatusCancelled: true,
 	db.MatchStatusAbandoned: true,
+	db.MatchStatusWalkover:  true,
 }
 
 // tournamentLockStatuses is the set of target statuses that require a FOR SHARE
@@ -530,6 +533,118 @@ func (s *Service) GetScore(ctx context.Context, orgSlug, matchID string) (*scori
 	engine := scoring.NewScoreEngine()
 	result := engine.Compute(match, events)
 	return &result, nil
+}
+
+// Walkover awards an administrative win to one side when its opponent does not
+// appear or withdraws. It produces a terminal match (status=walkover,
+// is_walkover=true) with a 0-0 forfeit score and a recorded reason. The win/loss
+// is counted in standings; the is_walkover flag is preserved so a future ranking
+// pass can exclude walkovers from Reputation Points (GP anti-farm).
+//
+// Business rules (in order):
+//  1. BOLA guard: actorOrgID must match the URL org or be empty (platform admin).
+//  2. winner must be "home" or "away"; reason must be non-empty.
+//  3. The match must not already be terminal — only scheduled or live matches
+//     may be walked over (walkover reversal is unsupported).
+//  4. Both participant slots must be assigned (no walkover into a TBD slot).
+//  5. The winner string is resolved server-side to the concrete team/player id.
+//
+// The repository performs the write under a tournament FOR SHARE lock and a CAS
+// guard on the previous status to make concurrent attempts safe.
+func (s *Service) Walkover(
+	ctx context.Context,
+	orgSlug, matchID string,
+	req WalkoverRequest,
+	actorID, actorOrgID string,
+) (*Response, error) {
+	org, err := s.repo.GetOrgBySlug(ctx, orgSlug)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := assertOrgOwnership(actorOrgID, pgutil.UUIDToString(org.ID)); err != nil {
+		return nil, err
+	}
+
+	winner := strings.ToLower(strings.TrimSpace(req.Winner))
+	if winner != "home" && winner != "away" {
+		return nil, ErrInvalidWalkoverWinner
+	}
+	reason := strings.TrimSpace(req.Reason)
+	if reason == "" {
+		return nil, ErrWalkoverReasonRequired
+	}
+
+	mid, err := pgutil.ParseUUID(matchID)
+	if err != nil {
+		return nil, ErrMatchNotFound
+	}
+
+	current, err := s.repo.GetByID(ctx, mid, org.ID)
+	if err != nil {
+		return nil, err
+	}
+
+	if terminalStatuses[current.Status] {
+		return nil, ErrMatchNotUpdatable
+	}
+
+	// Resolve the winner to a concrete participant. Both slots of the match's
+	// format must be present — a walkover cannot be awarded into a TBD bracket
+	// slot whose opponent is not yet known.
+	var winnerTeam, winnerPlayer pgtype.UUID
+	switch {
+	case current.HomeTeamID.Valid || current.AwayTeamID.Valid:
+		if !current.HomeTeamID.Valid || !current.AwayTeamID.Valid {
+			return nil, ErrWalkoverNeedsParticipants
+		}
+		if winner == "home" {
+			winnerTeam = current.HomeTeamID
+		} else {
+			winnerTeam = current.AwayTeamID
+		}
+	case current.HomePlayerID.Valid || current.AwayPlayerID.Valid:
+		if !current.HomePlayerID.Valid || !current.AwayPlayerID.Valid {
+			return nil, ErrWalkoverNeedsParticipants
+		}
+		if winner == "home" {
+			winnerPlayer = current.HomePlayerID
+		} else {
+			winnerPlayer = current.AwayPlayerID
+		}
+	default:
+		return nil, ErrWalkoverNeedsParticipants
+	}
+
+	actorUID, err := pgutil.ParseUUID(actorID)
+	if err != nil {
+		return nil, errors.New("invalid actor user id")
+	}
+
+	oldData, err := json.Marshal(matchToResponse(current))
+	if err != nil {
+		return nil, err
+	}
+
+	updated, err := s.repo.WalkoverWithAudit(ctx, walkoverMatchTxParams{
+		id:             current.ID,
+		orgID:          current.OrganizationID,
+		tournamentID:   current.TournamentID,
+		winnerTeamID:   winnerTeam,
+		winnerPlayerID: winnerPlayer,
+		reason:         &reason,
+		actorID:        actorUID,
+		oldData:        oldData,
+		previousStatus: current.Status,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Synchronous post-commit drain.
+	s.notifSvc.DrainOutbox(ctx, org.ID, s.log)
+
+	return matchToResponse(updated), nil
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────

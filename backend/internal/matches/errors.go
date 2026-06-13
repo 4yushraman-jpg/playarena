@@ -39,6 +39,17 @@ var (
 	ErrMatchNotUpdatable       = errors.New("match is in a terminal status and cannot be updated")
 	ErrMatchAlreadyCancelled   = errors.New("match is already cancelled")
 
+	// Walkover errors.
+	// ErrInvalidWalkoverWinner is returned when the winner field is not
+	// exactly "home" or "away".
+	ErrInvalidWalkoverWinner = errors.New("walkover winner must be \"home\" or \"away\"")
+	// ErrWalkoverReasonRequired is returned when no reason is supplied.
+	ErrWalkoverReasonRequired = errors.New("a reason is required to award a walkover")
+	// ErrWalkoverNeedsParticipants is returned when the match has an unresolved
+	// (TBD/NULL) participant slot — a walkover cannot be awarded into a bracket
+	// slot whose opponent is not yet known.
+	ErrWalkoverNeedsParticipants = errors.New("both participants must be assigned before a walkover can be awarded")
+
 	// Input parsing errors.
 	ErrInvalidTimestamp    = errors.New("timestamps must be in RFC3339 format (e.g. 2025-01-15T10:00:00Z)")
 	ErrInvalidTournamentID = errors.New("invalid tournament_id")

@@ -27,7 +27,11 @@ type matchResponse struct {
 	HomeTeamID     *string `json:"home_team_id"`
 	AwayTeamID     *string `json:"away_team_id"`
 	WinnerTeamID   *string `json:"winner_team_id"`
+	WinnerPlayerID *string `json:"winner_player_id"`
 	IsWalkover     bool    `json:"is_walkover"`
+	HomeScore      int     `json:"home_score"`
+	AwayScore      int     `json:"away_score"`
+	Notes          *string `json:"notes"`
 	ScheduledAt    *string `json:"scheduled_at"`
 	StartedAt      *string `json:"started_at"`
 	EndedAt        *string `json:"ended_at"`
@@ -126,6 +130,10 @@ func matchURL(orgSlug, matchID string) string {
 
 func matchScoreURL(orgSlug, matchID string) string {
 	return fmt.Sprintf("/api/v1/organizations/%s/matches/%s/score", orgSlug, matchID)
+}
+
+func matchWalkoverURL(orgSlug, matchID string) string {
+	return fmt.Sprintf("/api/v1/organizations/%s/matches/%s/walkover", orgSlug, matchID)
 }
 
 func matchEventsURL(orgSlug, matchID string) string {

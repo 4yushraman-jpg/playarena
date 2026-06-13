@@ -21,8 +21,9 @@ import (
 //	GET          /           RequireAuth
 //	GET          /{id}       RequireAuth
 //	GET          /{id}/score RequireAuth
-//	PATCH        /{id}       RequireAuth + RequirePermission("match.update")
-//	DELETE       /{id}       RequireAuth + RequirePermission("match.delete")
+//	PATCH        /{id}          RequireAuth + RequirePermission("match.update")
+//	POST         /{id}/walkover RequireAuth + RequirePermission("match.update")
+//	DELETE       /{id}          RequireAuth + RequirePermission("match.delete")
 func RegisterRoutes(
 	r chi.Router,
 	pool *pgxpool.Pool,
@@ -57,6 +58,10 @@ func RegisterRoutes(
 		// Update (including status transitions) — requires match.update permission
 		r.With(auth.RequirePermission(authz, "match.update")).
 			Patch("/{id}", h.Update)
+
+		// Walkover (award an administrative win) — requires match.update permission
+		r.With(auth.RequirePermission(authz, "match.update")).
+			Post("/{id}/walkover", h.Walkover)
 
 		// Delete (soft-cancel: status → cancelled) — requires match.delete permission
 		r.With(auth.RequirePermission(authz, "match.delete")).

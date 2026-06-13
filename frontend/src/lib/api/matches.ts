@@ -6,6 +6,7 @@ import type {
   MatchListParams,
   CreateMatchRequest,
   UpdateMatchRequest,
+  WalkoverRequest,
   LiveScore,
 } from "@/types/api/matches"
 
@@ -28,6 +29,10 @@ export const matchesApi = {
 
   update: (orgSlug: string, id: string, body: UpdateMatchRequest) =>
     api.patch<Match>(`/api/v1/organizations/${orgSlug}/matches/${id}`, body),
+
+  // Award a walkover: a terminal match with a 0-0 forfeit result and a winner.
+  walkover: (orgSlug: string, id: string, body: WalkoverRequest) =>
+    api.post<Match>(`/api/v1/organizations/${orgSlug}/matches/${id}/walkover`, body),
 
   // Soft-cancel: backend transitions status → cancelled, never hard-deletes.
   delete: (orgSlug: string, id: string) =>

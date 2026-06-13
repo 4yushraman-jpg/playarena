@@ -1,11 +1,40 @@
 # PlayArena — Project State & Handoff Document
 
-**Last Updated:** 2026-06-11  
-**Build status:** `go build ./...` passing, `go vet ./...` clean, `sqlc generate` clean  
-**Migrations applied:** 000001 – 000027  
+**Last Updated:** 2026-06-13  
+**Build status:** backend `go build ./...` / `go vet ./...` / `sqlc generate` clean; frontend `tsc --noEmit` 0 errors, `eslint` 0 warnings, `vitest` **308/308** passing, `next build` clean  
+**Migrations applied:** 000001 – 000028  
 **Go version:** 1.25.6  
 **Database:** PostgreSQL 17  
-**Phases complete:** 1 – 12, Auth Security Hotfix v2, Phase 13A, Phase 13B.1, Phase 13B.2A, Phase 13B.2B-A, Phase 13B.2B-B, Phase 14, Phase 15A, Phase 15A Remediation, Phase 16, Phase 17, Phase 18, Phase 19, Phase 19 Remediation, Phase 20, Phase 20 Remediation, Phase 21, Phase 22, Phase 23A, Phase 23B, Phase 23C, Phase 23D
+**Backend phases complete:** 1 – 12, Auth Security Hotfix v2, 13A, 13B.1, 13B.2A, 13B.2B-A, 13B.2B-B, 14, 15A, 15A Remediation, 16, 17, 18, 19, 19 Remediation, 20, 20 Remediation, 21, 22, 23A, 23B, 23C, 23D, **GP-1** (global PlayerProfile identity foundation — additive; shipped behind `GP_PLAYER_PERSONA_ENABLED=false`)  
+**Frontend phases complete:** FE-1, FE-2, FE-3, FE-4, FE-5, FE-6, **FE-7** (FE-7A + FE-7BA + FE-7BB + FE-7BC — Matches & Live Scoring)  
+**Platform status:** A real Kabaddi tournament can be run end-to-end through PlayArena — create tournament → approve registrations → create fixtures → start → score live (offline-tolerant) → complete with winner → standings refresh → complete tournament — without database access, manual score correction, or developer intervention. (One documented exception: walkover, which needs a backend capability — see §8 Known Open Items.)
+
+---
+
+## Platform Vision & Product Axioms
+
+These are the locked, binding decisions that define the product. They supersede
+any older language elsewhere in this document.
+
+- **Kabaddi-only.** No multi-sport abstraction; ranking key is `player`, never `player × sport`.
+- **Closed ecosystem.** Reputation is earned only from PlayArena activity — no external ratings, imports, seeded reputation, or claim/merge workflows. All players begin equal.
+- **Reputation-first future ranking model.** The forward ranking model is cumulative Reputation Points (not Elo), gated by verified-org / completed / minimum-field "ranked-eligible" tournaments. **Not yet built** (see §8).
+- **One User → one PlayerProfile.** The profile is the canonical, user-owned, global player identity (`players.user_id` unique; created once by its owner).
+- **Players are independent of organizations.** A PlayerProfile may exist with zero orgs and affiliate with many over time. (Org ownership of player rows is being removed across the GP migration; GP-1 already made `players.organization_id` nullable.)
+- **Organizations own teams and tournaments** (and use — do not own — players).
+- **Two personas, one account.** A person may be both a Player and an Organizer; persona is a mode of the active token, not a separate account.
+- **`GP_PLAYER_PERSONA_ENABLED = false`.** The player-persona surface (GP-1 self-profile routes, player home) is shipped behind this flag and is OFF in all runtime behavior.
+
+### Architecture Decisions (cross-cutting, current)
+
+- **Explicit auth scopes.** JWTs carry an explicit `scope` (`player | organizer | onboarding | platform`); `IsPlatformUser()` ⇔ `scope == "platform"` only — an empty `organization_id` is never sufficient for platform admin (closes the player/onboarding empty-org escalation surface). `RequireOrgScope()` guards all org trees; `RequirePlayerScope()` reserved for self routes.
+- **Global PlayerProfile model.** `players` is evolving in place into a global, user-keyed identity (GP-1: `user_id` unique partial index, nullable `organization_id`, `visibility`, archive-not-merge legacy policy). Org coupling is removed last, additively.
+- **Append-only event log scoring.** `match_events` is the immutable source of truth; corrections are new `score_correction` events (never edits/deletes). The score is a pure, recomputable fold over the effective (non-cancelled) log.
+- **Server-authoritative scoring.** `GET /matches/{id}/score` is the authority; the backend re-derives and snapshots the final score under lock at completion and validates the winner against it (`ErrWinnerScoreMismatch`). The TS engine mirrors the Go engine exactly (golden-vector tested) for instant display only.
+- **Offline-first scoring queue.** Every scoring action carries a `client_event_id`, is persisted to `localStorage`, and is delivered by a single-flight FIFO queue — surviving refresh, crash, sleep, and intermittent connectivity.
+- **Reconcile-before-resend (exactly-once).** No backend idempotency exists; the client uses the server event log as a deduplication oracle keyed on `client_event_id` and reconciles before any resend, so an action is recorded exactly once — never lost, never duplicated.
+- **Completion-gate integrity model.** A match can be completed only when it is live, has zero unsynced events, no permanently-failed events, and a settled authoritative score; the winner is derived from that authoritative score. Accidental, partial, or stale-score completion is structurally impossible.
+- **Params-less query-key invalidation pattern.** TanStack partial-match fails when a filter key ends in `undefined`; domains expose params-less roots (`lists`, `registrations`, `eventsRoot`, …) used for all invalidation. Applied to tournaments (FE-6) and matches (FE-7).
 
 ---
 
@@ -21,7 +50,7 @@
 8. [Outstanding Work](#8-outstanding-work)
 9. [Recommended Development Roadmap](#9-recommended-development-roadmap)
 10. [Frontend Application](#10-frontend-application)
-11. [Next Recommended Phase](#11-next-recommended-phase)
+11. [Next Strategic Review Required](#11-next-strategic-review-required)
 
 ---
 
@@ -2499,6 +2528,19 @@ r.Group(func(r chi.Router) {
 - [ ] **News module** — Stub exists; no business logic.
 - [x] **N-way head-to-head resolution** — Implemented in Phase 23D. Full sub-table resolution for all N tied participants now handled by `buildH2HRanks()` in `internal/standings/tiebreakers.go`.
 
+### Known Open Items (product — genuinely unfinished, post-FE-7)
+
+These are open directions, not committed phases. Sequencing is deferred to the strategic review (§11).
+
+- [ ] **Walkover support** — *Requires a backend capability that does not exist.* `matches.is_walkover` is `FALSE` at creation with no `UpdateRequest` field, and the backend rejects completing a 0-0 match with a winner (`ErrWinnerScoreMismatch`) unless `is_walkover` is true. The scorer therefore cannot record an administrative walkover; this needs a backend change (settable `is_walkover` at fixture/registration time) before any frontend work.
+- [ ] **Concurrent-scorer lease (backend)** — FE-7BC ships frontend *awareness* (a warning when the event log contains another account's events). Preventing two authorized scorers from both writing requires a backend scorer-lease/lock; deliberately out of FE-7 scope.
+- [ ] **Player persona activation (GP-2 and beyond)** — GP-1 laid the global-identity foundation behind `GP_PLAYER_PERSONA_ENABLED=false`. Activating the player persona (scope enforcement, self-service profile surface, persona switching, player home) is the GP-2…GP-4 work and is **not started**.
+- [ ] **Reputation / global ranking system** — The closed-ecosystem Reputation-Points ranking model (verified-org / completed / min-field "ranked-eligible" gating, anti-farm shaping) is **design-only** (GP-5). The existing `internal/rankings/` module is the older org-scoped leaderboard, not the global reputation ladder.
+- [ ] **Recruitment / bilateral team rostering** — Invite/accept and apply/approve consent flows for rostering global players (GP-6). Not started.
+- [ ] **Public player profiles** — Shareable, visibility-aware public profile pages. Not started (depends on real match data + the ranking fold).
+- [ ] **Scorer overlay focus containment** — The full-bleed scorer overlay does not `inert` the org chrome behind it (dialogs trap focus correctly); fixing needs FE-7A layout coordination. Minor a11y best-practice gap.
+- [ ] **News module** — `internal/news/` stub exists with only a package declaration (also tracked under "Required for feature completeness").
+
 ### Technical debt
 
 - [ ] **`golang-jwt/jwt/v5` declared `indirect` in `go.mod`.** Running `go mod tidy` will correct this.
@@ -3185,12 +3227,12 @@ Phase 22 implemented the full global rankings system: snapshot-on-completion tha
 
 ## 10. Frontend Application
 
-**Status: FE-1/FE-2/FE-3/FE-4/FE-5/FE-6 complete. FE-6 CLOSED. FE-7 is next.**
-**Last validated:** 2026-06-11
+**Status: FE-1 through FE-7 complete. FE-7 CLOSED (FE-7A + FE-7BA + FE-7BB + FE-7BC).**
+**Last validated:** 2026-06-13
 **Typecheck:** `tsc --noEmit` — 0 errors
 **Lint:** `eslint .` — 0 errors, 0 warnings
-**Tests:** 166/166 passing (`vitest run`) — 22 test files
-**Build:** `next build` — clean, 27 routes (19 dynamic ƒ, 8 static ○)
+**Tests:** 308/308 passing (`vitest run`) — 35 test files
+**Build:** `next build` — clean; includes the full-bleed live scorer route `/[orgSlug]/matches/[matchId]/score`
 
 ---
 
@@ -3445,30 +3487,37 @@ Test infrastructure: Vitest 3, `@testing-library/react` 16, jsdom, `@testing-lib
 
 ---
 
-## 11. Next Recommended Phase
+#### GP-1 — Global PlayerProfile Foundation (frontend, behind flag)
 
-**Phases 1 – 22 are complete.** All four notification delivery channels (in_app, email, webhook, SSE), the full observability stack, and the rankings module are implemented and production-hardened.
+**Status: shipped, additive, OFF by default (`GP_PLAYER_PERSONA_ENABLED=false`).** Adds the scaffolding for the player persona without changing runtime behavior. Frontend pieces: `scope`/`player_profile_id` decoded into the auth store (`selectScope`, `selectPlayerProfileId`); silent refresh sends `scope`; non-org `meKeys`/`playerProfileKeys`; reserved-slug guard; a minimal `app/(player)/me` route group foundation (no player dashboard). No org-scoped behavior changed.
 
-**Phases 23A–D are complete.** All four backend blockers that prevented frontend development are resolved.
+---
 
-**Frontend phases FE-1 through FE-6 are complete.** Tournaments and registration management (both team and individual participant types), lifecycle transitions, standings display, and server-authoritative registration counts are implemented, twice adversarially reviewed, and passing 166 tests. Matches were descoped from FE-6 into FE-7.
+#### FE-7 — Matches & Live Scoring
 
-**Next frontend phase: FE-7 — Matches & Live Scoring**
+**Status: CLOSED.** Delivered in four sub-phases (FE-7A → FE-7BA → FE-7BB → FE-7BC), each adversarially reviewed with all P0/P1 remediated. This completes the organizer's core loop: a real Kabaddi match can be created, scheduled, started, scored live (offline-tolerant), and completed entirely through the UI, with standings refreshing on completion.
 
-Scope:
-- Match list, match detail, match create/edit (RBAC-gated)
-- Match scoring interface + live score view (SSE already invalidates `matchKeys.score`)
-- Match event log (scorer view)
-- Cross-linking player tournament history on player profile (placeholder exists at `PlayerProfilePage` "Teams" card)
-- Early items: individual-tournament registration flow test (P1 test gap from FE-6 closure); invalidate `tournamentKeys.standings` on `match_completed` SSE; apply the params-less `lists()` invalidation-root pattern to `matchKeys` before relying on match invalidations (same latent bug FE-6 fixed for tournaments)
+**FE-7A — Match management.** Match directory (`/[orgSlug]/matches`, URL-driven filters), match detail, fixture creation from approved registrants, fixture scheduling/editing (scheduled-only), and fixture cancellation (soft-cancel). Files: `app/(app)/[orgSlug]/matches/**`, `components/matches/**` (`fixture-form`, `fixture-mapping`, `create-fixture-dialog`, `tournament-fixtures`, `match-actions`), `hooks/use-matches.ts`, `hooks/use-participant-names.ts`, `lib/match-meta.ts`, `lib/match-list-state.ts`. Participant UUIDs resolved to names (no N+1).
 
-Backend APIs available: `/organizations/{slug}/matches`, `/organizations/{slug}/matches/{id}/events`, `/organizations/{slug}/matches/{id}/score`, `/organizations/{slug}/tournaments/{id}/standings`.
+**FE-7BA — Read-only scorer + scoring engine.** Full-bleed scorer route `/[orgSlug]/matches/[matchId]/score` (renders as a fixed overlay — FE-7A layout untouched); read-only scoreboard, append-only event timeline, sync/freshness banner; **pure TS scoring engine** (`lib/scoring/engine.ts`) mirroring the backend Go engine, **golden-vector tested for parity**; defensive parity notice when the local fold diverges from the authoritative `GET /score`. Hooks: `use-match-score`, `use-match-events`, `use-local-score`.
 
-**Candidate backend scope (no recommendation):**
+**FE-7BB — Scoring integrity (offline-first, exactly-once).** `client_event_id` on every action; persistent single-flight FIFO queue (`use-scoring-queue.ts`, pure `queue-reducer`/`reconcile`/`optimistic-score`/`queue-storage`); **reconcile-before-resend** using the server log as a dedup oracle; optimistic display; **undo** (pending → local remove, confirmed → `score_correction`); completion-gate foundations (`completion-gate.ts`). Proven by 31 pure + 8 orchestration tests across offline, duplicate/lost-response, reconnect, refresh, and single-flight scenarios.
 
-1. **News module** (`internal/news/`) — stub exists with only a package declaration; no business logic.
-2. **Redis pub/sub for multi-instance SSE** — Phase 20 Hub is in-process (single binary). Horizontal scaling requires a Redis pub/sub bridge so events published by one instance reach SSE clients on another.
-3. **Integration test coverage gaps** — Organizations, players, teams, matches, match_events, media, users, and tournament_registrations integration packages exist but test coverage depth varies. The new `internal/members/` module has no integration tests yet.
+**FE-7BC — Tournament-grade completion & operations.** Gated **match completion** with winner confirmation (winner derived from the authoritative score; draw → no winner) and **abandon**; **period controls** (`half_started`/`half_ended` + advisory clock with pause/resume); **timeouts** (regular/technical/injury), **penalties**, and player events via a **MoreEventsSheet**; **concurrent-scorer awareness** banner (frontend detection of foreign `recorded_by` — no lease); **standings refresh** on completion (`useCompleteMatch` invalidates `tournamentKeys.standings`/`detail`/`lists` — no SSE change); accessibility pass (aria-live score, ≥56px scoring targets, focus-visible, dialog focus-trap); polished spectator/read-only mode. Components: `complete-match-dialog`, `abandon-dialog`, `more-events-sheet`, `period-controls`, `concurrent-scorer-banner`; hooks `use-match-clock`, `use-complete-match`.
+
+**Tests after FE-7: 308 across 35 files** (FE-7 added 142: engine golden vectors, queue/reconcile integrity, orchestration, completion, match management, scorer components, concurrent/abandon/period/timeout/a11y).
+
+**FE-7 closure carry-overs (none blocking; see §8 Known Open Items):** walkover (backend capability required), concurrent-scorer lease (frontend awareness only today), full focus-`inert` of chrome behind the scorer overlay, advisory clock starts at Half 1 on a freshly-opened mid-match scorer.
+
+---
+
+## 11. Next Strategic Review Required
+
+**Backend phases 1 – 23D, GP-1, and frontend phases FE-1 – FE-7 are complete.** The organizer-facing tournament lifecycle — create → approve → fixtures → start → live score → complete → standings → complete tournament — is fully operational through the UI and production-validated (308 frontend tests; backend suites green).
+
+This is a natural decision point. **Roadmap priorities must be re-evaluated in a dedicated strategic review before starting GP-2 or any subsequent initiative.** GP-2 is *not* automatically next. The review should weigh the open directions in §8 (player persona activation, reputation/ranking system, recruitment, public profiles, walkover/backend gaps, production hardening, news module, multi-instance SSE) against current product goals, and select the highest-value next move explicitly.
+
+No specific next phase is recommended here pending that review.
 
 ---
 

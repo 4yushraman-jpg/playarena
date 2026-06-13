@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest"
-import { screen, within } from "@testing-library/react"
+import { screen, within, waitFor } from "@testing-library/react"
+import userEvent from "@testing-library/user-event"
 import { renderWithProviders, makeTestQueryClient } from "@/test/test-utils"
 import MatchesPage from "../page"
 import MatchDetailPage from "../[matchId]/page"
@@ -33,7 +34,7 @@ vi.mock("@/stores/auth.store", () => ({
 // ── API mocks (fallbacks for any query not pre-seeded) ─────────────────────────
 
 vi.mock("@/lib/api/matches", () => ({
-  matchesApi: { list: vi.fn(), getById: vi.fn(), create: vi.fn(), update: vi.fn(), delete: vi.fn() },
+  matchesApi: { list: vi.fn(), getById: vi.fn(), create: vi.fn(), update: vi.fn(), delete: vi.fn(), walkover: vi.fn() },
 }))
 vi.mock("@/lib/api/teams", () => ({
   teamsApi: { list: vi.fn(), getById: vi.fn(), create: vi.fn(), update: vi.fn(), delete: vi.fn(), listMembers: vi.fn(), addMember: vi.fn(), removeMember: vi.fn() },
@@ -207,5 +208,96 @@ describe("MatchDetailPage", () => {
     await screen.findAllByText(/Raiders/)
     expect(screen.queryByRole("link", { name: /edit fixture/i })).toBeNull()
     expect(screen.queryByRole("button", { name: /cancel fixture/i })).toBeNull()
+  })
+})
+
+// ── Walkover ─────────────────────────────────────────────────────────────────
+
+describe("MatchDetailPage — walkover", () => {
+  function seedDetail(match: Match) {
+    const client = makeTestQueryClient()
+    client.setQueryData(matchKeys.detail("test-org", match.id), match)
+    client.setQueryData(tournamentKeys.detail("test-org", match.tournament_id), makeTournament())
+    client.setQueryData(teamKeys.list("test-org", { limit: 200 }), {
+      teams: TEAMS, total: TEAMS.length, limit: 200, offset: 0,
+    })
+    return renderWithProviders(<MatchDetailPage />, { client })
+  }
+
+  it("offers the walkover action for a scheduled match (with permission)", async () => {
+    seedDetail(makeMatch({ status: "scheduled" }))
+    await screen.findAllByText(/Raiders/)
+    expect(screen.getByRole("button", { name: /award walkover/i })).toBeInTheDocument()
+  })
+
+  it("offers the walkover action for a live match (no-show mid-fixture)", async () => {
+    seedDetail(makeMatch({ status: "live", started_at: "2026-07-01T10:05:00Z" }))
+    await screen.findAllByText(/Raiders/)
+    expect(screen.getByRole("button", { name: /award walkover/i })).toBeInTheDocument()
+  })
+
+  it("hides the walkover action for a viewer", async () => {
+    mockRole = "viewer"
+    seedDetail(makeMatch({ status: "scheduled" }))
+    await screen.findAllByText(/Raiders/)
+    expect(screen.queryByRole("button", { name: /award walkover/i })).toBeNull()
+  })
+
+  it("hides the walkover action once the match is terminal", async () => {
+    seedDetail(makeMatch({ status: "walkover", is_walkover: true, winner_team_id: "tm-raiders" }))
+    await screen.findAllByText(/Raiders/)
+    expect(screen.queryByRole("button", { name: /award walkover/i })).toBeNull()
+  })
+
+  it("renders the walkover result with the winner highlighted (no misleading score)", async () => {
+    seedDetail(makeMatch({ status: "walkover", is_walkover: true, winner_team_id: "tm-raiders" }))
+    await screen.findAllByText(/Raiders/)
+    // The W/O marker stands in for the 0-0 forfeit score.
+    expect(screen.getByText("W/O")).toBeInTheDocument()
+    // Walkover label appears (status badge + scoreboard marker).
+    expect(screen.getAllByText("Walkover").length).toBeGreaterThan(0)
+    expect(screen.getByText("Winner (walkover)")).toBeInTheDocument()
+  })
+
+  it("requires a winner and reason before the walkover can be submitted", async () => {
+    const user = userEvent.setup()
+    seedDetail(makeMatch({ status: "scheduled" }))
+    await screen.findAllByText(/Raiders/)
+
+    await user.click(screen.getByRole("button", { name: /award walkover/i }))
+
+    const dialog = await screen.findByRole("dialog")
+    const submit = within(dialog).getByRole("button", { name: /award walkover/i })
+    // Disabled until a winner + reason are provided.
+    expect(submit).toBeDisabled()
+
+    await user.click(within(dialog).getByRole("button", { name: "Kings" }))
+    expect(submit).toBeDisabled() // winner chosen, still needs a reason
+
+    await user.type(within(dialog).getByLabelText(/reason/i), "Home team no-show")
+    expect(submit).toBeEnabled()
+  })
+
+  it("calls the walkover API with the resolved winner and reason on confirm", async () => {
+    const user = userEvent.setup()
+    vi.mocked(matchesApi.walkover).mockResolvedValue({
+      data: makeMatch({ status: "walkover", is_walkover: true, winner_team_id: "tm-kings" }),
+    } as never)
+
+    seedDetail(makeMatch({ status: "scheduled" }))
+    await screen.findAllByText(/Raiders/)
+    await user.click(screen.getByRole("button", { name: /award walkover/i }))
+
+    const dialog = await screen.findByRole("dialog")
+    await user.click(within(dialog).getByRole("button", { name: "Kings" }))
+    await user.type(within(dialog).getByLabelText(/reason/i), "Home team no-show")
+    await user.click(within(dialog).getByRole("button", { name: /award walkover/i }))
+
+    await waitFor(() => {
+      expect(matchesApi.walkover).toHaveBeenCalledWith("test-org", "m1", {
+        winner: "away",
+        reason: "Home team no-show",
+      })
+    })
   })
 })

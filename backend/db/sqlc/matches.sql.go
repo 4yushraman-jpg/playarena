@@ -246,7 +246,7 @@ SELECT id,
 FROM   matches
 WHERE  tournament_id   = $1
   AND  organization_id = $2
-  AND  status          = 'completed'
+  AND  status          IN ('completed', 'walkover')
 ORDER  BY created_at ASC
 `
 
@@ -268,7 +268,11 @@ type ListCompletedMatchesByTournamentRow struct {
 	AwayScore      int32       `json:"away_score"`
 }
 
-// Returns all completed matches for a tournament, in creation order.
+// Returns all matches with a final result for a tournament, in creation order.
+// This means status IN ('completed','walkover'): a walkover is a terminal match
+// with a 0-0 forfeit result and is_walkover=TRUE, so it MUST feed standings just
+// like a scored completion. Omitting walkovers here silently drops forfeit
+// results from the table (FE-8A standings-corruption bug).
 // Used exclusively by the standings engine — standing computation MUST NOT
 // read match_events; it reads only these pre-snapshotted score columns.
 // Both organization_id and tournament_id are required to enforce multi-tenant
@@ -466,6 +470,82 @@ func (q *Queries) LockTournamentForShare(ctx context.Context, arg LockTournament
 	var status TournamentStatus
 	err := row.Scan(&status)
 	return status, err
+}
+
+const setMatchWalkover = `-- name: SetMatchWalkover :one
+UPDATE matches
+SET    status           = 'walkover',
+       is_walkover      = TRUE,
+       winner_team_id   = $3,
+       winner_player_id = $4,
+       home_score       = 0,
+       away_score       = 0,
+       ended_at         = GREATEST(NOW(), started_at + INTERVAL '1 millisecond'),
+       notes            = $5,
+       updated_at       = NOW()
+WHERE  id              = $1
+  AND  organization_id = $2
+  AND  status          = $6
+RETURNING id, tournament_id, organization_id, round_number, round_name, match_number, home_team_id, away_team_id, home_player_id, away_player_id, venue, scheduled_at, started_at, ended_at, status, winner_team_id, winner_player_id, is_walkover, notes, metadata, created_at, updated_at, home_score, away_score
+`
+
+type SetMatchWalkoverParams struct {
+	ID             pgtype.UUID `json:"id"`
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	WinnerTeamID   pgtype.UUID `json:"winner_team_id"`
+	WinnerPlayerID pgtype.UUID `json:"winner_player_id"`
+	Notes          *string     `json:"notes"`
+	Status         MatchStatus `json:"status"`
+}
+
+// Awards a walkover: a terminal match with a result but no event log.
+// Sets status='walkover', is_walkover=TRUE, the winner, and a 0-0 forfeit score.
+// The winner ($3/$4) is resolved by the service to one of the match participants,
+// satisfying chk_matches_winner_is_team/player_participant and
+// chk_matches_walkover_has_winner. ended_at is stamped now, guarded by
+// GREATEST(..., started_at + 1ms) so a live → walkover never violates
+// chk_matches_ended_after_started; when started_at is NULL (scheduled → walkover)
+// GREATEST ignores the NULL and returns NOW().
+// CAS guard: AND status = $6 (previous_status) ensures a concurrent transition
+// that already moved the match to a terminal state causes this UPDATE to match
+// 0 rows, returning ErrNoRows → ErrMatchNotUpdatable in the repository.
+func (q *Queries) SetMatchWalkover(ctx context.Context, arg SetMatchWalkoverParams) (Match, error) {
+	row := q.db.QueryRow(ctx, setMatchWalkover,
+		arg.ID,
+		arg.OrganizationID,
+		arg.WinnerTeamID,
+		arg.WinnerPlayerID,
+		arg.Notes,
+		arg.Status,
+	)
+	var i Match
+	err := row.Scan(
+		&i.ID,
+		&i.TournamentID,
+		&i.OrganizationID,
+		&i.RoundNumber,
+		&i.RoundName,
+		&i.MatchNumber,
+		&i.HomeTeamID,
+		&i.AwayTeamID,
+		&i.HomePlayerID,
+		&i.AwayPlayerID,
+		&i.Venue,
+		&i.ScheduledAt,
+		&i.StartedAt,
+		&i.EndedAt,
+		&i.Status,
+		&i.WinnerTeamID,
+		&i.WinnerPlayerID,
+		&i.IsWalkover,
+		&i.Notes,
+		&i.Metadata,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.HomeScore,
+		&i.AwayScore,
+	)
+	return i, err
 }
 
 const updateMatch = `-- name: UpdateMatch :one

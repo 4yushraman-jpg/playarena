@@ -82,6 +82,7 @@ export function TournamentFixtures({
               const homeName = resolve(isTeam ? homeId : null, isTeam ? null : homeId)
               const awayName = resolve(isTeam ? awayId : null, isTeam ? null : awayId)
               const showScore = m.status === "completed"
+              const isWalkover = m.status === "walkover"
               return (
                 <li key={m.id}>
                   <Link
@@ -100,6 +101,11 @@ export function TournamentFixtures({
                     {showScore && (
                       <span className="shrink-0 tabular-nums text-sm font-semibold">
                         {formatScore(m.home_score, m.away_score)}
+                      </span>
+                    )}
+                    {isWalkover && (
+                      <span className="shrink-0 text-sm font-semibold text-amber-600 dark:text-amber-400">
+                        W/O
                       </span>
                     )}
                     <StatusBadge status={m.status} />
