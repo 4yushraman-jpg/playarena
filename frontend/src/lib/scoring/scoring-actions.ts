@@ -102,6 +102,37 @@ export function buildAllOut(
 }
 
 /**
+ * Generic non-scoring event (lifecycle, timeout, player-state, administrative).
+ * Carries a client_event_id for exactly-once delivery; contributes 0 to the
+ * score. `attribution` is optional (e.g. a match-level timeout has no team).
+ */
+export function buildGeneric(
+  eventType: MatchEventType,
+  opts: {
+    attribution?: AttributedTo
+    payload?: Record<string, unknown>
+    period?: number | null
+    clockSeconds?: number | null
+  } = {},
+): BuiltAction {
+  const clientEventId = newClientEventId()
+  const part = opts.attribution ? participantField(opts.attribution) : {}
+  const period = opts.period != null ? { period: opts.period } : {}
+  const clock = opts.clockSeconds != null ? { clock_seconds: opts.clockSeconds } : {}
+  return {
+    clientEventId,
+    isScoring: false,
+    body: {
+      event_type: eventType,
+      ...part,
+      ...period,
+      ...clock,
+      payload: { ...(opts.payload ?? {}), client_event_id: clientEventId },
+    },
+  }
+}
+
+/**
  * Score correction — cancels a previously-confirmed event by its SERVER id.
  * Carries its own client_event_id for exactly-once delivery of the correction
  * itself. Not a scoring action (contributes 0); it negates its target.

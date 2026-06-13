@@ -1,10 +1,10 @@
 "use client"
 
-import { useCallback, useMemo } from "react"
+import { useCallback, useMemo, useRef, useState } from "react"
 import { useRouter } from "next/navigation"
 import { useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
-import { SwordsIcon, AlertTriangleIcon } from "lucide-react"
+import { SwordsIcon, AlertTriangleIcon, MoreHorizontalIcon } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { ScorerHeader } from "./scorer-header"
@@ -18,19 +18,28 @@ import { ReadOnlyBanner } from "./read-only-banner"
 import { TeamColumn } from "./team-column"
 import { UndoButton } from "./undo-button"
 import { CompletionGateBar } from "./completion-gate-bar"
+import { CompleteMatchDialog } from "./complete-match-dialog"
+import { AbandonDialog } from "./abandon-dialog"
+import { MoreEventsSheet } from "./more-events-sheet"
+import { PeriodControls } from "./period-controls"
+import { ConcurrentScorerBanner } from "./concurrent-scorer-banner"
 import { useMatch } from "@/hooks/use-matches"
 import { useMatchScore } from "@/hooks/use-match-score"
 import { useMatchEvents } from "@/hooks/use-match-events"
 import { useLocalScore } from "@/hooks/use-local-score"
 import { useScoringQueue } from "@/hooks/use-scoring-queue"
+import { useMatchClock } from "@/hooks/use-match-clock"
+import { useCompleteMatch } from "@/hooks/use-complete-match"
 import { useParticipantNames } from "@/hooks/use-participant-names"
-import { useAuthStore, selectRole } from "@/stores/auth.store"
+import { useAuthStore, selectRole, selectUserId } from "@/stores/auth.store"
 import { hasPermission } from "@/lib/permissions"
 import { matchEventsApi } from "@/lib/api/match-events"
 import { matchKeys } from "@/lib/query-keys"
 import { optimisticScore } from "@/lib/scoring/optimistic-score"
-import { evaluateCompletion } from "@/lib/scoring/completion-gate"
+import { evaluateCompletion, buildCompletionBody } from "@/lib/scoring/completion-gate"
+import { buildGeneric } from "@/lib/scoring/scoring-actions"
 import { formatMatchLabel, matchParticipantIds, matchParticipantType } from "@/lib/match-meta"
+import type { Match } from "@/types/api/matches"
 import type { MatchEvent, CreateMatchEventRequest } from "@/types/api/match-events"
 
 interface LiveScorerProps {
@@ -42,14 +51,16 @@ const EMPTY_EVENTS: MatchEvent[] = []
 const EVENTS_PARAMS = { effective_only: false, limit: 500, offset: 0 }
 
 /**
- * Live scorer. FE-7BA delivered the read-only shell; FE-7BB adds the scoring
- * loop for users with match.score: a persistent, exactly-once event queue with
- * optimistic display, offline tolerance, undo, and the completion gate.
+ * Live scorer. FE-7BA: read-only shell. FE-7BB: exactly-once scoring queue.
+ * FE-7BC: operational completeness — clock/periods, timeouts & player events,
+ * gated completion/abandon with winner confirmation, concurrent-scorer
+ * awareness, standings refresh, and an accessible spectator/read-only mode.
  */
 export function LiveScorer({ orgSlug, matchId }: LiveScorerProps) {
   const router = useRouter()
   const queryClient = useQueryClient()
   const role = useAuthStore(selectRole)
+  const currentUserId = useAuthStore(selectUserId)
   const canScore = hasPermission(role, "match.score")
   const canStart = hasPermission(role, "match.update")
 
@@ -58,13 +69,10 @@ export function LiveScorer({ orgSlug, matchId }: LiveScorerProps) {
   const eventsQuery = useMatchEvents(orgSlug, matchId, !!match)
   const { resolve } = useParticipantNames(orgSlug)
 
-  const serverEvents = useMemo(
-    () => eventsQuery.data?.events ?? EMPTY_EVENTS,
-    [eventsQuery.data],
-  )
+  const serverEvents = useMemo(() => eventsQuery.data?.events ?? EMPTY_EVENTS, [eventsQuery.data])
   const localScore = useLocalScore(match ?? null, match ? serverEvents : null)
+  const clock = useMatchClock(1)
 
-  // Stable I/O for the queue orchestrator.
   const postEvent = useCallback(
     (body: CreateMatchEventRequest) =>
       matchEventsApi.create(orgSlug, matchId, body).then((r) => r.data),
@@ -79,13 +87,8 @@ export function LiveScorer({ orgSlug, matchId }: LiveScorerProps) {
     queryClient.invalidateQueries({ queryKey: matchKeys.score(orgSlug, matchId) })
   }, [queryClient, orgSlug, matchId])
 
-  const queue = useScoringQueue({
-    matchId,
-    serverEvents,
-    postEvent,
-    fetchServerEvents,
-    onServerChanged,
-  })
+  const queue = useScoringQueue({ matchId, serverEvents, postEvent, fetchServerEvents, onServerChanged })
+  const completeMatch = useCompleteMatch(orgSlug, matchId, match?.tournament_id ?? "")
 
   function exit() {
     router.push(`/${orgSlug}/matches/${matchId}`)
@@ -135,15 +138,12 @@ export function LiveScorer({ orgSlug, matchId }: LiveScorerProps) {
   const isScheduled = match.status === "scheduled"
   const liveScoringMode = isLive && canScore
 
-  // ── Score source ────────────────────────────────────────────────────────────
   const authoritative = scoreQuery.data
   let homeScore: number | null
   let awayScore: number | null
   let usingLocalFallback = false
 
   if (liveScoringMode) {
-    // Optimistic fold over server events + un-landed queued actions — instant,
-    // offline-capable, exactly-once (deduped by client_event_id).
     const opt = optimisticScore(match, serverEvents, queue.actions)
     homeScore = opt.home
     awayScore = opt.away
@@ -162,10 +162,11 @@ export function LiveScorer({ orgSlug, matchId }: LiveScorerProps) {
     awayScore = null
   }
 
-  const currentPeriod = serverEvents.reduce<number | null>((max, e) => {
+  const eventMaxPeriod = serverEvents.reduce<number | null>((max, e) => {
     if (e.period == null) return max
     return max == null || e.period > max ? e.period : max
   }, null)
+  const displayPeriod = liveScoringMode ? clock.period : eventMaxPeriod
 
   const parityMismatch =
     !liveScoringMode &&
@@ -174,9 +175,6 @@ export function LiveScorer({ orgSlug, matchId }: LiveScorerProps) {
     !!localScore &&
     (authoritative.home_score !== localScore.home || authoritative.away_score !== localScore.away)
 
-  // Completion may only read a SETTLED authoritative score. While the score
-  // query is refetching (e.g. right after the final confirm), treat it as not
-  // yet loaded so the gate can't derive a winner from a stale score.
   const scoreSettled = !!authoritative && !scoreQuery.isFetching
   const completion = evaluateCompletion({
     status: match.status,
@@ -185,18 +183,22 @@ export function LiveScorer({ orgSlug, matchId }: LiveScorerProps) {
     score: scoreSettled ? authoritative : undefined,
   })
 
-  function onCompletePlaceholder() {
-    // Completion gate foundations only (FE-7BB). The actual completion flow
-    // (winner confirmation + PATCH) lands in FE-7BC.
-    toast.info("Ready to complete — the completion flow arrives in the next update.")
-  }
+  // Frontend scorer-ownership awareness: any event recorded by another account.
+  const othersPresent = serverEvents.some(
+    (e) => e.recorded_by != null && currentUserId != null && e.recorded_by !== currentUserId,
+  )
 
   return (
     <Shell>
       <ScorerHeader
         matchLabel={formatMatchLabel(match)}
         status={match.status}
-        period={currentPeriod}
+        period={displayPeriod}
+        clock={
+          liveScoringMode
+            ? { elapsedSeconds: clock.elapsedSeconds, running: clock.running, onToggle: clock.toggle }
+            : undefined
+        }
         onExit={exit}
       />
 
@@ -214,16 +216,31 @@ export function LiveScorer({ orgSlug, matchId }: LiveScorerProps) {
 
         {liveScoringMode ? (
           <ScoringMode
-            orgSlug={orgSlug}
             isTeam={isTeam}
             homeName={homeName}
             awayName={awayName}
             homeId={homeId}
             awayId={awayId}
-            period={currentPeriod}
+            homeScore={homeScore ?? 0}
+            awayScore={awayScore ?? 0}
+            clockPeriod={clock.period}
+            clockSeconds={clock.elapsedSeconds}
             queue={queue}
             completion={completion}
-            onComplete={onCompletePlaceholder}
+            completeMatch={completeMatch}
+            othersPresent={othersPresent}
+            authoritativeHome={authoritative?.home_score ?? null}
+            authoritativeAway={authoritative?.away_score ?? null}
+            onEndHalf={() => {
+              queue.enqueue(
+                buildGeneric("half_ended", { period: clock.period, clockSeconds: clock.elapsedSeconds }),
+              )
+              clock.endHalf()
+            }}
+            onStartNextHalf={() => {
+              queue.enqueue(buildGeneric("half_started", { period: clock.period + 1 }))
+              clock.startNextHalf()
+            }}
             serverEvents={serverEvents}
             match={match}
             resolveName={resolve}
@@ -243,6 +260,7 @@ export function LiveScorer({ orgSlug, matchId }: LiveScorerProps) {
             parityMismatch={parityMismatch}
             headlineHome={homeScore}
             headlineAway={awayScore}
+            othersPresent={othersPresent && isLive}
             onRefresh={refresh}
           />
         )}
@@ -259,34 +277,94 @@ function ScoringMode({
   awayName,
   homeId,
   awayId,
-  period,
+  homeScore,
+  awayScore,
+  clockPeriod,
+  clockSeconds,
   queue,
   completion,
-  onComplete,
+  completeMatch,
+  othersPresent,
+  authoritativeHome,
+  authoritativeAway,
+  onEndHalf,
+  onStartNextHalf,
   serverEvents,
   match,
   resolveName,
 }: {
-  orgSlug: string
   isTeam: boolean
   homeName: string
   awayName: string
   homeId: string | null
   awayId: string | null
-  period: number | null
+  homeScore: number
+  awayScore: number
+  clockPeriod: number
+  clockSeconds: number
   queue: ReturnType<typeof useScoringQueue>
   completion: ReturnType<typeof evaluateCompletion>
-  onComplete: () => void
+  completeMatch: ReturnType<typeof useCompleteMatch>
+  othersPresent: boolean
+  authoritativeHome: number | null
+  authoritativeAway: number | null
+  onEndHalf: () => void
+  onStartNextHalf: () => void
   serverEvents: MatchEvent[]
-  match: Parameters<typeof matchParticipantIds>[0]
+  match: Match
   resolveName: (teamId: string | null, playerId: string | null) => string
 }) {
+  const [completeOpen, setCompleteOpen] = useState(false)
+  const [abandonOpen, setAbandonOpen] = useState(false)
+  const [moreOpen, setMoreOpen] = useState(false)
+  // Guards a terminal transition from firing twice before isPending re-renders
+  // (defence-in-depth; the backend also rejects a second terminal PATCH).
+  const submittingRef = useRef(false)
+
   const homeAttr = { teamMode: isTeam, participantId: homeId ?? "" }
   const awayAttr = { teamMode: isTeam, participantId: awayId ?? "" }
   const disabled = !homeId || !awayId
+  const canAbandon = queue.unsyncedCount === 0 && !queue.hasFailed
+
+  function confirmComplete() {
+    if (!completion.winner || submittingRef.current) return
+    submittingRef.current = true
+    completeMatch.mutate(buildCompletionBody(isTeam, completion.winner), {
+      onSuccess: () => {
+        setCompleteOpen(false)
+        toast.success("Match completed")
+      },
+      onSettled: () => {
+        submittingRef.current = false
+      },
+    })
+  }
+  function confirmAbandon() {
+    if (submittingRef.current) return
+    submittingRef.current = true
+    completeMatch.mutate(
+      { status: "abandoned" },
+      {
+        onSuccess: () => {
+          setAbandonOpen(false)
+          toast.success("Match abandoned")
+        },
+        onSettled: () => {
+          submittingRef.current = false
+        },
+      },
+    )
+  }
 
   return (
     <>
+      {/* Accessible live announcement of the current score. */}
+      <p className="sr-only" role="status" aria-live="polite">
+        {homeName} {homeScore}, {awayName} {awayScore}
+      </p>
+
+      {othersPresent && <ConcurrentScorerBanner />}
+
       <SyncStatus
         isOnline={queue.isOnline}
         isSyncing={queue.isSyncing}
@@ -299,7 +377,7 @@ function ScoringMode({
           name={homeName}
           opponentName={awayName}
           attribution={homeAttr}
-          period={period}
+          period={clockPeriod}
           disabled={disabled}
           onAction={queue.enqueue}
           align="right"
@@ -308,16 +386,38 @@ function ScoringMode({
           name={awayName}
           opponentName={homeName}
           attribution={awayAttr}
-          period={period}
+          period={clockPeriod}
           disabled={disabled}
           onAction={queue.enqueue}
           align="left"
         />
       </div>
 
-      <UndoButton target={queue.undoTarget} onUndo={queue.undo} />
+      <div className="grid grid-cols-2 gap-2">
+        <UndoButton target={queue.undoTarget} onUndo={queue.undo} />
+        <button
+          type="button"
+          onClick={() => setMoreOpen(true)}
+          className="flex min-h-12 items-center justify-center gap-2 rounded-xl border-2 border-border bg-card px-4 text-sm font-semibold transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          <MoreHorizontalIcon className="size-4" />
+          More
+        </button>
+      </div>
 
-      <CompletionGateBar readiness={completion} onComplete={onComplete} />
+      <PeriodControls
+        period={clockPeriod}
+        disabled={false}
+        onEndHalf={onEndHalf}
+        onStartNextHalf={onStartNextHalf}
+      />
+
+      <CompletionGateBar
+        readiness={completion}
+        canAbandon={canAbandon}
+        onComplete={() => setCompleteOpen(true)}
+        onAbandon={() => setAbandonOpen(true)}
+      />
 
       <section aria-label="Event history" className="space-y-2 pt-2">
         <h2 className="px-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">
@@ -325,11 +425,41 @@ function ScoringMode({
         </h2>
         <ReadOnlyTimeline events={serverEvents} match={match} resolveName={resolveName} />
       </section>
+
+      <MoreEventsSheet
+        open={moreOpen}
+        onOpenChange={setMoreOpen}
+        isTeam={isTeam}
+        homeName={homeName}
+        awayName={awayName}
+        homeId={homeId}
+        awayId={awayId}
+        period={clockPeriod}
+        clockSeconds={clockSeconds}
+        onEnqueue={queue.enqueue}
+      />
+      <CompleteMatchDialog
+        open={completeOpen}
+        onOpenChange={setCompleteOpen}
+        homeName={homeName}
+        awayName={awayName}
+        homeScore={authoritativeHome ?? homeScore}
+        awayScore={authoritativeAway ?? awayScore}
+        winner={completion.winner}
+        isPending={completeMatch.isPending}
+        onConfirm={confirmComplete}
+      />
+      <AbandonDialog
+        open={abandonOpen}
+        onOpenChange={setAbandonOpen}
+        isPending={completeMatch.isPending}
+        onConfirm={confirmAbandon}
+      />
     </>
   )
 }
 
-// ── Read-only mode (FE-7BA behaviour, preserved) ────────────────────────────
+// ── Read-only / spectator mode (FE-7BA behaviour, preserved + polished) ──────
 
 function ReadOnlyMode({
   match,
@@ -345,9 +475,10 @@ function ReadOnlyMode({
   parityMismatch,
   headlineHome,
   headlineAway,
+  othersPresent,
   onRefresh,
 }: {
-  match: { status: string; scheduled_at: string | null } & Parameters<typeof matchParticipantIds>[0]
+  match: Match
   isScheduled: boolean
   canStart: boolean
   orgSlug: string
@@ -360,11 +491,14 @@ function ReadOnlyMode({
   parityMismatch: boolean
   headlineHome: number | null
   headlineAway: number | null
+  othersPresent: boolean
   onRefresh: () => void
 }) {
   return (
     <>
-      <ReadOnlyBanner status={match.status as never} />
+      <ReadOnlyBanner status={match.status} />
+
+      {othersPresent && <ConcurrentScorerBanner />}
 
       {!isScheduled && (
         <SyncBanner
@@ -377,8 +511,7 @@ function ReadOnlyMode({
 
       {usingLocalFallback && (
         <p className="px-1 text-xs text-muted-foreground" role="status">
-          Showing the score computed locally from the event log while the server
-          score syncs.
+          Showing the score computed locally from the event log while the server score syncs.
         </p>
       )}
 
@@ -389,8 +522,8 @@ function ReadOnlyMode({
         >
           <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0" />
           <span>
-            Reconciling the displayed score with the event log. The server score
-            ({headlineHome}–{headlineAway}) is authoritative.
+            Reconciling the displayed score with the event log. The server score (
+            {headlineHome}–{headlineAway}) is authoritative.
           </span>
         </div>
       )}
@@ -436,8 +569,6 @@ function ReadOnlyMode({
 // Full-bleed fixed overlay (covers the org shell without modifying FE-7A).
 function Shell({ children }: { children: React.ReactNode }) {
   return (
-    <div className="fixed inset-0 z-50 flex flex-col bg-background text-foreground">
-      {children}
-    </div>
+    <div className="fixed inset-0 z-50 flex flex-col bg-background text-foreground">{children}</div>
   )
 }

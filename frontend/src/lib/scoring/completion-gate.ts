@@ -1,4 +1,4 @@
-import type { LiveScore, MatchStatus } from "@/types/api/matches"
+import type { LiveScore, MatchStatus, UpdateMatchRequest } from "@/types/api/matches"
 
 /**
  * Completion-gate foundations. The integrity rule for ending a match: a result
@@ -61,4 +61,22 @@ function computeWinner(score: LiveScore): CompletionWinner {
     return { side: "away", participantId: score.away_team_id ?? score.away_player_id ?? undefined }
   }
   return { side: "draw" }
+}
+
+/**
+ * Builds the PATCH body for completing a match. The winner MUST agree with the
+ * authoritative score or the backend rejects it (ErrWinnerScoreMismatch):
+ *   - a decided match sets the winning participant's team/player id;
+ *   - a draw sets NO winner.
+ */
+export function buildCompletionBody(
+  isTeam: boolean,
+  winner: CompletionWinner,
+): UpdateMatchRequest {
+  if (winner.side === "draw" || !winner.participantId) {
+    return { status: "completed" }
+  }
+  return isTeam
+    ? { status: "completed", winner_team_id: winner.participantId }
+    : { status: "completed", winner_player_id: winner.participantId }
 }

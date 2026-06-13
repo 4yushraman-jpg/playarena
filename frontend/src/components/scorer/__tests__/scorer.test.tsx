@@ -1,9 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from "vitest"
-import { screen, within, fireEvent } from "@testing-library/react"
+import { screen, within, fireEvent, waitFor } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { renderWithProviders, makeTestQueryClient } from "@/test/test-utils"
 import { LiveScorer } from "@/components/scorer/live-scorer"
-import { matchKeys, teamKeys } from "@/lib/query-keys"
+import { matchKeys, teamKeys, tournamentKeys } from "@/lib/query-keys"
 import type { Match, MatchStatus, LiveScore } from "@/types/api/matches"
 import type { MatchEvent, MatchEventType } from "@/types/api/match-events"
 import type { Team } from "@/types/api/teams"
@@ -351,6 +351,139 @@ describe("LiveScorer — live scoring", () => {
     await screen.findByRole("button", { name: /end and complete match/i })
     expect(screen.getByRole("button", { name: /end and complete match/i })).toBeDisabled()
     expect(screen.getByText(/Loading the authoritative score/i)).toBeInTheDocument()
+  })
+})
+
+// ── FE-7BC match operations ──────────────────────────────────────────────────
+
+describe("LiveScorer — completion", () => {
+  it("completes with the winner derived from the authoritative score and refreshes standings", async () => {
+    mockRole = "org_owner"
+    vi.mocked(matchesApi.update).mockResolvedValue({
+      data: makeMatch({ status: "completed", winner_team_id: "tm-raiders", home_score: 31, away_score: 28 }),
+    } as never)
+    const utils = seedScorer({
+      match: makeMatch({ status: "live" }),
+      score: makeScore(31, 28, "live"),
+      events: [],
+    })
+    const invalidateSpy = vi.spyOn(utils.client, "invalidateQueries")
+
+    const endBtn = await screen.findByRole("button", { name: /end and complete match/i })
+    await waitFor(() => expect(endBtn).toBeEnabled())
+    await userEvent.click(endBtn)
+
+    await screen.findByText(/Raiders win 31/i)
+    await userEvent.click(screen.getByRole("button", { name: /^complete match$/i }))
+
+    expect(matchesApi.update).toHaveBeenCalledWith("test-org", "m1", {
+      status: "completed",
+      winner_team_id: "tm-raiders",
+    })
+    await waitFor(() =>
+      expect(invalidateSpy).toHaveBeenCalledWith({
+        queryKey: tournamentKeys.standings("test-org", "tour1"),
+      }),
+    )
+  })
+
+  it("guards against double completion — the terminal action fires once", async () => {
+    mockRole = "org_owner"
+    vi.mocked(matchesApi.update).mockResolvedValue({
+      data: makeMatch({ status: "completed", winner_team_id: "tm-raiders", home_score: 5, away_score: 2 }),
+    } as never)
+    seedScorer({ match: makeMatch({ status: "live" }), score: makeScore(5, 2, "live"), events: [] })
+    const endBtn = await screen.findByRole("button", { name: /end and complete match/i })
+    await waitFor(() => expect(endBtn).toBeEnabled())
+    await userEvent.click(endBtn)
+    const confirm = await screen.findByRole("button", { name: /^complete match$/i })
+    fireEvent.click(confirm)
+    fireEvent.click(confirm)
+    await waitFor(() => expect(matchesApi.update).toHaveBeenCalledTimes(1))
+  })
+
+  it("abandons a match (no winner) via the gated abandon flow", async () => {
+    mockRole = "org_owner"
+    vi.mocked(matchesApi.update).mockResolvedValue({
+      data: makeMatch({ status: "abandoned" }),
+    } as never)
+    seedScorer({ match: makeMatch({ status: "live" }), score: makeScore(0, 0, "live"), events: [] })
+
+    await userEvent.click(await screen.findByRole("button", { name: /^abandon match$/i }))
+    const dialogConfirm = screen.getAllByRole("button", { name: /abandon match/i }).at(-1)!
+    await userEvent.click(dialogConfirm)
+
+    expect(matchesApi.update).toHaveBeenCalledWith("test-org", "m1", { status: "abandoned" })
+  })
+})
+
+describe("LiveScorer — periods & more events", () => {
+  it("emits a half_started event on starting the next half", async () => {
+    mockRole = "org_owner"
+    seedScorer({ match: makeMatch({ status: "live" }), score: makeScore(0, 0, "live"), events: [] })
+    await userEvent.click(await screen.findByRole("button", { name: /start half 2/i }))
+    await waitFor(() =>
+      expect(matchEventsApi.create).toHaveBeenCalledWith(
+        "test-org",
+        "m1",
+        expect.objectContaining({ event_type: "half_started" }),
+      ),
+    )
+  })
+
+  it("records a timeout from the More sheet", async () => {
+    mockRole = "org_owner"
+    seedScorer({ match: makeMatch({ status: "live" }), score: makeScore(0, 0, "live"), events: [] })
+    await userEvent.click(await screen.findByRole("button", { name: /^more$/i }))
+    await userEvent.click(await screen.findByRole("button", { name: /^timeout$/i }))
+    await waitFor(() =>
+      expect(matchEventsApi.create).toHaveBeenCalledWith(
+        "test-org",
+        "m1",
+        expect.objectContaining({ event_type: "timeout_called" }),
+      ),
+    )
+  })
+
+  it("records a penalty to a chosen side from the More sheet", async () => {
+    mockRole = "org_owner"
+    seedScorer({ match: makeMatch({ status: "live" }), score: makeScore(0, 0, "live"), events: [] })
+    await userEvent.click(await screen.findByRole("button", { name: /^more$/i }))
+    await userEvent.click(await screen.findByRole("button", { name: /award Raiders/i }))
+    await waitFor(() =>
+      expect(matchEventsApi.create).toHaveBeenCalledWith(
+        "test-org",
+        "m1",
+        expect.objectContaining({ event_type: "penalty_awarded", team_id: "tm-raiders" }),
+      ),
+    )
+  })
+})
+
+describe("LiveScorer — accessibility", () => {
+  it("announces the score via a polite live region in scoring mode", async () => {
+    mockRole = "org_owner"
+    seedScorer({
+      match: makeMatch({ status: "live" }),
+      score: makeScore(2, 0, "live"),
+      events: [ev("raid_successful", { team_id: "tm-raiders", payload: { points: 2 } })],
+    })
+    const live = await screen.findByText("Raiders 2, Kings 0")
+    expect(live).toHaveAttribute("aria-live", "polite")
+  })
+})
+
+describe("LiveScorer — concurrent scorer awareness", () => {
+  it("warns when the event log contains events from another account", async () => {
+    mockRole = "org_owner"
+    seedScorer({
+      match: makeMatch({ status: "live" }),
+      score: makeScore(2, 0, "live"),
+      events: [
+        { ...ev("raid_successful", { team_id: "tm-raiders", payload: { points: 2 } }), recorded_by: "other-scorer" },
+      ],
+    })
+    await screen.findByText(/Another scorer is recording this match/i)
   })
 })
 
