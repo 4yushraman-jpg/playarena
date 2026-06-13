@@ -80,4 +80,5 @@ export interface MatchListParams {
   offset?: number
   tournament_id?: string
   status?: MatchStatus
+  search?: string
 }

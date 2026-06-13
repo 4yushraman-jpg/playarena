@@ -20,6 +20,7 @@ import { PageHeader } from "@/components/ui/page-header"
 import { TournamentActions } from "@/components/tournaments/tournament-actions"
 import { TournamentTimeline } from "@/components/tournaments/tournament-timeline"
 import { RegisterParticipantDialog } from "@/components/tournaments/register-participant-dialog"
+import { TournamentFixtures } from "@/components/matches/tournament-fixtures"
 import { useTournament, useTournamentStandings } from "@/hooks/use-tournaments"
 import { useAuthStore, selectRole } from "@/stores/auth.store"
 import { hasPermission } from "@/lib/permissions"
@@ -36,6 +37,7 @@ export default function TournamentDetailPage() {
   const role = useAuthStore(selectRole)
   const canUpdate = hasPermission(role, "tournament.update")
   const canDelete = hasPermission(role, "tournament.delete")
+  const canCreateMatch = hasPermission(role, "match.create")
 
   const [registerOpen, setRegisterOpen] = useState(false)
 
@@ -161,6 +163,15 @@ export default function TournamentDetailPage() {
           {/* Standings — live for ongoing, final for completed */}
           {showStandings && (
             <StandingsCard orgSlug={orgSlug} tournamentId={id} tournament={tournament} />
+          )}
+
+          {/* Fixtures — schedule and manage matches once the tournament is underway */}
+          {showStandings && (
+            <TournamentFixtures
+              orgSlug={orgSlug}
+              tournament={tournament}
+              canCreate={canCreateMatch}
+            />
           )}
 
           {/* Registration window */}

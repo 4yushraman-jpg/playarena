@@ -99,8 +99,11 @@ export const tournamentKeys = {
 
 export const matchKeys = {
   all: (orgSlug: string) => ["matches", orgSlug] as const,
+  /** Root for every match list query — use for invalidation (avoids the
+   *  trailing-`undefined` partial-match trap documented on tournamentKeys). */
+  lists: (orgSlug: string) => [...matchKeys.all(orgSlug), "list"] as const,
   list: (orgSlug: string, params?: MatchListParams) =>
-    [...matchKeys.all(orgSlug), "list", params] as const,
+    [...matchKeys.lists(orgSlug), params ?? {}] as const,
   detail: (orgSlug: string, id: string) =>
     [...matchKeys.all(orgSlug), id] as const,
   score: (orgSlug: string, id: string) =>
