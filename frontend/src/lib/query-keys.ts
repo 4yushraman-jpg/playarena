@@ -108,8 +108,11 @@ export const matchKeys = {
     [...matchKeys.all(orgSlug), id] as const,
   score: (orgSlug: string, id: string) =>
     [...matchKeys.detail(orgSlug, id), "score"] as const,
+  /** Params-less root for every event query of a match — use for invalidation. */
+  eventsRoot: (orgSlug: string, matchId: string) =>
+    [...matchKeys.detail(orgSlug, matchId), "events"] as const,
   events: (orgSlug: string, matchId: string, params?: MatchEventListParams) =>
-    [...matchKeys.detail(orgSlug, matchId), "events", params] as const,
+    [...matchKeys.eventsRoot(orgSlug, matchId), params] as const,
   event: (orgSlug: string, matchId: string, eventId: string) =>
     [...matchKeys.detail(orgSlug, matchId), "events", eventId] as const,
 }

@@ -6,6 +6,7 @@ import type {
   MatchListParams,
   CreateMatchRequest,
   UpdateMatchRequest,
+  LiveScore,
 } from "@/types/api/matches"
 
 interface MatchListResponse {
@@ -31,4 +32,9 @@ export const matchesApi = {
   // Soft-cancel: backend transitions status → cancelled, never hard-deletes.
   delete: (orgSlug: string, id: string) =>
     api.delete(`/api/v1/organizations/${orgSlug}/matches/${id}`),
+
+  // Authoritative score, derived server-side from the effective event log.
+  // Never stored; always recomputable. Read-only.
+  getScore: (orgSlug: string, id: string) =>
+    api.get<LiveScore>(`/api/v1/organizations/${orgSlug}/matches/${id}/score`),
 }
