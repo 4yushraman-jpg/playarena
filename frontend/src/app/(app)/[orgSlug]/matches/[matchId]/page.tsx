@@ -2,7 +2,7 @@
 
 import Link from "next/link"
 import { useParams } from "next/navigation"
-import { SwordsIcon, CalendarIcon, MapPinIcon, TrophyIcon, InfoIcon } from "lucide-react"
+import { SwordsIcon, CalendarIcon, MapPinIcon, TrophyIcon, InfoIcon, ArrowRightIcon } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { StatusBadge } from "@/components/ui/status-badge"
@@ -90,6 +90,11 @@ export default function MatchDetailPage() {
           </>
         )}
       </div>
+
+      {/* Bracket linkage: where this match's winner advances (read-only) */}
+      {match.next_match_id && (
+        <BracketAdvancesTo orgSlug={orgSlug} nextMatchId={match.next_match_id} />
+      )}
 
       {/* Actions (edit/cancel for scheduled; walkover for scheduled or live) */}
       <MatchActions
@@ -187,6 +192,25 @@ export default function MatchDetailPage() {
 }
 
 // ── Sub-components ────────────────────────────────────────────────────────────
+
+/**
+ * Read-only bracket-progression indicator: shows where this match's winner
+ * advances. Resolves the successor's round/match label so organizers can see the
+ * bracket wiring without a full bracket tree (FE-8B).
+ */
+function BracketAdvancesTo({ orgSlug, nextMatchId }: { orgSlug: string; nextMatchId: string }) {
+  const { data: next } = useMatch(orgSlug, nextMatchId)
+  const label = next ? formatMatchLabel(next) : "next match"
+  return (
+    <Link
+      href={`/${orgSlug}/matches/${nextMatchId}`}
+      className="inline-flex items-center gap-1.5 rounded-md border border-border bg-muted/40 px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+    >
+      <ArrowRightIcon className="size-3.5" />
+      Winner advances to {label}
+    </Link>
+  )
+}
 
 function ParticipantSide({
   name,

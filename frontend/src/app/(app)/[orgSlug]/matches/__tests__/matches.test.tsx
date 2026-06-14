@@ -76,6 +76,9 @@ function makeMatch(overrides: Partial<Match> = {}): Match {
     home_score: 0,
     away_score: 0,
     notes: null,
+    next_match_id: null,
+    next_match_slot: null,
+    group_label: null,
     created_at: "2026-06-01T00:00:00Z",
     updated_at: "2026-06-01T00:00:00Z",
     ...overrides,
@@ -299,5 +302,56 @@ describe("MatchDetailPage — walkover", () => {
         reason: "Home team no-show",
       })
     })
+  })
+})
+
+// ── Bracket linkage (FE-8B) ───────────────────────────────────────────────────
+
+describe("MatchDetailPage — bracket linkage", () => {
+  function seedDetail(match: Match, extra?: (c: ReturnType<typeof makeTestQueryClient>) => void) {
+    const client = makeTestQueryClient()
+    client.setQueryData(matchKeys.detail("test-org", match.id), match)
+    client.setQueryData(tournamentKeys.detail("test-org", match.tournament_id), makeTournament())
+    client.setQueryData(teamKeys.list("test-org", { limit: 200 }), {
+      teams: TEAMS, total: TEAMS.length, limit: 200, offset: 0,
+    })
+    extra?.(client)
+    return renderWithProviders(<MatchDetailPage />, { client })
+  }
+
+  it("renders TBD for an unresolved (bracket) participant slot", async () => {
+    // A TBD downstream slot: no participants assigned yet.
+    seedDetail(
+      makeMatch({ id: "m1", home_team_id: null, away_team_id: null, round_name: "Final" }),
+    )
+    // Both sides resolve to the TBD placeholder.
+    await waitFor(() => expect(screen.getAllByText("TBD").length).toBeGreaterThanOrEqual(2))
+  })
+
+  it("shows where the winner advances when the match is bracket-linked", async () => {
+    mockMatchId = "m1"
+    const successor = makeMatch({
+      id: "m2",
+      round_name: "Final",
+      home_team_id: null,
+      away_team_id: null,
+    })
+    seedDetail(
+      makeMatch({ id: "m1", round_name: "Semi Final", next_match_id: "m2", next_match_slot: 1 }),
+      (client) => {
+        // Seed the successor so its round label resolves in the link.
+        client.setQueryData(matchKeys.detail("test-org", "m2"), successor)
+      },
+    )
+
+    const link = await screen.findByRole("link", { name: /winner advances to/i })
+    expect(link).toHaveAttribute("href", "/test-org/matches/m2")
+    expect(link).toHaveTextContent(/Final/)
+  })
+
+  it("shows no advances-to link for an unlinked match (e.g. a final)", async () => {
+    seedDetail(makeMatch({ id: "m1", next_match_id: null, round_name: "Final" }))
+    await screen.findAllByText(/Raiders/)
+    expect(screen.queryByRole("link", { name: /winner advances to/i })).toBeNull()
   })
 })

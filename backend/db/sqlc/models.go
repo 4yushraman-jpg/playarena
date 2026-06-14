@@ -1009,6 +1009,12 @@ type Match struct {
 	HomeScore int32 `json:"home_score"`
 	// Final away participant score. See home_score for the full contract.
 	AwayScore int32 `json:"away_score"`
+	// Bracket edge: the match this fixture's winner advances to. NULL for finals, round-robin, league, and group-stage matches. ON DELETE SET NULL — a hard tournament delete cascades; matches are otherwise soft-cancelled, never deleted.
+	NextMatchID pgtype.UUID `json:"next_match_id"`
+	// Which slot of next_match_id this winner fills: 1 = home, 2 = away. The slot is fixed per feeder so propagation writes exactly one deterministic slot — this is what makes winner propagation idempotent and double-write-safe.
+	NextMatchSlot *int16 `json:"next_match_slot"`
+	// Group identifier (e.g. "A", "B") for group_knockout group-stage matches. Reserved for the FE-8C group_knockout path; no resolution logic in FE-8B.
+	GroupLabel *string `json:"group_label"`
 }
 
 // Append-only immutable event log. The single source of truth for all in-match data. Every point, player state change, and lifecycle transition is a row here. No UPDATE or DELETE is ever performed. score_correction events invalidate prior events via cancels_event_id without mutating them. All statistics (team scores, player raid counts, tackle rates) must be derived from this table — never stored redundantly in other tables.

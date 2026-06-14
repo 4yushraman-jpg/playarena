@@ -18,7 +18,7 @@ SET    status     = 'cancelled',
 WHERE  id              = $1
   AND  organization_id = $2
   AND  status          = $3
-RETURNING id, tournament_id, organization_id, round_number, round_name, match_number, home_team_id, away_team_id, home_player_id, away_player_id, venue, scheduled_at, started_at, ended_at, status, winner_team_id, winner_player_id, is_walkover, notes, metadata, created_at, updated_at, home_score, away_score
+RETURNING id, tournament_id, organization_id, round_number, round_name, match_number, home_team_id, away_team_id, home_player_id, away_player_id, venue, scheduled_at, started_at, ended_at, status, winner_team_id, winner_player_id, is_walkover, notes, metadata, created_at, updated_at, home_score, away_score, next_match_id, next_match_slot, group_label
 `
 
 type CancelMatchParams struct {
@@ -60,6 +60,9 @@ func (q *Queries) CancelMatch(ctx context.Context, arg CancelMatchParams) (Match
 		&i.UpdatedAt,
 		&i.HomeScore,
 		&i.AwayScore,
+		&i.NextMatchID,
+		&i.NextMatchSlot,
+		&i.GroupLabel,
 	)
 	return i, err
 }
@@ -98,6 +101,41 @@ func (q *Queries) CountMatches(ctx context.Context, arg CountMatchesParams) (int
 	return count, err
 }
 
+const countMatchesFeedingSlot = `-- name: CountMatchesFeedingSlot :one
+SELECT COUNT(*)
+FROM   matches
+WHERE  next_match_id    = $1
+  AND  next_match_slot  = $2
+  AND  organization_id  = $3
+  -- $4 is the match being linked, excluded so a re-link of the SAME match is not
+  -- self-flagged. NULL on create (no row yet); the OR keeps every row counted.
+  AND  ($4::uuid IS NULL OR id <> $4::uuid)
+  AND  status          <> 'cancelled'
+`
+
+type CountMatchesFeedingSlotParams struct {
+	NextMatchID    pgtype.UUID `json:"next_match_id"`
+	NextMatchSlot  *int16      `json:"next_match_slot"`
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	Column4        pgtype.UUID `json:"column_4"`
+}
+
+// Counts active feeders already linked to a specific (successor, slot), excluding
+// the match itself. Used to reject linking two feeders into the same slot, which
+// would let the second silently overwrite the first's propagated winner.
+// Cancelled feeders are excluded — they no longer advance anyone.
+func (q *Queries) CountMatchesFeedingSlot(ctx context.Context, arg CountMatchesFeedingSlotParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countMatchesFeedingSlot,
+		arg.NextMatchID,
+		arg.NextMatchSlot,
+		arg.OrganizationID,
+		arg.Column4,
+	)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const createMatch = `-- name: CreateMatch :one
 INSERT INTO matches (
     tournament_id,
@@ -112,10 +150,13 @@ INSERT INTO matches (
     venue,
     scheduled_at,
     status,
-    notes
+    notes,
+    next_match_id,
+    next_match_slot,
+    group_label
 )
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-RETURNING id, tournament_id, organization_id, round_number, round_name, match_number, home_team_id, away_team_id, home_player_id, away_player_id, venue, scheduled_at, started_at, ended_at, status, winner_team_id, winner_player_id, is_walkover, notes, metadata, created_at, updated_at, home_score, away_score
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+RETURNING id, tournament_id, organization_id, round_number, round_name, match_number, home_team_id, away_team_id, home_player_id, away_player_id, venue, scheduled_at, started_at, ended_at, status, winner_team_id, winner_player_id, is_walkover, notes, metadata, created_at, updated_at, home_score, away_score, next_match_id, next_match_slot, group_label
 `
 
 type CreateMatchParams struct {
@@ -132,6 +173,9 @@ type CreateMatchParams struct {
 	ScheduledAt    pgtype.Timestamptz `json:"scheduled_at"`
 	Status         MatchStatus        `json:"status"`
 	Notes          *string            `json:"notes"`
+	NextMatchID    pgtype.UUID        `json:"next_match_id"`
+	NextMatchSlot  *int16             `json:"next_match_slot"`
+	GroupLabel     *string            `json:"group_label"`
 }
 
 // Inserts a new scheduled match fixture. organization_id must equal the parent
@@ -153,6 +197,9 @@ func (q *Queries) CreateMatch(ctx context.Context, arg CreateMatchParams) (Match
 		arg.ScheduledAt,
 		arg.Status,
 		arg.Notes,
+		arg.NextMatchID,
+		arg.NextMatchSlot,
+		arg.GroupLabel,
 	)
 	var i Match
 	err := row.Scan(
@@ -180,13 +227,16 @@ func (q *Queries) CreateMatch(ctx context.Context, arg CreateMatchParams) (Match
 		&i.UpdatedAt,
 		&i.HomeScore,
 		&i.AwayScore,
+		&i.NextMatchID,
+		&i.NextMatchSlot,
+		&i.GroupLabel,
 	)
 	return i, err
 }
 
 const getMatchByID = `-- name: GetMatchByID :one
 
-SELECT id, tournament_id, organization_id, round_number, round_name, match_number, home_team_id, away_team_id, home_player_id, away_player_id, venue, scheduled_at, started_at, ended_at, status, winner_team_id, winner_player_id, is_walkover, notes, metadata, created_at, updated_at, home_score, away_score
+SELECT id, tournament_id, organization_id, round_number, round_name, match_number, home_team_id, away_team_id, home_player_id, away_player_id, venue, scheduled_at, started_at, ended_at, status, winner_team_id, winner_player_id, is_walkover, notes, metadata, created_at, updated_at, home_score, away_score, next_match_id, next_match_slot, group_label
 FROM   matches
 WHERE  id              = $1
   AND  organization_id = $2
@@ -228,6 +278,9 @@ func (q *Queries) GetMatchByID(ctx context.Context, arg GetMatchByIDParams) (Mat
 		&i.UpdatedAt,
 		&i.HomeScore,
 		&i.AwayScore,
+		&i.NextMatchID,
+		&i.NextMatchSlot,
+		&i.GroupLabel,
 	)
 	return i, err
 }
@@ -309,7 +362,7 @@ func (q *Queries) ListCompletedMatchesByTournament(ctx context.Context, arg List
 }
 
 const listMatchesByTournament = `-- name: ListMatchesByTournament :many
-SELECT id, tournament_id, organization_id, round_number, round_name, match_number, home_team_id, away_team_id, home_player_id, away_player_id, venue, scheduled_at, started_at, ended_at, status, winner_team_id, winner_player_id, is_walkover, notes, metadata, created_at, updated_at, home_score, away_score
+SELECT id, tournament_id, organization_id, round_number, round_name, match_number, home_team_id, away_team_id, home_player_id, away_player_id, venue, scheduled_at, started_at, ended_at, status, winner_team_id, winner_player_id, is_walkover, notes, metadata, created_at, updated_at, home_score, away_score, next_match_id, next_match_slot, group_label
 FROM   matches
 WHERE  tournament_id   = $1
   AND  organization_id = $2
@@ -356,6 +409,9 @@ func (q *Queries) ListMatchesByTournament(ctx context.Context, arg ListMatchesBy
 			&i.UpdatedAt,
 			&i.HomeScore,
 			&i.AwayScore,
+			&i.NextMatchID,
+			&i.NextMatchSlot,
+			&i.GroupLabel,
 		); err != nil {
 			return nil, err
 		}
@@ -368,7 +424,7 @@ func (q *Queries) ListMatchesByTournament(ctx context.Context, arg ListMatchesBy
 }
 
 const listMatchesPaginated = `-- name: ListMatchesPaginated :many
-SELECT id, tournament_id, organization_id, round_number, round_name, match_number, home_team_id, away_team_id, home_player_id, away_player_id, venue, scheduled_at, started_at, ended_at, status, winner_team_id, winner_player_id, is_walkover, notes, metadata, created_at, updated_at, home_score, away_score
+SELECT id, tournament_id, organization_id, round_number, round_name, match_number, home_team_id, away_team_id, home_player_id, away_player_id, venue, scheduled_at, started_at, ended_at, status, winner_team_id, winner_player_id, is_walkover, notes, metadata, created_at, updated_at, home_score, away_score, next_match_id, next_match_slot, group_label
 FROM   matches
 WHERE  organization_id = $1
   AND  ($2::uuid IS NULL
@@ -436,6 +492,9 @@ func (q *Queries) ListMatchesPaginated(ctx context.Context, arg ListMatchesPagin
 			&i.UpdatedAt,
 			&i.HomeScore,
 			&i.AwayScore,
+			&i.NextMatchID,
+			&i.NextMatchSlot,
+			&i.GroupLabel,
 		); err != nil {
 			return nil, err
 		}
@@ -445,6 +504,59 @@ func (q *Queries) ListMatchesPaginated(ctx context.Context, arg ListMatchesPagin
 		return nil, err
 	}
 	return items, nil
+}
+
+const lockMatchForProgression = `-- name: LockMatchForProgression :one
+SELECT id,
+       organization_id,
+       tournament_id,
+       status,
+       home_team_id,
+       away_team_id,
+       home_player_id,
+       away_player_id
+FROM   matches
+WHERE  id              = $1
+  AND  organization_id = $2
+FOR    UPDATE
+`
+
+type LockMatchForProgressionParams struct {
+	ID             pgtype.UUID `json:"id"`
+	OrganizationID pgtype.UUID `json:"organization_id"`
+}
+
+type LockMatchForProgressionRow struct {
+	ID             pgtype.UUID `json:"id"`
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	TournamentID   pgtype.UUID `json:"tournament_id"`
+	Status         MatchStatus `json:"status"`
+	HomeTeamID     pgtype.UUID `json:"home_team_id"`
+	AwayTeamID     pgtype.UUID `json:"away_team_id"`
+	HomePlayerID   pgtype.UUID `json:"home_player_id"`
+	AwayPlayerID   pgtype.UUID `json:"away_player_id"`
+}
+
+// Acquires an exclusive row-level lock on a downstream (successor) match while a
+// feeder is being completed/walked-over, returning the fields propagation needs:
+// status (the I3 downstream-state guard), tournament_id (the I5 same-tournament
+// integrity check), and the four participant slots (so the writer preserves the
+// slot it is NOT filling). FOR UPDATE serialises two feeders advancing into the
+// same successor so each writes its own slot without a lost update.
+func (q *Queries) LockMatchForProgression(ctx context.Context, arg LockMatchForProgressionParams) (LockMatchForProgressionRow, error) {
+	row := q.db.QueryRow(ctx, lockMatchForProgression, arg.ID, arg.OrganizationID)
+	var i LockMatchForProgressionRow
+	err := row.Scan(
+		&i.ID,
+		&i.OrganizationID,
+		&i.TournamentID,
+		&i.Status,
+		&i.HomeTeamID,
+		&i.AwayTeamID,
+		&i.HomePlayerID,
+		&i.AwayPlayerID,
+	)
+	return i, err
 }
 
 const lockTournamentForShare = `-- name: LockTournamentForShare :one
@@ -472,6 +584,47 @@ func (q *Queries) LockTournamentForShare(ctx context.Context, arg LockTournament
 	return status, err
 }
 
+const setMatchParticipants = `-- name: SetMatchParticipants :execrows
+UPDATE matches
+SET    home_team_id     = $3,
+       away_team_id     = $4,
+       home_player_id   = $5,
+       away_player_id   = $6,
+       updated_at       = NOW()
+WHERE  id              = $1
+  AND  organization_id = $2
+  AND  status          = 'scheduled'
+`
+
+type SetMatchParticipantsParams struct {
+	ID             pgtype.UUID `json:"id"`
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	HomeTeamID     pgtype.UUID `json:"home_team_id"`
+	AwayTeamID     pgtype.UUID `json:"away_team_id"`
+	HomePlayerID   pgtype.UUID `json:"home_player_id"`
+	AwayPlayerID   pgtype.UUID `json:"away_player_id"`
+}
+
+// Writes the four participant slots of a (scheduled) successor match during
+// winner propagation. Called only after LockMatchForProgression has locked the
+// row and the service has verified status='scheduled'. The redundant
+// status='scheduled' guard here is belt-and-suspenders against any future caller
+// and yields rows-affected = 0 if the row left 'scheduled' under us.
+func (q *Queries) SetMatchParticipants(ctx context.Context, arg SetMatchParticipantsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setMatchParticipants,
+		arg.ID,
+		arg.OrganizationID,
+		arg.HomeTeamID,
+		arg.AwayTeamID,
+		arg.HomePlayerID,
+		arg.AwayPlayerID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const setMatchWalkover = `-- name: SetMatchWalkover :one
 UPDATE matches
 SET    status           = 'walkover',
@@ -486,7 +639,7 @@ SET    status           = 'walkover',
 WHERE  id              = $1
   AND  organization_id = $2
   AND  status          = $6
-RETURNING id, tournament_id, organization_id, round_number, round_name, match_number, home_team_id, away_team_id, home_player_id, away_player_id, venue, scheduled_at, started_at, ended_at, status, winner_team_id, winner_player_id, is_walkover, notes, metadata, created_at, updated_at, home_score, away_score
+RETURNING id, tournament_id, organization_id, round_number, round_name, match_number, home_team_id, away_team_id, home_player_id, away_player_id, venue, scheduled_at, started_at, ended_at, status, winner_team_id, winner_player_id, is_walkover, notes, metadata, created_at, updated_at, home_score, away_score, next_match_id, next_match_slot, group_label
 `
 
 type SetMatchWalkoverParams struct {
@@ -544,6 +697,9 @@ func (q *Queries) SetMatchWalkover(ctx context.Context, arg SetMatchWalkoverPara
 		&i.UpdatedAt,
 		&i.HomeScore,
 		&i.AwayScore,
+		&i.NextMatchID,
+		&i.NextMatchSlot,
+		&i.GroupLabel,
 	)
 	return i, err
 }
@@ -567,11 +723,14 @@ SET    round_number     = $3,
        notes            = $17,
        home_score       = $18,
        away_score       = $19,
+       next_match_id    = $20,
+       next_match_slot  = $21,
+       group_label      = $22,
        updated_at       = NOW()
 WHERE  id              = $1
   AND  organization_id = $2
-  AND  status          = $20
-RETURNING id, tournament_id, organization_id, round_number, round_name, match_number, home_team_id, away_team_id, home_player_id, away_player_id, venue, scheduled_at, started_at, ended_at, status, winner_team_id, winner_player_id, is_walkover, notes, metadata, created_at, updated_at, home_score, away_score
+  AND  status          = $23
+RETURNING id, tournament_id, organization_id, round_number, round_name, match_number, home_team_id, away_team_id, home_player_id, away_player_id, venue, scheduled_at, started_at, ended_at, status, winner_team_id, winner_player_id, is_walkover, notes, metadata, created_at, updated_at, home_score, away_score, next_match_id, next_match_slot, group_label
 `
 
 type UpdateMatchParams struct {
@@ -594,6 +753,9 @@ type UpdateMatchParams struct {
 	Notes          *string            `json:"notes"`
 	HomeScore      int32              `json:"home_score"`
 	AwayScore      int32              `json:"away_score"`
+	NextMatchID    pgtype.UUID        `json:"next_match_id"`
+	NextMatchSlot  *int16             `json:"next_match_slot"`
+	GroupLabel     *string            `json:"group_label"`
 	Status_2       MatchStatus        `json:"status_2"`
 }
 
@@ -630,6 +792,9 @@ func (q *Queries) UpdateMatch(ctx context.Context, arg UpdateMatchParams) (Match
 		arg.Notes,
 		arg.HomeScore,
 		arg.AwayScore,
+		arg.NextMatchID,
+		arg.NextMatchSlot,
+		arg.GroupLabel,
 		arg.Status_2,
 	)
 	var i Match
@@ -658,6 +823,9 @@ func (q *Queries) UpdateMatch(ctx context.Context, arg UpdateMatchParams) (Match
 		&i.UpdatedAt,
 		&i.HomeScore,
 		&i.AwayScore,
+		&i.NextMatchID,
+		&i.NextMatchSlot,
+		&i.GroupLabel,
 	)
 	return i, err
 }

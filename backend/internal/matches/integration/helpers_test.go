@@ -32,6 +32,9 @@ type matchResponse struct {
 	HomeScore      int     `json:"home_score"`
 	AwayScore      int     `json:"away_score"`
 	Notes          *string `json:"notes"`
+	NextMatchID    *string `json:"next_match_id"`
+	NextMatchSlot  *int16  `json:"next_match_slot"`
+	GroupLabel     *string `json:"group_label"`
 	ScheduledAt    *string `json:"scheduled_at"`
 	StartedAt      *string `json:"started_at"`
 	EndedAt        *string `json:"ended_at"`

@@ -56,6 +56,7 @@ function makeMatch(overrides: Partial<Match> = {}): Match {
     started_at: null, ended_at: null, status: "live",
     winner_team_id: null, winner_player_id: null, is_walkover: false,
     home_score: 0, away_score: 0, notes: null,
+    next_match_id: null, next_match_slot: null, group_label: null,
     created_at: "2026-06-01T00:00:00Z", updated_at: "2026-06-01T00:00:00Z",
     ...overrides,
   }

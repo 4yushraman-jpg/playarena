@@ -294,10 +294,14 @@ func (h *Handler) writeMatchError(w http.ResponseWriter, r *http.Request, err er
 		response.Error(w, http.StatusNotFound, "player not found")
 	case errors.Is(err, ErrForbidden):
 		response.Error(w, http.StatusForbidden, err.Error())
+	case errors.Is(err, ErrNextMatchNotFound):
+		response.Error(w, http.StatusNotFound, "next match not found")
 	case errors.Is(err, ErrInvalidStatus), errors.Is(err, ErrInvalidTournamentID),
 		errors.Is(err, ErrInvalidTimestamp),
 		errors.Is(err, ErrInvalidWalkoverWinner),
-		errors.Is(err, ErrWalkoverReasonRequired):
+		errors.Is(err, ErrWalkoverReasonRequired),
+		errors.Is(err, ErrNextMatchLinkIncomplete),
+		errors.Is(err, ErrInvalidNextSlot):
 		response.Error(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, ErrTournamentNotOngoing),
 		errors.Is(err, ErrMixedParticipantTypes),
@@ -311,7 +315,13 @@ func (h *Handler) writeMatchError(w http.ResponseWriter, r *http.Request, err er
 		errors.Is(err, ErrInvalidStatusTransition),
 		errors.Is(err, ErrMatchNotUpdatable),
 		errors.Is(err, ErrMatchAlreadyCancelled),
-		errors.Is(err, ErrWalkoverNeedsParticipants):
+		errors.Is(err, ErrWalkoverNeedsParticipants),
+		errors.Is(err, ErrMatchHasTBDSlot),
+		errors.Is(err, ErrDownstreamLocked),
+		errors.Is(err, ErrNextMatchCrossTournament),
+		errors.Is(err, ErrSelfLink),
+		errors.Is(err, ErrBracketInconsistent),
+		errors.Is(err, ErrSlotAlreadyFed):
 		response.Error(w, http.StatusUnprocessableEntity, err.Error())
 	default:
 		h.log.ErrorContext(r.Context(), "matches.unexpected_error",
@@ -383,6 +393,24 @@ func errKind(err error) string {
 		return "walkover_reason_required"
 	case errors.Is(err, ErrWalkoverNeedsParticipants):
 		return "walkover_needs_participants"
+	case errors.Is(err, ErrMatchHasTBDSlot):
+		return "match_has_tbd_slot"
+	case errors.Is(err, ErrDownstreamLocked):
+		return "downstream_locked"
+	case errors.Is(err, ErrNextMatchLinkIncomplete):
+		return "next_match_link_incomplete"
+	case errors.Is(err, ErrInvalidNextSlot):
+		return "invalid_next_slot"
+	case errors.Is(err, ErrNextMatchNotFound):
+		return "next_match_not_found"
+	case errors.Is(err, ErrNextMatchCrossTournament):
+		return "next_match_cross_tournament"
+	case errors.Is(err, ErrSelfLink):
+		return "self_link"
+	case errors.Is(err, ErrBracketInconsistent):
+		return "bracket_inconsistent"
+	case errors.Is(err, ErrSlotAlreadyFed):
+		return "slot_already_fed"
 	case errors.Is(err, ErrInvalidTimestamp):
 		return "invalid_timestamp"
 	case errors.Is(err, ErrInvalidTournamentID):

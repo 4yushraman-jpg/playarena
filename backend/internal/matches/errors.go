@@ -50,6 +50,35 @@ var (
 	// slot whose opponent is not yet known.
 	ErrWalkoverNeedsParticipants = errors.New("both participants must be assigned before a walkover can be awarded")
 
+	// Bracket-progression errors (FE-8B).
+	// ErrMatchHasTBDSlot is the I1 guard: a match with an unresolved (TBD/NULL)
+	// participant slot cannot be started, completed, or walked over.
+	ErrMatchHasTBDSlot = errors.New("match has an unassigned participant slot and cannot be started or concluded")
+	// ErrNextMatchLinkIncomplete is returned when next_match_id and
+	// next_match_slot are not both set or both absent.
+	ErrNextMatchLinkIncomplete = errors.New("next_match_id and next_match_slot must be provided together")
+	// ErrInvalidNextSlot is returned when next_match_slot is not 1 (home) or 2 (away).
+	ErrInvalidNextSlot = errors.New("next_match_slot must be 1 (home) or 2 (away)")
+	// ErrNextMatchNotFound is returned when the linked successor match does not
+	// exist within the organization.
+	ErrNextMatchNotFound = errors.New("next match (bracket successor) not found")
+	// ErrNextMatchCrossTournament is returned when the linked successor belongs
+	// to a different tournament (I5 bracket-integrity guard).
+	ErrNextMatchCrossTournament = errors.New("next match must belong to the same tournament")
+	// ErrSelfLink is returned when a match is linked to advance into itself.
+	ErrSelfLink = errors.New("a match cannot advance into itself")
+	// ErrDownstreamLocked is the I3 guard: a winner cannot be propagated into a
+	// successor that is no longer scheduled (already live or concluded). The
+	// completion/walkover that triggered the propagation is rolled back.
+	ErrDownstreamLocked = errors.New("the next match has already started or concluded; resolve the bracket manually before completing this match")
+	// ErrBracketInconsistent is an internal integrity violation: a linked
+	// successor was found in a different tournament than its feeder.
+	ErrBracketInconsistent = errors.New("bracket linkage is inconsistent")
+	// ErrSlotAlreadyFed is returned when another match already advances into the
+	// requested (successor, slot) — two feeders cannot share one slot, as the
+	// second would overwrite the first's propagated winner.
+	ErrSlotAlreadyFed = errors.New("another match already advances into that next-match slot")
+
 	// Input parsing errors.
 	ErrInvalidTimestamp    = errors.New("timestamps must be in RFC3339 format (e.g. 2025-01-15T10:00:00Z)")
 	ErrInvalidTournamentID = errors.New("invalid tournament_id")

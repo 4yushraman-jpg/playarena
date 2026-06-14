@@ -34,9 +34,12 @@ INSERT INTO matches (
     venue,
     scheduled_at,
     status,
-    notes
+    notes,
+    next_match_id,
+    next_match_slot,
+    group_label
 )
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 RETURNING *;
 
 -- name: UpdateMatch :one
@@ -70,10 +73,13 @@ SET    round_number     = $3,
        notes            = $17,
        home_score       = $18,
        away_score       = $19,
+       next_match_id    = $20,
+       next_match_slot  = $21,
+       group_label      = $22,
        updated_at       = NOW()
 WHERE  id              = $1
   AND  organization_id = $2
-  AND  status          = $20
+  AND  status          = $23
 RETURNING *;
 
 -- name: SetMatchWalkover :one
@@ -160,6 +166,57 @@ FROM   tournaments
 WHERE  id              = $1
   AND  organization_id = $2
 FOR    SHARE;
+
+-- name: CountMatchesFeedingSlot :one
+-- Counts active feeders already linked to a specific (successor, slot), excluding
+-- the match itself. Used to reject linking two feeders into the same slot, which
+-- would let the second silently overwrite the first's propagated winner.
+-- Cancelled feeders are excluded — they no longer advance anyone.
+SELECT COUNT(*)
+FROM   matches
+WHERE  next_match_id    = $1
+  AND  next_match_slot  = $2
+  AND  organization_id  = $3
+  -- $4 is the match being linked, excluded so a re-link of the SAME match is not
+  -- self-flagged. NULL on create (no row yet); the OR keeps every row counted.
+  AND  ($4::uuid IS NULL OR id <> $4::uuid)
+  AND  status          <> 'cancelled';
+
+-- name: LockMatchForProgression :one
+-- Acquires an exclusive row-level lock on a downstream (successor) match while a
+-- feeder is being completed/walked-over, returning the fields propagation needs:
+-- status (the I3 downstream-state guard), tournament_id (the I5 same-tournament
+-- integrity check), and the four participant slots (so the writer preserves the
+-- slot it is NOT filling). FOR UPDATE serialises two feeders advancing into the
+-- same successor so each writes its own slot without a lost update.
+SELECT id,
+       organization_id,
+       tournament_id,
+       status,
+       home_team_id,
+       away_team_id,
+       home_player_id,
+       away_player_id
+FROM   matches
+WHERE  id              = $1
+  AND  organization_id = $2
+FOR    UPDATE;
+
+-- name: SetMatchParticipants :execrows
+-- Writes the four participant slots of a (scheduled) successor match during
+-- winner propagation. Called only after LockMatchForProgression has locked the
+-- row and the service has verified status='scheduled'. The redundant
+-- status='scheduled' guard here is belt-and-suspenders against any future caller
+-- and yields rows-affected = 0 if the row left 'scheduled' under us.
+UPDATE matches
+SET    home_team_id     = $3,
+       away_team_id     = $4,
+       home_player_id   = $5,
+       away_player_id   = $6,
+       updated_at       = NOW()
+WHERE  id              = $1
+  AND  organization_id = $2
+  AND  status          = 'scheduled';
 
 -- name: ListCompletedMatchesByTournament :many
 -- Returns all matches with a final result for a tournament, in creation order.

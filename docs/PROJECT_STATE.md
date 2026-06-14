@@ -1,13 +1,13 @@
 # PlayArena — Project State & Handoff Document
 
-**Last Updated:** 2026-06-13  
-**Build status:** backend `go build ./...` / `go vet ./...` / `sqlc generate` clean; frontend `tsc --noEmit` 0 errors, `eslint` 0 warnings, `vitest` **308/308** passing, `next build` clean  
+**Last Updated:** 2026-06-14  
+**Build status:** backend `go build ./...` / `go vet ./...` / `sqlc generate` clean; frontend `tsc --noEmit` 0 errors, `eslint` 0 warnings, `vitest` **315/315** passing, `next build` clean  
 **Migrations applied:** 000001 – 000028  
 **Go version:** 1.25.6  
 **Database:** PostgreSQL 17  
 **Backend phases complete:** 1 – 12, Auth Security Hotfix v2, 13A, 13B.1, 13B.2A, 13B.2B-A, 13B.2B-B, 14, 15A, 15A Remediation, 16, 17, 18, 19, 19 Remediation, 20, 20 Remediation, 21, 22, 23A, 23B, 23C, 23D, **GP-1** (global PlayerProfile identity foundation — additive; shipped behind `GP_PLAYER_PERSONA_ENABLED=false`)  
-**Frontend phases complete:** FE-1, FE-2, FE-3, FE-4, FE-5, FE-6, **FE-7** (FE-7A + FE-7BA + FE-7BB + FE-7BC — Matches & Live Scoring)  
-**Platform status:** A real Kabaddi tournament can be run end-to-end through PlayArena — create tournament → approve registrations → create fixtures → start → score live (offline-tolerant) → complete with winner → standings refresh → complete tournament — without database access, manual score correction, or developer intervention. (One documented exception: walkover, which needs a backend capability — see §8 Known Open Items.)
+**Frontend phases complete:** FE-1, FE-2, FE-3, FE-4, FE-5, FE-6, **FE-7** (FE-7A + FE-7BA + FE-7BB + FE-7BC — Matches & Live Scoring), **FE-8A** (Walkover Support — end-to-end no-show handling + standings integration)  
+**Platform status:** A real Kabaddi tournament can be run end-to-end through PlayArena — create tournament → approve registrations → create fixtures → start → score live (offline-tolerant) → complete with winner → standings refresh → complete tournament — without database access, manual score correction, or developer intervention. No-shows are now handled in-product via walkover (FE-8A); the win/loss counts in standings and the `is_walkover` flag is preserved for future Reputation-Point exclusion.
 
 ---
 
@@ -2532,7 +2532,7 @@ r.Group(func(r chi.Router) {
 
 These are open directions, not committed phases. Sequencing is deferred to the strategic review (§11).
 
-- [ ] **Walkover support** — *Requires a backend capability that does not exist.* `matches.is_walkover` is `FALSE` at creation with no `UpdateRequest` field, and the backend rejects completing a 0-0 match with a winner (`ErrWinnerScoreMismatch`) unless `is_walkover` is true. The scorer therefore cannot record an administrative walkover; this needs a backend change (settable `is_walkover` at fixture/registration time) before any frontend work.
+- [x] **Walkover support** — *Delivered in FE-8A.* Dedicated `POST /matches/{id}/walkover` endpoint sets `status='walkover'`, `is_walkover=TRUE`, a resolved winner, and a 0-0 forfeit score under a tournament lock + CAS guard; the standings query now includes `walkover` so forfeits count as win/loss; full audit trail + reason recorded; walkover is terminal (no reversal/re-walkover/edit). Frontend walkover action + dialog on scheduled and live matches. See FE-8A section in §10.
 - [ ] **Concurrent-scorer lease (backend)** — FE-7BC ships frontend *awareness* (a warning when the event log contains another account's events). Preventing two authorized scorers from both writing requires a backend scorer-lease/lock; deliberately out of FE-7 scope.
 - [ ] **Player persona activation (GP-2 and beyond)** — GP-1 laid the global-identity foundation behind `GP_PLAYER_PERSONA_ENABLED=false`. Activating the player persona (scope enforcement, self-service profile surface, persona switching, player home) is the GP-2…GP-4 work and is **not started**.
 - [ ] **Reputation / global ranking system** — The closed-ecosystem Reputation-Points ranking model (verified-org / completed / min-field "ranked-eligible" gating, anti-farm shaping) is **design-only** (GP-5). The existing `internal/rankings/` module is the older org-scoped leaderboard, not the global reputation ladder.
@@ -3507,15 +3507,35 @@ Test infrastructure: Vitest 3, `@testing-library/react` 16, jsdom, `@testing-lib
 
 **Tests after FE-7: 308 across 35 files** (FE-7 added 142: engine golden vectors, queue/reconcile integrity, orchestration, completion, match management, scorer components, concurrent/abandon/period/timeout/a11y).
 
-**FE-7 closure carry-overs (none blocking; see §8 Known Open Items):** walkover (backend capability required), concurrent-scorer lease (frontend awareness only today), full focus-`inert` of chrome behind the scorer overlay, advisory clock starts at Half 1 on a freshly-opened mid-match scorer.
+**FE-7 closure carry-overs (none blocking; see §8 Known Open Items):** walkover (**now delivered in FE-8A**), concurrent-scorer lease (frontend awareness only today), full focus-`inert` of chrome behind the scorer overlay, advisory clock starts at Half 1 on a freshly-opened mid-match scorer.
+
+---
+
+#### FE-8A — Walkover Support
+
+**Status: COMPLETE.** First slice of the approved FE-8 (Tournament Operations Completeness) blueprint — exposes the latent walkover capability end-to-end, fixes the standings-visibility bug, and preserves future ranking-exclusion semantics. Implemented as a dedicated single-purpose operation (not a generic `PATCH` overload), per the blueprint. **No schema/enum migration required** (the `walkover` status, `is_walkover` column, and walkover-aware standings engine already existed; the write path and one query filter were the gaps). Adversarially reviewed; all P0/P1 resolved.
+
+- **Walkover Support ✓** — Dedicated `POST /api/v1/organizations/{slug}/matches/{id}/walkover` (gated on `match.update`). `WalkoverRequest{winner: home|away, reason}`; the service resolves `winner` to the concrete participant id (client never sends a UUID). New `SetMatchWalkover` SQL sets `status='walkover'`, `is_walkover=TRUE`, winner, 0-0 forfeit score, and `ended_at=GREATEST(NOW(), started_at+1ms)` (CHECK-safe from both `scheduled` and `live`). Allowed from scheduled or live; `UpdateMatch` SQL deliberately **not** widened (keeps its "never touches is_walkover" invariant). Frontend: `useWalkoverMatch` hook, `WalkoverDialog` (winner picker + required reason), "Award walkover" action on the match detail page for scheduled **and** live matches, `walkover` status badge, `W/O` markers in fixture list + detail scoreboard.
+- **Walkover Standings Integration ✓** — `ListCompletedMatchesByTournament` (the standings + rankings-snapshot feed) widened from `status='completed'` to `status IN ('completed','walkover')`. **This was the headline corruption bug:** a `walkover` row was previously invisible to standings, silently dropping forfeit results. The pure standings engine already awarded a walkover full WinPoints/LossPoints and exempted it from the close-loss bonus; it simply never saw the rows. Covered by a new `internal/standings` unit test (win/loss points + close-loss exemption + scored-loss contrast) and an end-to-end `tournaments/integration` test asserting a walkover appears as 1 win / 1 loss in `GET /standings`.
+- **Walkover Audit Trail ✓** — `WalkoverWithAudit` writes an `audit_logs` (`update`) row with old/new snapshots and the operator's reason (also stored on `matches.notes`), and enqueues a match-conclusion outbox entry (reuses `match_completed`; payload carries `is_walkover:true` + `new_status` so consumers distinguish it — no new notification enum value, keeping FE-8A migration-free). Ranking forward-compat: `is_walkover` flows through the standings snapshot so a future GP Reputation-Points pass can exclude forfeits (anti-farm) while still counting the win/loss.
+- **Tournament Integrity Protections ✓** — Walkover requires the parent tournament to be `ongoing` (acquired via `FOR SHARE` lock, races a concurrent cancel safely). `walkover` is a **terminal** status: no edit, no cancel, no re-walkover, no reversal (PATCH/DELETE/2nd-walkover all hit the terminal guard → 422); `match_events.Create` requires `status==live`, so a walkover can't be mutated via the event log either. TBD/NULL participant slots are rejected (`ErrWalkoverNeedsParticipants`) — forward-defensive for FE-8B brackets. Concurrent/duplicate walkovers are serialized by the same CAS guard (`status = previous_status`) used by `UpdateMatch`/`CancelMatch`. BOLA + `match.update` permission enforced.
+
+**Adversarial review (focus: standings corruption, bracket corruption, duplicate walkovers, walkover reversal, tournament integrity):** all P0 (standings invisibility, close-loss exemption) and P1 (terminal-state guards, TBD-slot rejection, concurrency CAS, permission/BOLA) resolved. Tests: backend matches-integration walkover suite (success from scheduled/live, missing-reason 400, invalid-winner 400, already-terminal 422, double-walkover 422, no-permission 403, no-auth 401), standings unit tests, tournaments standings-inclusion e2e; frontend +7 walkover tests (action visibility by status/role, walkover result rendering, dialog required-fields gating, API-call payload).
+
+**Tests after FE-8A: 315 frontend across 35 files** (+7 walkover); backend `go build`/`go vet` clean, matches + tournaments + standings suites green (integration in Docker). **Scope stopped at FE-8A — FE-8B (bracket linkage + progression) not started.**
+
+**Design decisions / lessons (FE-8A):**
+- Walkover is a **distinct terminal status**, not `completed`+`is_walkover` — keeps it visibly differentiable in the fixture list/audit/notifications. Cost was one query filter change, which is the standings fix.
+- The standings query, not the engine, was the corruption surface — the engine was already correct. Always check the feed filter, not just the math.
+- Reused `match_completed` outbox event to avoid a notification-enum migration; payload flags `is_walkover`.
 
 ---
 
 ## 11. Next Strategic Review Required
 
-**Backend phases 1 – 23D, GP-1, and frontend phases FE-1 – FE-7 are complete.** The organizer-facing tournament lifecycle — create → approve → fixtures → start → live score → complete → standings → complete tournament — is fully operational through the UI and production-validated (308 frontend tests; backend suites green).
+**Backend phases 1 – 23D, GP-1, and frontend phases FE-1 – FE-7 plus FE-8A are complete.** The organizer-facing tournament lifecycle — create → approve → fixtures → start → live score → complete (incl. walkover for no-shows) → standings → complete tournament — is fully operational through the UI and production-validated (315 frontend tests; backend suites green).
 
-This is a natural decision point. **Roadmap priorities must be re-evaluated in a dedicated strategic review before starting GP-2 or any subsequent initiative.** GP-2 is *not* automatically next. The review should weigh the open directions in §8 (player persona activation, reputation/ranking system, recruitment, public profiles, walkover/backend gaps, production hardening, news module, multi-instance SSE) against current product goals, and select the highest-value next move explicitly.
+This is a natural decision point. **Roadmap priorities must be re-evaluated in a dedicated strategic review before starting GP-2 or any subsequent initiative.** GP-2 is *not* automatically next. The review should weigh the open directions in §8 (player persona activation, reputation/ranking system, recruitment, public profiles, FE-8B+ tournament operations — bracket progression / fixture generation, production hardening, news module, multi-instance SSE) against current product goals, and select the highest-value next move explicitly.
 
 No specific next phase is recommended here pending that review.
 

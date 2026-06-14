@@ -136,6 +136,18 @@ func (r *Repository) GetByID(ctx context.Context, id, orgID pgtype.UUID) (*db.Ma
 	return &m, nil
 }
 
+// CountFeedersForSlot reports how many active matches (other than excludeID)
+// already advance into the given successor slot. Used to reject linking two
+// feeders into one slot. excludeID may be a zero UUID on create.
+func (r *Repository) CountFeedersForSlot(ctx context.Context, nextMatchID pgtype.UUID, slot *int16, orgID, excludeID pgtype.UUID) (int64, error) {
+	return r.queries.CountMatchesFeedingSlot(ctx, db.CountMatchesFeedingSlotParams{
+		NextMatchID:    nextMatchID,
+		NextMatchSlot:  slot,
+		OrganizationID: orgID,
+		Column4:        excludeID,
+	})
+}
+
 // List returns a paginated page of matches for an org.
 func (r *Repository) List(ctx context.Context, orgID pgtype.UUID, params ListParams) ([]db.Match, error) {
 	tidFilter := pgutil.ParseOptionalUUID(derefStr(params.TournamentFilter))
@@ -390,6 +402,15 @@ func (r *Repository) UpdateWithAudit(ctx context.Context, p updateMatchTxParams)
 		}
 	}
 
+	// Bracket progression (FE-8B): on completion, advance the winner into the
+	// linked successor — in this same transaction, so completion + propagation
+	// are atomic. A blocked/inconsistent successor rolls the completion back.
+	if m.Status == db.MatchStatusCompleted {
+		if err := propagateWinner(ctx, qtx, &m); err != nil {
+			return nil, err
+		}
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
@@ -559,10 +580,91 @@ func (r *Repository) WalkoverWithAudit(ctx context.Context, p walkoverMatchTxPar
 		return nil, err
 	}
 
+	// Bracket progression (FE-8B): a walkover concludes with a winner and
+	// propagates identically to a scored completion, in the same transaction.
+	if err := propagateWinner(ctx, qtx, &m); err != nil {
+		return nil, err
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
 	return &m, nil
+}
+
+// propagateWinner advances a concluded feeder's winner into its linked
+// successor's designated slot, INSIDE the caller's transaction. It is invoked
+// from the completion and walkover transactions so propagation is atomic with
+// the result that triggered it — a partial failure can never leave a winner
+// recorded but unpropagated.
+//
+// Invariants enforced:
+//   - I2 (no double propagation): the slot is fixed per feeder (next_match_slot),
+//     so re-running writes the SAME slot idempotently — never a second slot.
+//   - I3 (no stale propagation): the successor is locked FOR UPDATE and must
+//     still be 'scheduled'; if it has started or concluded, the whole
+//     transaction is aborted with ErrDownstreamLocked.
+//   - I5 (bracket integrity): the successor must belong to the same tournament.
+//
+// No-op when the feeder has no link or no winner (e.g. a drawn completion).
+func propagateWinner(ctx context.Context, qtx *db.Queries, feeder *db.Match) error {
+	if !feeder.NextMatchID.Valid || feeder.NextMatchSlot == nil {
+		return nil
+	}
+	winnerTeam := feeder.WinnerTeamID
+	winnerPlayer := feeder.WinnerPlayerID
+	if !winnerTeam.Valid && !winnerPlayer.Valid {
+		return nil // no winner to advance (draw)
+	}
+
+	succ, err := qtx.LockMatchForProgression(ctx, db.LockMatchForProgressionParams{
+		ID:             feeder.NextMatchID,
+		OrganizationID: feeder.OrganizationID,
+	})
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return ErrNextMatchNotFound
+		}
+		return err
+	}
+	if succ.TournamentID.Bytes != feeder.TournamentID.Bytes {
+		return ErrBracketInconsistent
+	}
+	// I3: a winner may only flow into a still-scheduled successor.
+	if succ.Status != db.MatchStatusScheduled {
+		return ErrDownstreamLocked
+	}
+
+	// Preserve the successor's other slot; set only this feeder's fixed slot.
+	params := db.SetMatchParticipantsParams{
+		ID:             succ.ID,
+		OrganizationID: succ.OrganizationID,
+		HomeTeamID:     succ.HomeTeamID,
+		AwayTeamID:     succ.AwayTeamID,
+		HomePlayerID:   succ.HomePlayerID,
+		AwayPlayerID:   succ.AwayPlayerID,
+	}
+	switch *feeder.NextMatchSlot {
+	case 1: // home
+		params.HomeTeamID = winnerTeam
+		params.HomePlayerID = winnerPlayer
+	case 2: // away
+		params.AwayTeamID = winnerTeam
+		params.AwayPlayerID = winnerPlayer
+	default:
+		return ErrInvalidNextSlot
+	}
+
+	n, err := qtx.SetMatchParticipants(ctx, params)
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		// The row left 'scheduled' between lock and write — impossible under the
+		// FOR UPDATE lock, but treated as a block rather than a silent drop.
+		return ErrDownstreamLocked
+	}
+	return nil
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -594,6 +696,9 @@ func matchToAuditJSON(m *db.Match) ([]byte, error) {
 		"home_score":       m.HomeScore,
 		"away_score":       m.AwayScore,
 		"notes":            m.Notes,
+		"next_match_id":    pgutil.UUIDToString(m.NextMatchID),
+		"next_match_slot":  m.NextMatchSlot,
+		"group_label":      m.GroupLabel,
 		"metadata":         metadata,
 		"created_at":       m.CreatedAt.Time.UTC().Format(time.RFC3339),
 		"updated_at":       m.UpdatedAt.Time.UTC().Format(time.RFC3339),

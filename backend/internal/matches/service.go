@@ -120,17 +120,30 @@ func (s *Service) Create(
 	homePlayerUID := pgutil.ParseOptionalUUID(derefStr(req.HomePlayerID))
 	awayPlayerUID := pgutil.ParseOptionalUUID(derefStr(req.AwayPlayerID))
 
-	if err := validateParticipantType(tournament.ParticipantType,
-		homeTeamUID, awayTeamUID, homePlayerUID, awayPlayerUID); err != nil {
-		return nil, err
+	// A match created with no participants is a TBD bracket slot whose opponents
+	// are filled later by winner propagation (FE-8B). Participant validation
+	// applies only when at least one slot is provided; a partial create (one
+	// side) is rejected by validateParticipantType as ErrMissingParticipants.
+	isTBD := !homeTeamUID.Valid && !awayTeamUID.Valid &&
+		!homePlayerUID.Valid && !awayPlayerUID.Valid
+	if !isTBD {
+		if err := validateParticipantType(tournament.ParticipantType,
+			homeTeamUID, awayTeamUID, homePlayerUID, awayPlayerUID); err != nil {
+			return nil, err
+		}
+		if err := validateNoDuplicates(homeTeamUID, awayTeamUID, homePlayerUID, awayPlayerUID); err != nil {
+			return nil, err
+		}
+		if err := s.validateParticipantEligibility(ctx, tid, org.ID,
+			homeTeamUID, awayTeamUID, homePlayerUID, awayPlayerUID); err != nil {
+			return nil, err
+		}
 	}
 
-	if err := validateNoDuplicates(homeTeamUID, awayTeamUID, homePlayerUID, awayPlayerUID); err != nil {
-		return nil, err
-	}
-
-	if err := s.validateParticipantEligibility(ctx, tid, org.ID,
-		homeTeamUID, awayTeamUID, homePlayerUID, awayPlayerUID); err != nil {
+	// Validate optional bracket linkage; the successor must exist in the same
+	// tournament. (Self-link is impossible on create — the id does not exist yet.)
+	nextMatchUID, nextSlot, err := s.validateLinkage(ctx, org.ID, tid, req.NextMatchID, req.NextMatchSlot, nil)
+	if err != nil {
 		return nil, err
 	}
 
@@ -154,6 +167,9 @@ func (s *Service) Create(
 			ScheduledAt:    scheduledAt,
 			Status:         db.MatchStatusScheduled,
 			Notes:          req.Notes,
+			NextMatchID:    nextMatchUID,
+			NextMatchSlot:  nextSlot,
+			GroupLabel:     req.GroupLabel,
 		},
 		actorID:        actorUID,
 		tournamentID:   tid,
@@ -301,7 +317,10 @@ func (s *Service) Update(
 		Notes:          current.Notes,
 		HomeScore:      current.HomeScore,
 		AwayScore:      current.AwayScore,
-		Status_2:       current.Status, // CAS guard ($20 = previous_status)
+		NextMatchID:    current.NextMatchID,
+		NextMatchSlot:  current.NextMatchSlot,
+		GroupLabel:     current.GroupLabel,
+		Status_2:       current.Status, // CAS guard (previous_status)
 	}
 
 	if req.RoundNumber != nil {
@@ -368,6 +387,21 @@ func (s *Service) Update(
 		}
 	}
 
+	// Bracket linkage (FE-8B): (re)link or change the successor. Both fields move
+	// together. Omitting both preserves the current link (already in params).
+	if req.NextMatchID != nil || req.NextMatchSlot != nil {
+		nextUID, nextSlot, err := s.validateLinkage(ctx, org.ID, current.TournamentID,
+			req.NextMatchID, req.NextMatchSlot, &current.ID)
+		if err != nil {
+			return nil, err
+		}
+		params.NextMatchID = nextUID
+		params.NextMatchSlot = nextSlot
+	}
+	if req.GroupLabel != nil {
+		params.GroupLabel = req.GroupLabel
+	}
+
 	// Status transition validation and timestamp side-effects.
 	lockTournament := false
 	if req.Status != nil {
@@ -379,6 +413,15 @@ func (s *Service) Update(
 			return nil, err
 		}
 		params.Status = newStatus
+
+		// I1 (bracket integrity): a match cannot start or be completed while a
+		// participant slot is still TBD. Walkover enforces the same separately.
+		if newStatus == db.MatchStatusLive || newStatus == db.MatchStatusCompleted {
+			if !bothParticipantsAssigned(params.HomeTeamID, params.AwayTeamID,
+				params.HomePlayerID, params.AwayPlayerID) {
+				return nil, ErrMatchHasTBDSlot
+			}
+		}
 
 		// Stamp timestamps on lifecycle transitions.
 		if newStatus == db.MatchStatusLive && !params.StartedAt.Valid {
@@ -686,6 +729,70 @@ func validateParticipantType(
 	return nil
 }
 
+// bothParticipantsAssigned reports whether the match has a complete pair of
+// participants of a single type — the precondition (I1) for going live/completed.
+func bothParticipantsAssigned(homeTeam, awayTeam, homePlayer, awayPlayer pgtype.UUID) bool {
+	return (homeTeam.Valid && awayTeam.Valid) || (homePlayer.Valid && awayPlayer.Valid)
+}
+
+// validateLinkage validates the optional bracket-successor link (FE-8B).
+// next_match_id and next_match_slot must be provided together; the slot must be
+// 1 (home) or 2 (away); and the successor must exist within the same tournament
+// and org (I5). A nil selfID skips the self-reference check (used on create,
+// where the new id is not yet known). Returns the resolved successor UUID
+// (zero/invalid when no link is specified) and the slot.
+func (s *Service) validateLinkage(
+	ctx context.Context,
+	orgID, tournamentID pgtype.UUID,
+	nextMatchID *string,
+	nextSlot *int16,
+	selfID *pgtype.UUID,
+) (pgtype.UUID, *int16, error) {
+	idAbsent := nextMatchID == nil || *nextMatchID == ""
+	// Both absent → no link.
+	if idAbsent && nextSlot == nil {
+		return pgtype.UUID{}, nil, nil
+	}
+	// Exactly one present → incomplete link.
+	if idAbsent || nextSlot == nil {
+		return pgtype.UUID{}, nil, ErrNextMatchLinkIncomplete
+	}
+	if *nextSlot != 1 && *nextSlot != 2 {
+		return pgtype.UUID{}, nil, ErrInvalidNextSlot
+	}
+	nextUID, err := pgutil.ParseUUID(*nextMatchID)
+	if err != nil {
+		return pgtype.UUID{}, nil, ErrNextMatchNotFound
+	}
+	if selfID != nil && selfID.Valid && nextUID.Bytes == selfID.Bytes {
+		return pgtype.UUID{}, nil, ErrSelfLink
+	}
+	succ, err := s.repo.GetByID(ctx, nextUID, orgID)
+	if err != nil {
+		if errors.Is(err, ErrMatchNotFound) {
+			return pgtype.UUID{}, nil, ErrNextMatchNotFound
+		}
+		return pgtype.UUID{}, nil, err
+	}
+	if succ.TournamentID.Bytes != tournamentID.Bytes {
+		return pgtype.UUID{}, nil, ErrNextMatchCrossTournament
+	}
+	// Reject a second feeder into the same slot — it would overwrite the first's
+	// propagated winner. excludeID is the match being linked (zero on create).
+	var excludeID pgtype.UUID
+	if selfID != nil {
+		excludeID = *selfID
+	}
+	n, err := s.repo.CountFeedersForSlot(ctx, nextUID, nextSlot, orgID, excludeID)
+	if err != nil {
+		return pgtype.UUID{}, nil, err
+	}
+	if n > 0 {
+		return pgtype.UUID{}, nil, ErrSlotAlreadyFed
+	}
+	return nextUID, nextSlot, nil
+}
+
 // validateNoDuplicates rejects matches where home and away are the same entity.
 func validateNoDuplicates(homeTeam, awayTeam, homePlayer, awayPlayer pgtype.UUID) error {
 	if homeTeam.Valid && awayTeam.Valid && uuidEquals(homeTeam, awayTeam) {
@@ -818,6 +925,9 @@ func matchToResponse(m *db.Match) *Response {
 		HomeScore:      m.HomeScore,
 		AwayScore:      m.AwayScore,
 		Notes:          m.Notes,
+		NextMatchID:    uuidStringPtr(m.NextMatchID),
+		NextMatchSlot:  m.NextMatchSlot,
+		GroupLabel:     m.GroupLabel,
 		CreatedAt:      m.CreatedAt.Time.UTC().Format(time.RFC3339),
 		UpdatedAt:      m.UpdatedAt.Time.UTC().Format(time.RFC3339),
 	}

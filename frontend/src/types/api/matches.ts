@@ -30,6 +30,11 @@ export interface Match {
   home_score: number
   away_score: number
   notes: string | null
+  // Bracket linkage (FE-8B): the successor this winner advances into, and which
+  // slot (1 = home, 2 = away). Null for finals, league, and round-robin matches.
+  next_match_id: string | null
+  next_match_slot: number | null
+  group_label: string | null
   created_at: string
   updated_at: string
 }
@@ -58,6 +63,11 @@ export interface CreateMatchRequest {
   venue?: string
   scheduled_at: string         // required by backend
   notes?: string
+  // Bracket linkage (FE-8B). Send next_match_id + next_match_slot together. Omit
+  // all participants to create a TBD bracket slot filled later by propagation.
+  next_match_id?: string
+  next_match_slot?: number
+  group_label?: string
 }
 
 export interface UpdateMatchRequest {
@@ -74,6 +84,9 @@ export interface UpdateMatchRequest {
   winner_team_id?: string | null
   winner_player_id?: string | null
   notes?: string | null
+  next_match_id?: string | null
+  next_match_slot?: number | null
+  group_label?: string | null
 }
 
 // Award an administrative win when one side does not appear. The winner string

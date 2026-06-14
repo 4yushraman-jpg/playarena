@@ -21,6 +21,12 @@ type CreateRequest struct {
 	Venue        *string `json:"venue"`
 	ScheduledAt  string  `json:"scheduled_at" validate:"required"`
 	Notes        *string `json:"notes"`
+	// Bracket linkage (FE-8B). next_match_id + next_match_slot must be provided
+	// together. A match created with no participants is a TBD bracket slot whose
+	// opponents are filled later by winner propagation.
+	NextMatchID   *string `json:"next_match_id"`
+	NextMatchSlot *int16  `json:"next_match_slot"`
+	GroupLabel    *string `json:"group_label"`
 }
 
 // UpdateRequest is the payload for
@@ -54,6 +60,11 @@ type UpdateRequest struct {
 	WinnerTeamID   *string `json:"winner_team_id"`
 	WinnerPlayerID *string `json:"winner_player_id"`
 	Notes          *string `json:"notes"`
+	// Bracket linkage (FE-8B). Send next_match_id and next_match_slot together to
+	// (re)link a non-terminal match; send both as null to clear the link.
+	NextMatchID   *string `json:"next_match_id"`
+	NextMatchSlot *int16  `json:"next_match_slot"`
+	GroupLabel    *string `json:"group_label"`
 }
 
 // WalkoverRequest is the payload for
@@ -101,8 +112,13 @@ type Response struct {
 	HomeScore int32   `json:"home_score"`
 	AwayScore int32   `json:"away_score"`
 	Notes     *string `json:"notes,omitempty"`
-	CreatedAt string  `json:"created_at"`
-	UpdatedAt string  `json:"updated_at"`
+	// Bracket linkage (FE-8B). next_match_id is the successor this winner advances
+	// into; next_match_slot is which slot (1=home, 2=away).
+	NextMatchID   *string `json:"next_match_id,omitempty"`
+	NextMatchSlot *int16  `json:"next_match_slot,omitempty"`
+	GroupLabel    *string `json:"group_label,omitempty"`
+	CreatedAt     string  `json:"created_at"`
+	UpdatedAt     string  `json:"updated_at"`
 }
 
 // ListResponse wraps a paginated list of matches.
