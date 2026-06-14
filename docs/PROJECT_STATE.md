@@ -1,13 +1,13 @@
 # PlayArena — Project State & Handoff Document
 
 **Last Updated:** 2026-06-14  
-**Build status:** backend `go build ./...` / `go vet ./...` / `sqlc generate` clean; frontend `tsc --noEmit` 0 errors, `eslint` 0 warnings, `vitest` **315/315** passing, `next build` clean  
-**Migrations applied:** 000001 – 000028  
+**Build status:** backend `go build ./...` / `go vet ./...` / `sqlc generate` clean; frontend `tsc --noEmit` 0 errors, `eslint` 0 warnings, `vitest` **318/318** passing, `next build` clean  
+**Migrations applied:** 000001 – 000029  
 **Go version:** 1.25.6  
 **Database:** PostgreSQL 17  
 **Backend phases complete:** 1 – 12, Auth Security Hotfix v2, 13A, 13B.1, 13B.2A, 13B.2B-A, 13B.2B-B, 14, 15A, 15A Remediation, 16, 17, 18, 19, 19 Remediation, 20, 20 Remediation, 21, 22, 23A, 23B, 23C, 23D, **GP-1** (global PlayerProfile identity foundation — additive; shipped behind `GP_PLAYER_PERSONA_ENABLED=false`)  
-**Frontend phases complete:** FE-1, FE-2, FE-3, FE-4, FE-5, FE-6, **FE-7** (FE-7A + FE-7BA + FE-7BB + FE-7BC — Matches & Live Scoring), **FE-8A** (Walkover Support — end-to-end no-show handling + standings integration)  
-**Platform status:** A real Kabaddi tournament can be run end-to-end through PlayArena — create tournament → approve registrations → create fixtures → start → score live (offline-tolerant) → complete with winner → standings refresh → complete tournament — without database access, manual score correction, or developer intervention. No-shows are now handled in-product via walkover (FE-8A); the win/loss counts in standings and the `is_walkover` flag is preserved for future Reputation-Point exclusion.
+**Frontend phases complete:** FE-1, FE-2, FE-3, FE-4, FE-5, FE-6, **FE-7** (FE-7A + FE-7BA + FE-7BB + FE-7BC — Matches & Live Scoring), **FE-8A** (Walkover Support — end-to-end no-show handling + standings integration), **FE-8B** (Bracket Progression — next-match linkage + atomic winner propagation)  
+**Platform status:** A real Kabaddi tournament can be run end-to-end through PlayArena — create tournament → approve registrations → create fixtures → start → score live (offline-tolerant) → complete with winner → standings refresh → complete tournament — without database access, manual score correction, or developer intervention. No-shows are now handled in-product via walkover (FE-8A); the win/loss counts in standings and the `is_walkover` flag is preserved for future Reputation-Point exclusion. Knockout brackets can be wired (next-match linkage) and self-advance: a completed or walked-over match propagates its winner into the linked successor slot atomically (FE-8B). Automated fixture *generation* (seeding the bracket) remains FE-8C.
 
 ---
 
@@ -3522,7 +3522,7 @@ Test infrastructure: Vitest 3, `@testing-library/react` 16, jsdom, `@testing-lib
 
 **Adversarial review (focus: standings corruption, bracket corruption, duplicate walkovers, walkover reversal, tournament integrity):** all P0 (standings invisibility, close-loss exemption) and P1 (terminal-state guards, TBD-slot rejection, concurrency CAS, permission/BOLA) resolved. Tests: backend matches-integration walkover suite (success from scheduled/live, missing-reason 400, invalid-winner 400, already-terminal 422, double-walkover 422, no-permission 403, no-auth 401), standings unit tests, tournaments standings-inclusion e2e; frontend +7 walkover tests (action visibility by status/role, walkover result rendering, dialog required-fields gating, API-call payload).
 
-**Tests after FE-8A: 315 frontend across 35 files** (+7 walkover); backend `go build`/`go vet` clean, matches + tournaments + standings suites green (integration in Docker). **Scope stopped at FE-8A — FE-8B (bracket linkage + progression) not started.**
+**Tests after FE-8A: 315 frontend across 35 files** (+7 walkover); backend `go build`/`go vet` clean, matches + tournaments + standings suites green (integration in Docker). **(FE-8A closed here; FE-8B — bracket linkage + progression — has since been delivered, see below.)**
 
 **Design decisions / lessons (FE-8A):**
 - Walkover is a **distinct terminal status**, not `completed`+`is_walkover` — keeps it visibly differentiable in the fixture list/audit/notifications. Cost was one query filter change, which is the standings fix.
@@ -3531,11 +3531,33 @@ Test infrastructure: Vitest 3, `@testing-library/react` 16, jsdom, `@testing-lib
 
 ---
 
+#### FE-8B — Bracket Progression
+
+**Status: COMPLETE.** Second slice of the FE-8 blueprint — adds the bracket edge and atomic winner propagation so knockout matches self-advance. Fixture *generation* (seeding), double-elimination, GP-2, and rankings are explicitly out of scope (FE-8C+). Adversarially reviewed; all P0/P1 resolved.
+
+- **Bracket Linkage ✓** — Migration **000029** adds `matches.next_match_id` (FK→matches, ON DELETE SET NULL), `next_match_slot` (1=home, 2=away), and `group_label` (group_knockout future path), plus `chk_matches_no_self_next`. `Create`/`Update` accept linkage and now allow **TBD matches** (a fixture with no participants — a downstream slot awaiting its feeders). `validateLinkage` enforces both-fields-together, slot ∈ {1,2}, successor exists in the **same org + tournament** (I5), no self-link, and **no two feeders into one slot** (`CountMatchesFeedingSlot` → `ErrSlotAlreadyFed`). Frontend: linkage in `Match`/request types, automatic **"TBD"** rendering for empty slots, and a read-only **"Winner advances to …"** indicator on the match detail page.
+- **Winner Propagation ✓** — On completion (live→completed with a winner) the feeder's winner is written into its linked successor's fixed slot. The slot is **per-feeder fixed** (`next_match_slot`), so propagation targets exactly one deterministic slot — making it idempotent and double-write-safe (I2). When both feeders have advanced, the successor is fully populated and becomes playable; no status change is forced.
+- **Walkover Propagation ✓** — A walkover concludes with a winner and propagates through the **identical** `propagateWinner` path as a scored completion (called from both `UpdateWithAudit` and `WalkoverWithAudit`). A bracket can be advanced entirely by walkovers.
+- **Bracket Integrity Guards ✓** — I1: a match with a TBD slot cannot start or conclude (`ErrMatchHasTBDSlot` on live/completed; `ErrWalkoverNeedsParticipants` on walkover). I3: a winner may only flow into a still-`scheduled` successor — if it has started or concluded, the propagation **blocks** (`ErrDownstreamLocked`). I5: cross-tournament/cross-org/self links rejected. The relaxed `chk_matches_participants` (now permits a partial single-type fill) still forbids mixing team and player identities; partial state is only ever a transient progression intermediate, never startable.
+- **Atomic Progression ✓** — Propagation runs **inside the same transaction** as the completion/walkover that triggered it. A blocked or inconsistent successor (`ErrDownstreamLocked`/`ErrBracketInconsistent`) rolls the whole operation back — a winner can never be recorded without its propagation, and a feeder left in a non-terminal state after a blocked propagation stays exactly as it was. The successor is locked `FOR UPDATE`, so two feeders advancing into one match are serialized (each writes its own slot; no lost update).
+
+**Adversarial review (focus: bracket corruption, duplicate propagation, stale propagation, walkover propagation, correction propagation):** all P0 (atomicity, stale-propagation guard, walkover parity) and P1 (cross-tournament/self link, slot-collision, I1 TBD guard, concurrency serialization) resolved. The "correction-after-propagation" rule is the propagation function itself — write only into a `scheduled` successor, block otherwise; completed/walkover feeders are terminal and cannot be re-triggered or re-linked, so a propagated winner cannot be silently changed. One bug found and fixed mid-review: the slot-collision guard's `id <> $4` exclusion filtered out every row when the exclude-id was NULL on create → fixed to `($4 IS NULL OR id <> $4)`.
+
+**Tests after FE-8B: 318 frontend across 35 files** (+3 bracket-linkage: TBD rendering, advances-to link, no-link case); backend matches-integration adds propagation (completion + walkover), two-feeders-fill-both-slots, I1 start/walkover blocks, I3 downstream-locked with atomic rollback, TBD/linkage create, incomplete-link, cross-tournament, and slot-collision. `go build`/`go vet`/`gofmt` clean; matches + tournaments + standings suites green (integration in Docker). **Scope stopped at FE-8B — FE-8C (fixture generation) not started.**
+
+**Design decisions / lessons (FE-8B):**
+- **Per-feeder fixed slot** (`next_match_slot`) is the key to safe propagation: each winner has one deterministic destination, so writes are idempotent and two feeders never collide on a slot. Choosing the slot dynamically ("first empty") would have made double propagation and races dangerous.
+- Incremental propagation (feeders finish at different times) forced **relaxing `chk_matches_participants`** to permit a one-sided fill; the application I1 guard — not the DB constraint — keeps a partial match from being played.
+- Propagation lives in the **repository transaction layer**, next to completion/walkover, so atomicity is structural rather than convention.
+- Integrity stance for the I3 block: when a winner can't be safely advanced (successor already underway), fail the completion loudly rather than drop the propagation — the organizer resolves the bracket manually.
+
+---
+
 ## 11. Next Strategic Review Required
 
-**Backend phases 1 – 23D, GP-1, and frontend phases FE-1 – FE-7 plus FE-8A are complete.** The organizer-facing tournament lifecycle — create → approve → fixtures → start → live score → complete (incl. walkover for no-shows) → standings → complete tournament — is fully operational through the UI and production-validated (315 frontend tests; backend suites green).
+**Backend phases 1 – 23D, GP-1, and frontend phases FE-1 – FE-7 plus FE-8A and FE-8B are complete.** The organizer-facing tournament lifecycle — create → approve → fixtures → start → live score → complete (incl. walkover for no-shows) → bracket winner auto-advances → standings → complete tournament — is fully operational through the UI and production-validated (318 frontend tests; backend suites green). The remaining FE-8 gap is automated fixture generation / seeding (FE-8C).
 
-This is a natural decision point. **Roadmap priorities must be re-evaluated in a dedicated strategic review before starting GP-2 or any subsequent initiative.** GP-2 is *not* automatically next. The review should weigh the open directions in §8 (player persona activation, reputation/ranking system, recruitment, public profiles, FE-8B+ tournament operations — bracket progression / fixture generation, production hardening, news module, multi-instance SSE) against current product goals, and select the highest-value next move explicitly.
+This is a natural decision point. **Roadmap priorities must be re-evaluated in a dedicated strategic review before starting GP-2 or any subsequent initiative.** GP-2 is *not* automatically next. The review should weigh the open directions in §8 (player persona activation, reputation/ranking system, recruitment, public profiles, FE-8C tournament operations — automated fixture generation / seeding, production hardening, news module, multi-instance SSE) against current product goals, and select the highest-value next move explicitly.
 
 No specific next phase is recommended here pending that review.
 

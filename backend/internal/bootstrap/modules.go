@@ -10,6 +10,7 @@ import (
 	db "github.com/4yushraman-jpg/playarena/db/sqlc"
 	"github.com/4yushraman-jpg/playarena/internal/auth"
 	"github.com/4yushraman-jpg/playarena/internal/email"
+	"github.com/4yushraman-jpg/playarena/internal/fixturegen"
 	"github.com/4yushraman-jpg/playarena/internal/health"
 	"github.com/4yushraman-jpg/playarena/internal/match_events"
 	"github.com/4yushraman-jpg/playarena/internal/matches"
@@ -114,6 +115,7 @@ func registerModules(
 		tournament_registrations.RegisterRoutes(r, pool, cfg, log, authz, notifSvc)
 		matches.RegisterRoutes(r, pool, cfg, log, authz, notifSvc)
 		match_events.RegisterRoutes(r, pool, cfg, log, authz)
+		fixturegen.RegisterRoutes(r, pool, cfg, log, authz)
 		notifications.RegisterRoutes(r, pool, cfg, log, authz, hub)
 		webhooks.RegisterRoutes(r, pool, cfg, log, authz)
 		rankings.RegisterRoutes(r, pool, cfg, log)

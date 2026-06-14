@@ -86,6 +86,8 @@ export const tournamentKeys = {
     [...tournamentKeys.all(orgSlug), id] as const,
   standings: (orgSlug: string, id: string) =>
     [...tournamentKeys.detail(orgSlug, id), "standings"] as const,
+  generation: (orgSlug: string, id: string) =>
+    [...tournamentKeys.detail(orgSlug, id), "generation"] as const,
   /** Root for everything registration-scoped under a tournament — use for invalidation. */
   registrations: (orgSlug: string, tournamentId: string) =>
     [...tournamentKeys.detail(orgSlug, tournamentId), "registrations"] as const,
