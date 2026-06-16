@@ -898,6 +898,50 @@ func (ns NullTournamentStatus) Value() (driver.Value, error) {
 	return string(ns.TournamentStatus), nil
 }
 
+// Public-surface visibility (PRI-1). private = never public; unlisted = link-only, not indexed; public = link + discoverable/indexed. Draft tournaments are private regardless of this value.
+type TournamentVisibility string
+
+const (
+	TournamentVisibilityPrivate  TournamentVisibility = "private"
+	TournamentVisibilityUnlisted TournamentVisibility = "unlisted"
+	TournamentVisibilityPublic   TournamentVisibility = "public"
+)
+
+func (e *TournamentVisibility) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = TournamentVisibility(s)
+	case string:
+		*e = TournamentVisibility(s)
+	default:
+		return fmt.Errorf("unsupported scan type for TournamentVisibility: %T", src)
+	}
+	return nil
+}
+
+type NullTournamentVisibility struct {
+	TournamentVisibility TournamentVisibility `json:"tournament_visibility"`
+	Valid                bool                 `json:"valid"` // Valid is true if TournamentVisibility is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullTournamentVisibility) Scan(value interface{}) error {
+	if value == nil {
+		ns.TournamentVisibility, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.TournamentVisibility.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullTournamentVisibility) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.TournamentVisibility), nil
+}
+
 // Lifecycle states for a user account. pending_verification is set on registration until the email is confirmed. suspended is set administratively and blocks all authenticated access.
 type UserStatus string
 
@@ -1353,6 +1397,8 @@ type Tournament struct {
 	CreatedBy pgtype.UUID        `json:"created_by"`
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+	// PRI-1 public-surface gate. Combined with status<>draft and an active org, determines whether the tournament is readable on the anonymous public path.
+	Visibility TournamentVisibility `json:"visibility"`
 }
 
 // Records a team or individual player entering a tournament. Exactly one of team_id / player_id must be non-NULL (chk_treg_one_participant). organization_id is the registrant's org — not necessarily the tournament host org. This distinction matters for cross-org tournaments (e.g. a league with multiple clubs).

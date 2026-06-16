@@ -120,6 +120,43 @@ func startOutboxMetricsScraper(
 	}()
 }
 
+// startTournamentActivityScraper periodically samples tournament-day activity
+// (ongoing tournaments, live matches, recent scoring rate) so the Pilot Day
+// dashboard shows the event happening on one screen. It reads row counts via raw
+// SQL — no domain-package coupling, no application-feature changes.
+func startTournamentActivityScraper(db *pgxpool.Pool, reg *metrics.Registry, log *slog.Logger, done <-chan struct{}) {
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				scrapeTournamentActivity(ctx, db, reg, log)
+				cancel()
+			case <-done:
+				return
+			}
+		}
+	}()
+}
+
+func scrapeTournamentActivity(ctx context.Context, db *pgxpool.Pool, reg *metrics.Registry, log *slog.Logger) {
+	var ongoing, live, events int64
+	if err := db.QueryRow(ctx,
+		`SELECT
+		   (SELECT COUNT(*) FROM tournaments WHERE status = 'ongoing'),
+		   (SELECT COUNT(*) FROM matches WHERE status = 'live'),
+		   (SELECT COUNT(*) FROM match_events WHERE recorded_at >= NOW() - INTERVAL '60 seconds')`,
+	).Scan(&ongoing, &live, &events); err != nil {
+		log.Error("metrics: scrape tournament activity", slog.Any("error", err))
+		return
+	}
+	reg.TournamentsOngoing.Set(float64(ongoing))
+	reg.MatchesLive.Set(float64(live))
+	reg.MatchEventsLastMinute.Set(float64(events))
+}
+
 func scrapeOutbox(
 	ctx context.Context,
 	notifRepo outboxScraper,

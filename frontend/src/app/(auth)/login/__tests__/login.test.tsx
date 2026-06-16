@@ -94,7 +94,7 @@ describe("LoginPage — login completion", () => {
     expect(useAuthStore.getState().claims?.organizationId).toBe("org-1")
   })
 
-  it("zero-org user: onboarding token redirects to /onboarding without an org lookup", async () => {
+  it("zero-org user: onboarding token redirects to neutral /welcome without an org lookup (PRI-1)", async () => {
     vi.mocked(authApi.login).mockResolvedValue(
       tokenResponse(makeMockJwt("", "onboarding")),
     )
@@ -102,7 +102,7 @@ describe("LoginPage — login completion", () => {
     render(<LoginPage />)
     await submitLogin()
 
-    await waitFor(() => expect(mockPush).toHaveBeenCalledWith("/onboarding"))
+    await waitFor(() => expect(mockPush).toHaveBeenCalledWith("/welcome"))
     expect(orgsApi.list).not.toHaveBeenCalled()
     expect(useAuthStore.getState().claims?.role).toBe("onboarding")
   })

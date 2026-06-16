@@ -25,6 +25,11 @@ type RegistrationInfo struct {
 	ParticipantID string
 	SeedNumber    *int16    // nil when the organiser has not assigned a seed
 	RegisteredAt  time.Time // always present; used as final deterministic tiebreaker
+	// Disqualified marks a participant removed from the tournament. PRI-1 policy:
+	// a disqualified participant with zero played matches is dropped from the
+	// table entirely (DQ before play); one with results is retained but flagged
+	// and sorted to the bottom (DQ after play — opponents' results are preserved).
+	Disqualified bool
 }
 
 // Settings holds the point values used for standings computation.
@@ -62,4 +67,5 @@ type StandingsRow struct {
 	ScoreDifference int // ScoreFor - ScoreAgainst
 	SeedNumber      *int16
 	RegisteredAt    time.Time
+	Disqualified    bool
 }

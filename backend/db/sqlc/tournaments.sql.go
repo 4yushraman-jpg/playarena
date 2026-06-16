@@ -17,7 +17,7 @@ SET    status     = 'cancelled',
        updated_at = NOW()
 WHERE  id              = $1
   AND  organization_id = $2
-RETURNING id, organization_id, name, slug, description, sport, format, participant_type, status, banner_url, prize_pool, currency, max_participants, min_participants, registration_opens_at, registration_closes_at, starts_at, ends_at, venue, city, country, rules, settings, created_by, created_at, updated_at
+RETURNING id, organization_id, name, slug, description, sport, format, participant_type, status, banner_url, prize_pool, currency, max_participants, min_participants, registration_opens_at, registration_closes_at, starts_at, ends_at, venue, city, country, rules, settings, created_by, created_at, updated_at, visibility
 `
 
 type CancelTournamentParams struct {
@@ -57,6 +57,7 @@ func (q *Queries) CancelTournament(ctx context.Context, arg CancelTournamentPara
 		&i.CreatedBy,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Visibility,
 	)
 	return i, err
 }
@@ -128,7 +129,7 @@ INSERT INTO tournaments (
     venue, city, country, rules, created_by
 )
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
-RETURNING id, organization_id, name, slug, description, sport, format, participant_type, status, banner_url, prize_pool, currency, max_participants, min_participants, registration_opens_at, registration_closes_at, starts_at, ends_at, venue, city, country, rules, settings, created_by, created_at, updated_at
+RETURNING id, organization_id, name, slug, description, sport, format, participant_type, status, banner_url, prize_pool, currency, max_participants, min_participants, registration_opens_at, registration_closes_at, starts_at, ends_at, venue, city, country, rules, settings, created_by, created_at, updated_at, visibility
 `
 
 type CreateTournamentParams struct {
@@ -208,13 +209,14 @@ func (q *Queries) CreateTournament(ctx context.Context, arg CreateTournamentPara
 		&i.CreatedBy,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Visibility,
 	)
 	return i, err
 }
 
 const getTournamentByID = `-- name: GetTournamentByID :one
 
-SELECT id, organization_id, name, slug, description, sport, format, participant_type, status, banner_url, prize_pool, currency, max_participants, min_participants, registration_opens_at, registration_closes_at, starts_at, ends_at, venue, city, country, rules, settings, created_by, created_at, updated_at
+SELECT id, organization_id, name, slug, description, sport, format, participant_type, status, banner_url, prize_pool, currency, max_participants, min_participants, registration_opens_at, registration_closes_at, starts_at, ends_at, venue, city, country, rules, settings, created_by, created_at, updated_at, visibility
 FROM   tournaments
 WHERE  id              = $1
   AND  organization_id = $2
@@ -258,12 +260,13 @@ func (q *Queries) GetTournamentByID(ctx context.Context, arg GetTournamentByIDPa
 		&i.CreatedBy,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Visibility,
 	)
 	return i, err
 }
 
 const getTournamentBySlug = `-- name: GetTournamentBySlug :one
-SELECT id, organization_id, name, slug, description, sport, format, participant_type, status, banner_url, prize_pool, currency, max_participants, min_participants, registration_opens_at, registration_closes_at, starts_at, ends_at, venue, city, country, rules, settings, created_by, created_at, updated_at
+SELECT id, organization_id, name, slug, description, sport, format, participant_type, status, banner_url, prize_pool, currency, max_participants, min_participants, registration_opens_at, registration_closes_at, starts_at, ends_at, venue, city, country, rules, settings, created_by, created_at, updated_at, visibility
 FROM   tournaments
 WHERE  slug            = $1
   AND  organization_id = $2
@@ -305,6 +308,7 @@ func (q *Queries) GetTournamentBySlug(ctx context.Context, arg GetTournamentBySl
 		&i.CreatedBy,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Visibility,
 	)
 	return i, err
 }
@@ -374,7 +378,7 @@ func (q *Queries) ListTeamNamesByIDs(ctx context.Context, teamIds []pgtype.UUID)
 }
 
 const listTournamentsByOrganization = `-- name: ListTournamentsByOrganization :many
-SELECT id, organization_id, name, slug, description, sport, format, participant_type, status, banner_url, prize_pool, currency, max_participants, min_participants, registration_opens_at, registration_closes_at, starts_at, ends_at, venue, city, country, rules, settings, created_by, created_at, updated_at
+SELECT id, organization_id, name, slug, description, sport, format, participant_type, status, banner_url, prize_pool, currency, max_participants, min_participants, registration_opens_at, registration_closes_at, starts_at, ends_at, venue, city, country, rules, settings, created_by, created_at, updated_at, visibility
 FROM   tournaments
 WHERE  organization_id = $1
 ORDER  BY created_at DESC
@@ -416,6 +420,7 @@ func (q *Queries) ListTournamentsByOrganization(ctx context.Context, organizatio
 			&i.CreatedBy,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.Visibility,
 		); err != nil {
 			return nil, err
 		}
@@ -428,7 +433,7 @@ func (q *Queries) ListTournamentsByOrganization(ctx context.Context, organizatio
 }
 
 const listTournamentsPaginated = `-- name: ListTournamentsPaginated :many
-SELECT id, organization_id, name, slug, description, sport, format, participant_type, status, banner_url, prize_pool, currency, max_participants, min_participants, registration_opens_at, registration_closes_at, starts_at, ends_at, venue, city, country, rules, settings, created_by, created_at, updated_at
+SELECT id, organization_id, name, slug, description, sport, format, participant_type, status, banner_url, prize_pool, currency, max_participants, min_participants, registration_opens_at, registration_closes_at, starts_at, ends_at, venue, city, country, rules, settings, created_by, created_at, updated_at, visibility
 FROM   tournaments
 WHERE  organization_id = $1
   AND  status != 'cancelled'
@@ -491,6 +496,7 @@ func (q *Queries) ListTournamentsPaginated(ctx context.Context, arg ListTourname
 			&i.CreatedBy,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.Visibility,
 		); err != nil {
 			return nil, err
 		}
@@ -523,34 +529,36 @@ SET    name                   = $3,
        country                = $19,
        rules                  = $20,
        status                 = $21,
+       visibility             = $22,
        updated_at             = NOW()
 WHERE  id              = $1
   AND  organization_id = $2
-RETURNING id, organization_id, name, slug, description, sport, format, participant_type, status, banner_url, prize_pool, currency, max_participants, min_participants, registration_opens_at, registration_closes_at, starts_at, ends_at, venue, city, country, rules, settings, created_by, created_at, updated_at
+RETURNING id, organization_id, name, slug, description, sport, format, participant_type, status, banner_url, prize_pool, currency, max_participants, min_participants, registration_opens_at, registration_closes_at, starts_at, ends_at, venue, city, country, rules, settings, created_by, created_at, updated_at, visibility
 `
 
 type UpdateTournamentParams struct {
-	ID                   pgtype.UUID        `json:"id"`
-	OrganizationID       pgtype.UUID        `json:"organization_id"`
-	Name                 string             `json:"name"`
-	Description          *string            `json:"description"`
-	Sport                string             `json:"sport"`
-	Format               TournamentFormat   `json:"format"`
-	ParticipantType      ParticipantType    `json:"participant_type"`
-	BannerUrl            *string            `json:"banner_url"`
-	PrizePool            pgtype.Numeric     `json:"prize_pool"`
-	Currency             string             `json:"currency"`
-	MaxParticipants      *int16             `json:"max_participants"`
-	MinParticipants      *int16             `json:"min_participants"`
-	RegistrationOpensAt  pgtype.Timestamptz `json:"registration_opens_at"`
-	RegistrationClosesAt pgtype.Timestamptz `json:"registration_closes_at"`
-	StartsAt             pgtype.Timestamptz `json:"starts_at"`
-	EndsAt               pgtype.Timestamptz `json:"ends_at"`
-	Venue                *string            `json:"venue"`
-	City                 *string            `json:"city"`
-	Country              *string            `json:"country"`
-	Rules                *string            `json:"rules"`
-	Status               TournamentStatus   `json:"status"`
+	ID                   pgtype.UUID          `json:"id"`
+	OrganizationID       pgtype.UUID          `json:"organization_id"`
+	Name                 string               `json:"name"`
+	Description          *string              `json:"description"`
+	Sport                string               `json:"sport"`
+	Format               TournamentFormat     `json:"format"`
+	ParticipantType      ParticipantType      `json:"participant_type"`
+	BannerUrl            *string              `json:"banner_url"`
+	PrizePool            pgtype.Numeric       `json:"prize_pool"`
+	Currency             string               `json:"currency"`
+	MaxParticipants      *int16               `json:"max_participants"`
+	MinParticipants      *int16               `json:"min_participants"`
+	RegistrationOpensAt  pgtype.Timestamptz   `json:"registration_opens_at"`
+	RegistrationClosesAt pgtype.Timestamptz   `json:"registration_closes_at"`
+	StartsAt             pgtype.Timestamptz   `json:"starts_at"`
+	EndsAt               pgtype.Timestamptz   `json:"ends_at"`
+	Venue                *string              `json:"venue"`
+	City                 *string              `json:"city"`
+	Country              *string              `json:"country"`
+	Rules                *string              `json:"rules"`
+	Status               TournamentStatus     `json:"status"`
+	Visibility           TournamentVisibility `json:"visibility"`
 }
 
 // Full field update. Service layer merges partial request fields over current
@@ -578,6 +586,7 @@ func (q *Queries) UpdateTournament(ctx context.Context, arg UpdateTournamentPara
 		arg.Country,
 		arg.Rules,
 		arg.Status,
+		arg.Visibility,
 	)
 	var i Tournament
 	err := row.Scan(
@@ -607,6 +616,7 @@ func (q *Queries) UpdateTournament(ctx context.Context, arg UpdateTournamentPara
 		&i.CreatedBy,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Visibility,
 	)
 	return i, err
 }

@@ -408,6 +408,54 @@ func (q *Queries) ListRegistrationsByTournamentPaginated(ctx context.Context, ar
 	return items, nil
 }
 
+const listStandingsRegistrations = `-- name: ListStandingsRegistrations :many
+SELECT team_id, player_id, seed_number, registered_at, status
+FROM   tournament_registrations
+WHERE  tournament_id = $1
+  AND  status IN ('approved', 'disqualified')
+ORDER  BY registered_at ASC
+`
+
+type ListStandingsRegistrationsRow struct {
+	TeamID       pgtype.UUID        `json:"team_id"`
+	PlayerID     pgtype.UUID        `json:"player_id"`
+	SeedNumber   *int16             `json:"seed_number"`
+	RegisteredAt pgtype.Timestamptz `json:"registered_at"`
+	Status       RegistrationStatus `json:"status"`
+}
+
+// Standings participant set INCLUDING disqualified registrations (PRI-1
+// disqualification policy). The status column lets the standings engine apply
+// the policy: a participant disqualified BEFORE playing is dropped (Played=0),
+// while one disqualified AFTER results stays — flagged — so opponents' results
+// are preserved (PlayArena is a historical record). Approved + disqualified are
+// the only statuses that can appear in completed matches.
+func (q *Queries) ListStandingsRegistrations(ctx context.Context, tournamentID pgtype.UUID) ([]ListStandingsRegistrationsRow, error) {
+	rows, err := q.db.Query(ctx, listStandingsRegistrations, tournamentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListStandingsRegistrationsRow{}
+	for rows.Next() {
+		var i ListStandingsRegistrationsRow
+		if err := rows.Scan(
+			&i.TeamID,
+			&i.PlayerID,
+			&i.SeedNumber,
+			&i.RegisteredAt,
+			&i.Status,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const lockTournamentForUpdate = `-- name: LockTournamentForUpdate :one
 SELECT id
 FROM   tournaments

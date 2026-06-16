@@ -15,6 +15,8 @@ export type TournamentFormat =
 
 export type ParticipantType = "team" | "individual"
 
+export type TournamentVisibility = "private" | "unlisted" | "public"
+
 // Per-status registration breakdown embedded in tournament responses.
 // `active` = pending + approved — the count the backend enforces against
 // max_participants. Always use `active` for capacity math, never `approved`.
@@ -36,6 +38,8 @@ export interface Tournament {
   sport: string
   format: TournamentFormat
   status: TournamentStatus
+  // Public-surface setting (PRI-1): private | unlisted | public.
+  visibility: TournamentVisibility
   participant_type: ParticipantType
   description: string | null
   banner_url: string | null
@@ -135,6 +139,7 @@ export interface UpdateTournamentRequest {
   country?: string | null
   rules?: string | null
   status?: TournamentStatus
+  visibility?: TournamentVisibility
 }
 
 export interface TournamentListParams {

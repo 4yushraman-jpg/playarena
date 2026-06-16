@@ -63,6 +63,9 @@ type UpdateRequest struct {
 	// Allowed: draft→registration_open, registration_open→registration_closed,
 	// registration_closed→ongoing, ongoing→completed, any→cancelled.
 	Status *string `json:"status"`
+	// Visibility controls the public (anonymous) read surface (PRI-1):
+	// private | unlisted | public. The organizer Share control sets this.
+	Visibility *string `json:"visibility"`
 }
 
 // ListParams carries validated pagination and filter inputs.
@@ -89,7 +92,9 @@ type Response struct {
 	// "cancelled" means the tournament was soft-deleted via DELETE.
 	// GetTournamentByID returns cancelled tournaments so that future
 	// registration and match history references remain resolvable.
-	Status               string  `json:"status"`
+	Status string `json:"status"`
+	// Visibility is the public-surface setting (PRI-1): private | unlisted | public.
+	Visibility           string  `json:"visibility"`
 	BannerURL            *string `json:"banner_url,omitempty"`
 	PrizePool            *string `json:"prize_pool,omitempty"` // decimal string
 	Currency             string  `json:"currency"`
@@ -151,6 +156,10 @@ type StandingsRowResponse struct {
 	ScoreFor        int    `json:"score_for"`
 	ScoreAgainst    int    `json:"score_against"`
 	ScoreDifference int    `json:"score_difference"`
+	// Disqualified flags a participant removed after playing (PRI-1 policy):
+	// their results are preserved (opponents keep theirs) but they are marked and
+	// sorted to the bottom.
+	Disqualified bool `json:"disqualified"`
 }
 
 // PointSystemResponse describes the point values in use for this tournament.

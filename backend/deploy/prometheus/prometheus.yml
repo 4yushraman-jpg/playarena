@@ -7,9 +7,22 @@ global:
 rule_files:
   - /etc/prometheus/alerts.yaml
 
+# PHI-1B: route firing alerts to Alertmanager (human notification path).
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
+
 scrape_configs:
   - job_name: playarena_api
     static_configs:
       - targets: ['api:9090']
     metrics_path: /metrics
     scrape_interval: 15s
+
+  # Optional host metrics for DiskPressure / BackupStale (node_exporter with the
+  # textfile collector reading BACKUP_TEXTFILE_DIR). Deploy node_exporter on the
+  # host and uncomment. Without it those two alerts simply never fire.
+  # - job_name: node
+  #   static_configs:
+  #     - targets: ['node-exporter:9100']

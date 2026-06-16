@@ -38,7 +38,9 @@ export default function LoginPage() {
       setSession(data)
       const claims = useAuthStore.getState().claims
       if (!claims?.organizationId) {
-        router.push(claims?.role === "onboarding" ? "/onboarding" : "/")
+        // Neutral landing (PRI-1): no longer force-march onboarding users into
+        // organization creation — they choose on /welcome.
+        router.push(claims?.role === "onboarding" ? "/welcome" : "/")
         return
       }
 

@@ -2,6 +2,20 @@ groups:
   - name: playarena_critical
     interval: 30s
     rules:
+      # PHI-1B: the single most important alert — the API process is gone. The
+      # in-process /metrics can't report its own absence, so `up` (set by the
+      # Prometheus scrape) is the source of truth. Pair with the EXTERNAL uptime
+      # monitor (deploy/runbooks/uptime-monitoring.md) which survives a full host
+      # outage that would also take Prometheus down.
+      - alert: APIUnavailable
+        expr: up{job="playarena_api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "API target is DOWN (scrape failing)"
+          description: "Prometheus cannot scrape playarena_api for >1m. The API process is likely down. Runbook: deploy/runbooks/api-down.md"
+
       - alert: DatabaseUnavailable
         expr: |
           playarena_db_pool_open_connections == 0
@@ -131,3 +145,70 @@ groups:
         annotations:
           summary: "SSE events are being dropped"
           description: "{{ $value | humanize }} events/sec are being dropped due to full subscriber buffers."
+
+  # ── PHI-1B: resilience, backup, and tournament-day (pilot) alerts ─────────────
+  - name: playarena_pilot
+    interval: 60s
+    rules:
+      # Backup freshness. backup.sh writes a node_exporter textfile metric on
+      # success; if it goes stale the nightly job is failing → data at risk.
+      # (Requires node_exporter with the textfile collector — see backup runbook.)
+      - alert: BackupStale
+        expr: |
+          absent(playarena_backup_last_success_timestamp_seconds)
+          OR
+          (time() - playarena_backup_last_success_timestamp_seconds) > 93600
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No successful backup in >26h"
+          description: "Last successful logical backup was {{ $value | humanizeDuration }} ago (or the metric is absent). Runbook: deploy/runbooks/backup.md"
+
+      # Host disk pressure (requires node_exporter job 'node'). Free space < 10%.
+      - alert: DiskPressure
+        expr: |
+          (node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"}
+           / node_filesystem_size_bytes{fstype!~"tmpfs|overlay"}) < 0.10
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Host disk <10% free"
+          description: "Mount {{ $labels.mountpoint }} is at {{ $value | humanizePercentage }} free."
+
+      # Memory pressure proxy from the app's process collector (no node_exporter
+      # needed). Tune the byte threshold to ~80% of the container memory limit.
+      - alert: APIMemoryHigh
+        expr: process_resident_memory_bytes{job="playarena_api"} > 7e8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "API RSS high (>700 MB)"
+          description: "Resident memory {{ $value | humanize1024 }}B for >10m. Check for a leak or raise the limit."
+
+      # Public surface errors — spectators/parents hitting failures on share links.
+      - alert: PublicPageErrors
+        expr: |
+          sum(rate(playarena_http_requests_total{route=~".*/public/.*",status_class="5xx"}[5m])) > 0.2
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Public tournament pages returning 5xx"
+          description: "{{ $value | humanize }} public 5xx/sec over 5m. Runbook: deploy/runbooks/public-outage.md"
+
+      # Tournament-day: matches are live but no scoring events are landing → a
+      # scorer has likely disconnected or stopped (or the event path is broken).
+      - alert: LiveMatchesNotScoring
+        expr: |
+          playarena_matches_live > 0
+          AND
+          playarena_match_events_last_minute == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Live matches but no scoring events for 10m"
+          description: "{{ $value }} match(es) are live yet 0 events were recorded in the last minute. Check scorers/connectivity. Runbook: deploy/runbooks/scorer-incident.md"

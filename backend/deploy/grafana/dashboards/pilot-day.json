@@ -1,0 +1,90 @@
+{
+  "uid": "playarena-pilot-day",
+  "title": "PlayArena — Pilot Day",
+  "tags": ["playarena", "pilot"],
+  "timezone": "browser",
+  "refresh": "15s",
+  "schemaVersion": 38,
+  "time": { "from": "now-3h", "to": "now" },
+  "panels": [
+    {
+      "id": 1, "title": "API Up", "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 0},
+      "fieldConfig": {"defaults": {"mappings": [
+        {"type": "value", "options": {"0": {"text": "DOWN", "color": "red"}, "1": {"text": "UP", "color": "green"}}}
+      ]}},
+      "targets": [{"expr": "up{job=\"playarena_api\"}", "legendFormat": "api"}]
+    },
+    {
+      "id": 2, "title": "Live Matches", "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 4, "y": 0},
+      "targets": [{"expr": "playarena_matches_live", "legendFormat": "live"}]
+    },
+    {
+      "id": 3, "title": "Ongoing Tournaments", "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 8, "y": 0},
+      "targets": [{"expr": "playarena_tournaments_ongoing", "legendFormat": "ongoing"}]
+    },
+    {
+      "id": 4, "title": "Scoring Events / min", "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 12, "y": 0},
+      "targets": [{"expr": "playarena_match_events_last_minute", "legendFormat": "events/min"}]
+    },
+    {
+      "id": 5, "title": "Live Spectators (SSE)", "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 16, "y": 0},
+      "targets": [{"expr": "playarena_realtime_active_subscribers", "legendFormat": "subscribers"}]
+    },
+    {
+      "id": 6, "title": "Backup Age (hours)", "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 20, "y": 0},
+      "fieldConfig": {"defaults": {"unit": "h", "thresholds": {"steps": [
+        {"color": "green", "value": null}, {"color": "yellow", "value": 24}, {"color": "red", "value": 26}
+      ]}}},
+      "targets": [{"expr": "(time() - playarena_backup_last_success_timestamp_seconds) / 3600", "legendFormat": "age"}]
+    },
+
+    {
+      "id": 10, "title": "Public Page Traffic (rps) by status", "type": "timeseries",
+      "gridPos": {"h": 7, "w": 12, "x": 0, "y": 4},
+      "targets": [{"expr": "sum by (status_class) (rate(playarena_http_requests_total{route=~\".*/public/.*\"}[1m]))", "legendFormat": "{{status_class}}"}]
+    },
+    {
+      "id": 11, "title": "API 5xx rate & P99 latency", "type": "timeseries",
+      "gridPos": {"h": 7, "w": 12, "x": 12, "y": 4},
+      "targets": [
+        {"expr": "sum(rate(playarena_http_requests_total{status_class=\"5xx\"}[1m]))", "legendFormat": "5xx/s"},
+        {"expr": "histogram_quantile(0.99, sum by (le) (rate(playarena_http_request_duration_seconds_bucket[5m])))", "legendFormat": "p99 (s)"}
+      ]
+    },
+
+    {
+      "id": 12, "title": "DB Pool (acquired / max)", "type": "timeseries",
+      "gridPos": {"h": 7, "w": 12, "x": 0, "y": 11},
+      "targets": [
+        {"expr": "playarena_db_pool_acquired_connections", "legendFormat": "acquired"},
+        {"expr": "playarena_db_pool_max_connections", "legendFormat": "max"}
+      ]
+    },
+    {
+      "id": 13, "title": "Delivery backlog (dead letters & outbox)", "type": "timeseries",
+      "gridPos": {"h": 7, "w": 12, "x": 12, "y": 11},
+      "targets": [
+        {"expr": "playarena_email_dead_letters_total", "legendFormat": "email dead-letters"},
+        {"expr": "playarena_webhook_dead_letters_total", "legendFormat": "webhook dead-letters"},
+        {"expr": "playarena_notification_outbox_pending_rows", "legendFormat": "outbox pending"}
+      ]
+    },
+
+    {
+      "id": 14, "title": "Rate-limit rejections by limiter", "type": "timeseries",
+      "gridPos": {"h": 7, "w": 12, "x": 0, "y": 18},
+      "targets": [{"expr": "sum by (limiter) (rate(playarena_rate_limit_rejections_total[1m]))", "legendFormat": "{{limiter}}"}]
+    },
+    {
+      "id": 15, "title": "SSE dropped events / s", "type": "timeseries",
+      "gridPos": {"h": 7, "w": 12, "x": 12, "y": 18},
+      "targets": [{"expr": "rate(playarena_realtime_dropped_events_total[1m])", "legendFormat": "dropped/s"}]
+    }
+  ]
+}

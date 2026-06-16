@@ -29,6 +29,12 @@ func makeLess(rows []StandingsRow, matches []CompletedMatch, s Settings) func(i,
 	return func(i, j int) bool {
 		ri, rj := rows[i], rows[j]
 
+		// 0. Disqualified participants always sort below non-disqualified ones,
+		//    regardless of points (PRI-1: results preserved, but ranked last).
+		if ri.Disqualified != rj.Disqualified {
+			return !ri.Disqualified
+		}
+
 		// 1. Points DESC
 		if ri.Points != rj.Points {
 			return ri.Points > rj.Points

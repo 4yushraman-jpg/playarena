@@ -16,6 +16,7 @@ function makeTournament(overrides: Partial<Tournament> = {}): Tournament {
     sport: "football",
     format: "knockout",
     status: "registration_open",
+    visibility: "private",
     participant_type: "team",
     description: null,
     banner_url: null,

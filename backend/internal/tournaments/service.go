@@ -309,6 +309,15 @@ func (s *Service) Update(ctx context.Context, orgSlug, tournamentID string, req 
 		Country:              current.Country,
 		Rules:                current.Rules,
 		Status:               current.Status,
+		Visibility:           current.Visibility,
+	}
+
+	if req.Visibility != nil {
+		v, err := parseVisibility(*req.Visibility)
+		if err != nil {
+			return nil, err
+		}
+		params.Visibility = v
 	}
 
 	if req.Name != nil {
@@ -600,7 +609,7 @@ func (s *Service) snapshotTournamentStats(ctx context.Context, t *db.Tournament,
 		return
 	}
 
-	rawRegs, err := s.repo.GetRegistrationsForStandings(ctx, t.ID)
+	rawRegs, err := s.repo.GetStandingsRegistrations(ctx, t.ID)
 	if err != nil {
 		s.log.ErrorContext(ctx, "rankings.snapshot: fetch registrations failed",
 			slog.String("tournament_id", pgutil.UUIDToString(t.ID)),
@@ -637,6 +646,7 @@ func (s *Service) snapshotTournamentStats(ctx context.Context, t *db.Tournament,
 			ParticipantID: pid,
 			SeedNumber:    reg.SeedNumber,
 			RegisteredAt:  reg.RegisteredAt.Time.UTC(),
+			Disqualified:  reg.Status == db.RegistrationStatusDisqualified,
 		})
 	}
 
@@ -730,6 +740,15 @@ func parseTournamentStatus(s string) (db.TournamentStatus, error) {
 		return st, nil
 	}
 	return "", ErrInvalidStatus
+}
+
+func parseVisibility(s string) (db.TournamentVisibility, error) {
+	v := db.TournamentVisibility(strings.ToLower(strings.TrimSpace(s)))
+	switch v {
+	case db.TournamentVisibilityPrivate, db.TournamentVisibilityUnlisted, db.TournamentVisibilityPublic:
+		return v, nil
+	}
+	return "", ErrInvalidVisibility
 }
 
 func validateStatusTransition(from, to db.TournamentStatus) error {
@@ -863,7 +882,7 @@ func (s *Service) GetStandings(ctx context.Context, orgSlug, tournamentID string
 		return nil, err
 	}
 
-	rawRegs, err := s.repo.GetRegistrationsForStandings(ctx, tid)
+	rawRegs, err := s.repo.GetStandingsRegistrations(ctx, tid)
 	if err != nil {
 		return nil, err
 	}
@@ -901,6 +920,7 @@ func (s *Service) GetStandings(ctx context.Context, orgSlug, tournamentID string
 			ParticipantID: pid,
 			SeedNumber:    seed,
 			RegisteredAt:  r.RegisteredAt.Time.UTC(),
+			Disqualified:  r.Status == db.RegistrationStatusDisqualified,
 		})
 	}
 
@@ -929,6 +949,7 @@ func (s *Service) GetStandings(ctx context.Context, orgSlug, tournamentID string
 			ScoreFor:        row.ScoreFor,
 			ScoreAgainst:    row.ScoreAgainst,
 			ScoreDifference: row.ScoreDifference,
+			Disqualified:    row.Disqualified,
 		}
 	}
 
@@ -1014,6 +1035,7 @@ func tournamentToResponse(t *db.Tournament) *Response {
 		Format:               string(t.Format),
 		ParticipantType:      string(t.ParticipantType),
 		Status:               string(t.Status),
+		Visibility:           string(t.Visibility),
 		BannerURL:            t.BannerUrl,
 		PrizePool:            numericToString(t.PrizePool),
 		Currency:             t.Currency,

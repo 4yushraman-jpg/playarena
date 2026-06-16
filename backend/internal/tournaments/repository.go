@@ -126,6 +126,14 @@ func (r *Repository) GetRegistrationsForStandings(ctx context.Context, tournamen
 	return r.queries.ListApprovedRegistrationsForStandings(ctx, tournamentID)
 }
 
+// GetStandingsRegistrations returns approved AND disqualified registrations
+// (PRI-1 disqualification policy). The disqualified flag lets the standings
+// engine retain a disqualified-after-play participant (flagged, ranked last)
+// while preserving opponents' results.
+func (r *Repository) GetStandingsRegistrations(ctx context.Context, tournamentID pgtype.UUID) ([]db.ListStandingsRegistrationsRow, error) {
+	return r.queries.ListStandingsRegistrations(ctx, tournamentID)
+}
+
 // ── transactional writes ──────────────────────────────────────────────────────
 
 type createTournamentTxParams struct {

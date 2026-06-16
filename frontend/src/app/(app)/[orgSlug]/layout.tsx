@@ -1,11 +1,13 @@
 "use client"
 
 import { useEffect, useSyncExternalStore } from "react"
-import { notFound, useParams } from "next/navigation"
+import { notFound, useParams, useRouter } from "next/navigation"
 import { isReservedSlug } from "@/lib/reserved-slugs"
 import { OrgSidebar } from "@/components/layout/org-sidebar"
 import { OrgHeader } from "@/components/layout/org-header"
 import { useUIStore } from "@/stores/ui.store"
+import { useAuthStore } from "@/stores/auth.store"
+import { hasOrgContext } from "@/lib/permissions"
 import { useNotificationStream } from "@/hooks/use-notification-stream"
 import { cn } from "@/lib/utils"
 
@@ -29,6 +31,26 @@ export default function OrgLayout({ children }: { children: React.ReactNode }) {
   if (orgSlug && isReservedSlug(orgSlug)) {
     notFound()
   }
+  const router = useRouter()
+  const claims = useAuthStore((s) => s.claims)
+  const isHydrating = useAuthStore((s) => s.isHydrating)
+  // The org shell is the organizer application. A bare top-level path such as
+  // /tournaments is captured by this [orgSlug] segment (orgSlug="tournaments"),
+  // so without this guard an onboarding/no-org user would render the full
+  // organizer shell while every org-scoped widget 403s. Onboarding and player
+  // users have no org context and must be sent to the neutral /welcome landing.
+  // Mirrors the backend RequireOrgScope boundary; platform admins (empty org,
+  // scope="platform") are allowed through. See hasOrgContext.
+  const orgAllowed = hasOrgContext(claims)
+  useEffect(() => {
+    // Only redirect once auth has hydrated and we know the user lacks org
+    // context. Before hydration claims may be transiently null; the parent
+    // (app)/layout shows a skeleton until then.
+    if (!isHydrating && claims && !orgAllowed) {
+      router.replace("/welcome")
+    }
+  }, [isHydrating, claims, orgAllowed, router])
+
   const { sidebarOpen, setSidebarOpen } = useUIStore()
 
   // Subscribes to matchMedia changes without calling setState inside an effect.
@@ -62,7 +84,14 @@ export default function OrgLayout({ children }: { children: React.ReactNode }) {
     firstFocusable?.focus()
   }, [isMobileDrawerOpen])
 
-  useNotificationStream({ orgSlug })
+  useNotificationStream({ orgSlug, enabled: orgAllowed })
+
+  // Don't flash the organizer shell for users without org context — render
+  // nothing while the redirect to /welcome (above) takes effect. Authenticated
+  // organizer/platform users fall straight through to the shell.
+  if (claims && !orgAllowed) {
+    return null
+  }
 
   return (
     <div className="flex min-h-svh">

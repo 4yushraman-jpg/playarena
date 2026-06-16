@@ -141,3 +141,16 @@ FROM   tournament_registrations
 WHERE  tournament_id = $1
   AND  status        = 'approved'
 ORDER  BY registered_at ASC;
+
+-- name: ListStandingsRegistrations :many
+-- Standings participant set INCLUDING disqualified registrations (PRI-1
+-- disqualification policy). The status column lets the standings engine apply
+-- the policy: a participant disqualified BEFORE playing is dropped (Played=0),
+-- while one disqualified AFTER results stays — flagged — so opponents' results
+-- are preserved (PlayArena is a historical record). Approved + disqualified are
+-- the only statuses that can appear in completed matches.
+SELECT team_id, player_id, seed_number, registered_at, status
+FROM   tournament_registrations
+WHERE  tournament_id = $1
+  AND  status IN ('approved', 'disqualified')
+ORDER  BY registered_at ASC;

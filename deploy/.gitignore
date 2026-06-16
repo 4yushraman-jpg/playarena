@@ -1,0 +1,6 @@
+# Never commit production secrets or origin certificates.
+certs/
+*.env
+.env
+.env.*
+!.env.example

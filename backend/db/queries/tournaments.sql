@@ -55,6 +55,7 @@ SET    name                   = $3,
        country                = $19,
        rules                  = $20,
        status                 = $21,
+       visibility             = $22,
        updated_at             = NOW()
 WHERE  id              = $1
   AND  organization_id = $2

@@ -22,6 +22,7 @@ import { TournamentTimeline } from "@/components/tournaments/tournament-timeline
 import { RegisterParticipantDialog } from "@/components/tournaments/register-participant-dialog"
 import { TournamentFixtures } from "@/components/matches/tournament-fixtures"
 import { FixtureGenerationPanel } from "@/components/fixtures/fixture-generation-panel"
+import { ShareTournament } from "@/components/tournaments/share-tournament"
 import { useTournament, useTournamentStandings } from "@/hooks/use-tournaments"
 import { useAuthStore, selectRole } from "@/stores/auth.store"
 import { hasPermission } from "@/lib/permissions"
@@ -165,6 +166,9 @@ export default function TournamentDetailPage() {
           {showStandings && (
             <StandingsCard orgSlug={orgSlug} tournamentId={id} tournament={tournament} />
           )}
+
+          {/* Share / public visibility control (PRI-1) */}
+          {canUpdate && <ShareTournament orgSlug={orgSlug} tournament={tournament} />}
 
           {/* Automated fixture generation (registration_closed) + audit + resolve */}
           <FixtureGenerationPanel

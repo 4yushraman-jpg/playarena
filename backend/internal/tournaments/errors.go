@@ -16,6 +16,7 @@ var (
 	ErrInvalidFormat          = errors.New("invalid format; valid values: league, knockout, group_knockout, round_robin, double_elimination")
 	ErrInvalidParticipantType = errors.New("invalid participant_type; valid values: team, individual")
 	ErrInvalidStatus          = errors.New("invalid status; valid values: draft, registration_open, registration_closed, ongoing, completed, cancelled")
+	ErrInvalidVisibility      = errors.New("invalid visibility; valid values: private, unlisted, public")
 	ErrInvalidCurrency        = errors.New("currency must be a 3-letter ISO 4217 code (e.g. INR, USD)")
 	ErrInvalidCountry         = errors.New("country must be a 2-letter ISO 3166-1 alpha-2 code (e.g. IN, US)")
 	ErrInvalidPrizePool       = errors.New("prize_pool must be a valid non-negative decimal number (e.g. \"10000.00\")")

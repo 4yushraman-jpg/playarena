@@ -254,6 +254,8 @@ func (h *Handler) writeTournamentError(w http.ResponseWriter, r *http.Request, e
 		response.Error(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, ErrInvalidStatus):
 		response.Error(w, http.StatusBadRequest, err.Error())
+	case errors.Is(err, ErrInvalidVisibility):
+		response.Error(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, ErrInvalidCurrency):
 		response.Error(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, ErrInvalidCountry):

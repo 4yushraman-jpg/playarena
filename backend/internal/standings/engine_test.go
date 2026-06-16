@@ -99,3 +99,61 @@ func TestCompute_CloseLoss_AppliesBonusForScoredMatch(t *testing.T) {
 		t.Errorf("scored close loss points=%d, want CloseLossPoints=%d", a.Points, s.CloseLossPoints)
 	}
 }
+
+// ── PRI-1 disqualification policy ───────────────────────────────────────────────
+
+// TestCompute_DQ_BeforePlay_Removed: a disqualified participant with no completed
+// matches is dropped from the table entirely.
+func TestCompute_DQ_BeforePlay_Removed(t *testing.T) {
+	regs := []RegistrationInfo{
+		{ParticipantID: "home", RegisteredAt: time.Unix(1, 0)},
+		{ParticipantID: "away", RegisteredAt: time.Unix(2, 0)},
+		{ParticipantID: "dq", RegisteredAt: time.Unix(3, 0), Disqualified: true},
+	}
+	// One match between home and away; dq never played.
+	matches := []CompletedMatch{
+		{HomeParticipantID: "home", AwayParticipantID: "away", HomeScore: 30, AwayScore: 20, WinnerID: "home"},
+	}
+	rows := indexByID(Compute(matches, regs, DefaultSettings()))
+	if _, present := rows["dq"]; present {
+		t.Fatal("disqualified-before-play participant must be removed from standings")
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(rows))
+	}
+}
+
+// TestCompute_DQ_AfterPlay_PreservedFlaggedLast: a disqualified participant that
+// already played is kept (flagged), ranked below all non-DQ participants, and the
+// opponent's result against it is preserved.
+func TestCompute_DQ_AfterPlay_PreservedFlaggedLast(t *testing.T) {
+	regs := []RegistrationInfo{
+		{ParticipantID: "winner", RegisteredAt: time.Unix(1, 0)},
+		{ParticipantID: "dq", RegisteredAt: time.Unix(2, 0), Disqualified: true},
+	}
+	// dq played winner and lost; dq is disqualified after the result.
+	matches := []CompletedMatch{
+		{HomeParticipantID: "winner", AwayParticipantID: "dq", HomeScore: 40, AwayScore: 10, WinnerID: "winner"},
+	}
+	rows := Compute(matches, regs, DefaultSettings())
+	byID := indexByID(rows)
+
+	dq, present := byID["dq"]
+	if !present {
+		t.Fatal("disqualified-after-play participant must be preserved (flagged)")
+	}
+	if !dq.Disqualified {
+		t.Error("retained participant should carry the Disqualified flag")
+	}
+	// Opponent's win is preserved.
+	if w := byID["winner"]; w.Wins != 1 || w.Points != 3 {
+		t.Errorf("opponent result not preserved: wins=%d points=%d, want 1/3", w.Wins, w.Points)
+	}
+	// DQ ranked last despite any points it earned.
+	if rows[len(rows)-1].ParticipantID != "dq" {
+		t.Errorf("disqualified participant should rank last; last=%s", rows[len(rows)-1].ParticipantID)
+	}
+	if rows[0].ParticipantID != "winner" {
+		t.Errorf("non-DQ participant should rank first; first=%s", rows[0].ParticipantID)
+	}
+}

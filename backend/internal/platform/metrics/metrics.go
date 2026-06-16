@@ -67,6 +67,13 @@ type Registry struct {
 	RealtimeUnsubTotal     prometheus.Counter
 	RealtimePublishTotal   prometheus.Counter
 	RealtimeDroppedTotal   prometheus.Counter
+
+	// ── Tournament activity (PHI-1B "Pilot Day" visibility) ───────────────────
+	// Sampled periodically by a DB scraper; let an operator see the tournament
+	// happening on one screen. Derived from row counts, no domain coupling.
+	TournamentsOngoing    prometheus.Gauge
+	MatchesLive           prometheus.Gauge
+	MatchEventsLastMinute prometheus.Gauge
 }
 
 // New constructs a Registry with all metrics registered against a fresh
@@ -221,6 +228,20 @@ func New() *Registry {
 			Name: "playarena_realtime_dropped_events_total",
 			Help: "Total SSE events dropped due to full subscriber channel buffers.",
 		}),
+
+		// Tournament activity
+		TournamentsOngoing: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "playarena_tournaments_ongoing",
+			Help: "Current number of tournaments in 'ongoing' status.",
+		}),
+		MatchesLive: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "playarena_matches_live",
+			Help: "Current number of matches in 'live' status.",
+		}),
+		MatchEventsLastMinute: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "playarena_match_events_last_minute",
+			Help: "Match events recorded in the last 60 seconds (live scoring rate).",
+		}),
 	}
 
 	// Register all collectors with the custom registry.
@@ -255,6 +276,9 @@ func New() *Registry {
 		r.RealtimeUnsubTotal,
 		r.RealtimePublishTotal,
 		r.RealtimeDroppedTotal,
+		r.TournamentsOngoing,
+		r.MatchesLive,
+		r.MatchEventsLastMinute,
 	)
 
 	return r

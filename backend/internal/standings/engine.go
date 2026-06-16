@@ -27,6 +27,7 @@ func Compute(
 			ParticipantID: reg.ParticipantID,
 			SeedNumber:    reg.SeedNumber,
 			RegisteredAt:  reg.RegisteredAt,
+			Disqualified:  reg.Disqualified,
 		}
 	}
 
@@ -75,6 +76,12 @@ func Compute(
 
 	rows := make([]StandingsRow, 0, len(accum))
 	for _, row := range accum {
+		// PRI-1 disqualification policy: drop a disqualified participant that
+		// never played (DQ before play). One that played is retained (flagged,
+		// sorted last) so opponents' results stay intact.
+		if row.Disqualified && row.Played == 0 {
+			continue
+		}
 		row.ScoreDifference = row.ScoreFor - row.ScoreAgainst
 		rows = append(rows, *row)
 	}

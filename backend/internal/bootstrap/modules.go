@@ -24,6 +24,7 @@ import (
 	"github.com/4yushraman-jpg/playarena/internal/platform/metrics"
 	"github.com/4yushraman-jpg/playarena/internal/platform/middleware"
 	"github.com/4yushraman-jpg/playarena/internal/players"
+	"github.com/4yushraman-jpg/playarena/internal/public"
 	"github.com/4yushraman-jpg/playarena/internal/rankings"
 	"github.com/4yushraman-jpg/playarena/internal/realtime"
 	"github.com/4yushraman-jpg/playarena/internal/teams"
@@ -51,6 +52,7 @@ func registerModules(
 	authLimiter *middleware.IPRateLimiter,
 	writeLimiter *middleware.IPRateLimiter,
 	mediaLimiter *middleware.IPRateLimiter,
+	publicLimiter *middleware.IPRateLimiter,
 ) (*auth.Handler, *notifworker.EmailWorker, *webhookworker.WebhookWorker, *realtime.Hub, *notifications.Repository, *webhookworker.Repository) {
 	queries := db.New(pool)
 	authz := auth.NewAuthorizationService(queries)
@@ -92,6 +94,12 @@ func registerModules(
 
 	health.RegisterRoutes(r, pool)
 	authHandler := auth.RegisterRoutes(r, pool, cfg, log, authLimiter, emailSender, reg)
+
+	// Public (anonymous) read surface — PRI-1. Mounted OUTSIDE every authenticated
+	// group: no RequireAuth, no RequireOrgScope, no principal. Authorization is the
+	// SQL visibility gate inside internal/public's queries. Its own read limiter
+	// (throttles GETs) blunts scraping; responses are cacheable.
+	public.RegisterRoutes(r, pool, log, publicLimiter)
 
 	// Domain write endpoints — writeLimiter applied to POST/PUT/PATCH/DELETE.
 	// GET requests pass through without consuming tokens.

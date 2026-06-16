@@ -36,6 +36,7 @@ func NewRouter(
 	authLimiter *middleware.IPRateLimiter,
 	writeLimiter *middleware.IPRateLimiter,
 	mediaLimiter *middleware.IPRateLimiter,
+	publicLimiter *middleware.IPRateLimiter,
 ) (http.Handler, *auth.Handler, *notifworker.EmailWorker, *webhookworker.WebhookWorker, *realtime.Hub, *notifications.Repository, *webhookworker.Repository) {
 	r := chi.NewRouter()
 
@@ -46,7 +47,7 @@ func NewRouter(
 	r.Use(middleware.CORS(cfg.CORSAllowedOrigins))         // Cross-Origin Resource Sharing headers
 	r.Use(middleware.Metrics(reg))                         // Prometheus HTTP metrics (counter + histogram + in-flight)
 
-	authHandler, emailWorker, webhookWorker, hub, notifRepo, webhookRepo := registerModules(r, db, log, cfg, reg, authLimiter, writeLimiter, mediaLimiter)
+	authHandler, emailWorker, webhookWorker, hub, notifRepo, webhookRepo := registerModules(r, db, log, cfg, reg, authLimiter, writeLimiter, mediaLimiter, publicLimiter)
 
 	return r, authHandler, emailWorker, webhookWorker, hub, notifRepo, webhookRepo
 }

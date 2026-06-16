@@ -1,0 +1,90 @@
+# PlayArena — STAGING deployment via Cloudflare Tunnel (PHI-1A, Tunnel variant).
+#
+# Topology:  Cloudflare edge ──(outbound tunnel)── cloudflared ──> { web, api }
+# No published ports, no static IP, no origin certificate. cloudflared dials OUT
+# to Cloudflare; public hostnames are routed to the internal services in the
+# Cloudflare Zero Trust dashboard:
+#     app.<domain>  ->  http://web:3000
+#     api.<domain>  ->  http://api:8080
+# Postgres is a MANAGED service (Neon/Supabase) referenced by DATABASE_URL.
+# The internal observability port (9090) is never exposed.
+#
+# Usage (on the VM):
+#   cp ../backend/.env.production.example ../backend/.env.staging   # fill it
+#   export DATABASE_URL=...                  # for the one-shot migrate
+#   export CLOUDFLARE_TUNNEL_TOKEN=...       # from the dashboard tunnel
+#   export NEXT_PUBLIC_API_URL=https://api.<domain>
+#   docker compose -f docker-compose.staging.yml run --rm migrate
+#   docker compose -f docker-compose.staging.yml up -d --build
+
+networks:
+  playarena:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16   # must be covered by TRUSTED_PROXY_CIDRS in .env.staging
+
+volumes:
+  uploads_data:
+
+services:
+  # One-shot schema migration against the managed database. Run before `up`.
+  migrate:
+    image: migrate/migrate:v4.18.3
+    profiles: ["migrate"]
+    networks: [playarena]
+    volumes:
+      - ../backend/db/migrations:/migrations:ro
+    entrypoint:
+      - /bin/sh
+      - -c
+      - 'migrate -path=/migrations -database="$$DATABASE_URL" up'
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in your shell}
+    restart: "no"
+
+  api:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    image: playarena-api:latest
+    networks: [playarena]
+    env_file:
+      - ../backend/.env.staging
+    expose:
+      - "8080"      # reached only by cloudflared on the private network
+      - "9090"      # observability — private only
+    volumes:
+      - uploads_data:/app/uploads
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/live"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    restart: always
+
+  web:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+      args:
+        # Baked at build time — must be the PUBLIC api hostname behind the tunnel.
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:?set NEXT_PUBLIC_API_URL to https://api.<domain>}
+    image: playarena-web:latest
+    networks: [playarena]
+    expose:
+      - "3000"
+    restart: always
+
+  # Cloudflare Tunnel — outbound only; routes public hostnames to web/api.
+  # Hostname->service ingress is configured in the Zero Trust dashboard for the
+  # tunnel that issued CLOUDFLARE_TUNNEL_TOKEN.
+  cloudflared:
+    image: cloudflare/cloudflared:2024.10.0
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN:?set CLOUDFLARE_TUNNEL_TOKEN}
+    networks: [playarena]
+    depends_on:
+      - api
+      - web
+    restart: always

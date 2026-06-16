@@ -37,6 +37,7 @@ type App struct {
 	authLimiter        *middleware.IPRateLimiter    // /api/v1/auth/* — most restrictive
 	writeLimiter       *middleware.IPRateLimiter    // domain write endpoints (POST/PATCH/DELETE)
 	mediaLimiter       *middleware.IPRateLimiter    // media upload endpoint
+	publicLimiter      *middleware.IPRateLimiter    // anonymous public read surface (PRI-1)
 	authHandler        *auth.Handler                // for DrainEmail on graceful shutdown
 	notifEmailWorker   *notifworker.EmailWorker     // for Stop/Drain on graceful shutdown
 	notifWebhookWorker *webhookworker.WebhookWorker // for Stop/Drain on graceful shutdown
@@ -71,6 +72,12 @@ func (a *App) Handler() http.Handler {
 			rate.Limit(a.Config.RateLimitMediaRPS),
 			a.Config.RateLimitMediaBurst,
 		).WithMetrics(a.reg, "media")
+		// Public read surface: throttle anonymous GETs (caching absorbs the rest).
+		// Reuses the write budget as a sensible per-IP read ceiling — no new config.
+		a.publicLimiter = middleware.NewIPRateLimiter(
+			rate.Limit(a.Config.RateLimitWriteRPS),
+			a.Config.RateLimitWriteBurst,
+		).WithMetrics(a.reg, "public")
 		a.Log.Info("rate limiters started",
 			slog.Float64("auth_rps", a.Config.RateLimitAuthRPS),
 			slog.Float64("write_rps", a.Config.RateLimitWriteRPS),
@@ -87,8 +94,9 @@ func (a *App) Handler() http.Handler {
 	// DB pool scraper + outbox metrics scraper — share a single done channel.
 	a.scraperDone = make(chan struct{})
 	startDBPoolScraper(a.DB, a.reg, a.scraperDone)
+	startTournamentActivityScraper(a.DB, a.reg, a.Log, a.scraperDone)
 
-	handler, authH, emailWorker, webhookWorker, hub, notifRepo, webhookRepo := NewRouter(a.DB, a.Log, a.Config, a.reg, a.authLimiter, a.writeLimiter, a.mediaLimiter)
+	handler, authH, emailWorker, webhookWorker, hub, notifRepo, webhookRepo := NewRouter(a.DB, a.Log, a.Config, a.reg, a.authLimiter, a.writeLimiter, a.mediaLimiter, a.publicLimiter)
 	a.authHandler = authH
 	a.realtimeHub = hub
 	a.notifEmailWorker = emailWorker
@@ -190,6 +198,9 @@ func (a *App) Shutdown(ctx context.Context) {
 	}
 	if a.writeLimiter != nil {
 		a.writeLimiter.Stop()
+	}
+	if a.publicLimiter != nil {
+		a.publicLimiter.Stop()
 	}
 	if a.mediaLimiter != nil {
 		a.mediaLimiter.Stop()
